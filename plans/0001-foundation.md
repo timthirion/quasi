@@ -88,6 +88,16 @@ instance owns its canvas, rAF loop, pointer/wheel listeners, and a `ResizeObserv
 that sizes the canvas to the host element's `clientWidth/Height × devicePixelRatio`.
 Native still uses a single winit window/event loop. This is the groundwork for M4.
 
+**Web performance (multi-instance):** with N widgets the dominant cost is each
+one path-tracing every rAF tick forever. Two pauses fix it: (1) **converged/idle
+pause** — stop sampling once `frame_count` reaches `SAMPLE_BUDGET` (1024); camera
+interaction/resize resets it; (2) **off-screen pause** — an `IntersectionObserver`
+skips rendering while the host isn't in the viewport. The rAF loop keeps ticking
+(cheap) but does no GPU work when idle or hidden. Observer-touched state lives in
+`Cell`s (a `Shared` struct) separate from the `RefCell<Inner>` render borrow, so
+a callback can never collide with a render. Deferred: sharing one GPU device
+across instances (memory/startup win, but a shared device-loss failure domain).
+
 ### M1 — Cornell Box path tracer ✅ DONE (visually confirmed, native + web)
 - [x] Scene structs (quad, material) + Cornell Box factory (`scene.rs`), with a
       GPU-packed `Uniforms` matching WGSL alignment (vec3 on 16-byte boundaries).

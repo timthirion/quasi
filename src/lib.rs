@@ -681,21 +681,42 @@ mod web {
         (w.max(1), h.max(1))
     }
 
+    type IntersectionClosure = Closure<dyn FnMut(js_sys::Array)>;
+
+    /// Stop accumulating after this many samples — the image has converged and
+    /// further frames would just burn GPU. Camera interaction resets the count.
+    const SAMPLE_BUDGET: u32 = 1024;
+
+    /// State touched by observer callbacks. Kept separate from `RefCell<Inner>`
+    /// (these are `Cell`s) so an observer firing can never collide with the
+    /// mutable borrow held during a render.
+    struct Shared {
+        pending_resize: Cell<Option<(u32, u32)>>,
+        visible: Cell<bool>,
+    }
+
     struct Inner {
         state: State,
-        host: web_sys::Element,
         canvas: web_sys::HtmlCanvasElement,
-        pending_resize: Cell<Option<(u32, u32)>>,
+        shared: Rc<Shared>,
     }
 
     impl Inner {
-        fn frame(&mut self) {
-            if let Some((w, h)) = self.pending_resize.take() {
+        fn tick(&mut self) {
+            // Off-screen widgets do no work.
+            if !self.shared.visible.get() {
+                return;
+            }
+            if let Some((w, h)) = self.shared.pending_resize.take() {
                 self.canvas.set_width(w);
                 self.canvas.set_height(h);
                 self.state.resize(w, h);
             }
-            self.state.render();
+            // Render only while converging or right after a camera change;
+            // once the image is stable, leave the GPU idle.
+            if self.state.camera.dirty || self.state.frame_count < SAMPLE_BUDGET {
+                self.state.render();
+            }
         }
     }
 
@@ -705,8 +726,10 @@ mod web {
     pub struct QuasiInstance {
         _inner: Rc<RefCell<Inner>>,
         _raf: RenderLoop,
-        _observer: web_sys::ResizeObserver,
-        _observer_cb: Closure<dyn FnMut()>,
+        _resize_observer: web_sys::ResizeObserver,
+        _resize_cb: Closure<dyn FnMut()>,
+        _intersection_observer: web_sys::IntersectionObserver,
+        _intersection_cb: IntersectionClosure,
         _listeners: Vec<(String, EventClosure)>,
     }
 
@@ -737,20 +760,25 @@ mod web {
             .map_err(|e| JsValue::from_str(&format!("create_surface: {e:?}")))?;
         let state = State::new(instance, surface, w, h).await;
 
+        let shared = Rc::new(Shared {
+            pending_resize: Cell::new(None),
+            visible: Cell::new(true),
+        });
+
         let inner = Rc::new(RefCell::new(Inner {
             state,
-            host: host.clone(),
             canvas: canvas.clone(),
-            pending_resize: Cell::new(None),
+            shared: shared.clone(),
         }));
 
-        // requestAnimationFrame loop (self-rescheduling).
+        // requestAnimationFrame loop (self-rescheduling). The tick is cheap when
+        // the widget is idle or off-screen: it does no GPU work.
         let raf: RenderLoop = Rc::new(RefCell::new(None));
         {
             let raf2 = raf.clone();
             let inner2 = inner.clone();
             *raf.borrow_mut() = Some(Closure::wrap(Box::new(move || {
-                inner2.borrow_mut().frame();
+                inner2.borrow_mut().tick();
                 if let Some(cb) = raf2.borrow().as_ref() {
                     request_animation_frame(cb);
                 }
@@ -759,15 +787,31 @@ mod web {
         request_animation_frame(raf.borrow().as_ref().unwrap());
 
         // ResizeObserver: re-read the host size on layout changes.
-        let observer_cb = {
-            let inner3 = inner.clone();
+        let resize_cb = {
+            let shared = shared.clone();
+            let host = host.clone();
             Closure::wrap(Box::new(move || {
-                let inner = inner3.borrow();
-                inner.pending_resize.set(Some(backing_size(&inner.host)));
+                shared.pending_resize.set(Some(backing_size(&host)));
             }) as Box<dyn FnMut()>)
         };
-        let observer = web_sys::ResizeObserver::new(observer_cb.as_ref().unchecked_ref())?;
-        observer.observe(&host);
+        let resize_observer = web_sys::ResizeObserver::new(resize_cb.as_ref().unchecked_ref())?;
+        resize_observer.observe(&host);
+
+        // IntersectionObserver: pause rendering while the host is off-screen.
+        let intersection_cb = {
+            let shared = shared.clone();
+            Closure::wrap(Box::new(move |entries: js_sys::Array| {
+                if let Ok(entry) = entries
+                    .get(0)
+                    .dyn_into::<web_sys::IntersectionObserverEntry>()
+                {
+                    shared.visible.set(entry.is_intersecting());
+                }
+            }) as Box<dyn FnMut(js_sys::Array)>)
+        };
+        let intersection_observer =
+            web_sys::IntersectionObserver::new(intersection_cb.as_ref().unchecked_ref())?;
+        intersection_observer.observe(&host);
 
         // Pointer + wheel input on the canvas.
         let mut listeners: Vec<(String, EventClosure)> = Vec::new();
@@ -836,15 +880,18 @@ mod web {
         Ok(QuasiInstance {
             _inner: inner,
             _raf: raf,
-            _observer: observer,
-            _observer_cb: observer_cb,
+            _resize_observer: resize_observer,
+            _resize_cb: resize_cb,
+            _intersection_observer: intersection_observer,
+            _intersection_cb: intersection_cb,
             _listeners: listeners,
         })
     }
 
     impl Drop for QuasiInstance {
         fn drop(&mut self) {
-            self._observer.disconnect();
+            self._resize_observer.disconnect();
+            self._intersection_observer.disconnect();
             let inner = self._inner.borrow();
             for (event, cb) in &self._listeners {
                 let _ = inner
