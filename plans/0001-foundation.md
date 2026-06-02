@@ -80,7 +80,7 @@ the long-removed `maxInterStageShaderComponents` limit that old wgpu still sends
 Lesson for a browser-targeting renderer: track current wgpu. (winit kept at 0.29;
 compatible via raw-window-handle 0.6.)
 
-### M1 — Cornell Box path tracer ✅ code complete (visual check pending)
+### M1 — Cornell Box path tracer ✅ DONE (visually confirmed, native + web)
 - [x] Scene structs (quad, material) + Cornell Box factory (`scene.rs`), with a
       GPU-packed `Uniforms` matching WGSL alignment (vec3 on 16-byte boundaries).
 - [x] WGSL path tracer (`shaders/pathtrace.wgsl`): ray gen, quad intersection,
@@ -90,8 +90,8 @@ compatible via raw-window-handle 0.6.)
 - [x] Orbit camera (drag/zoom), accumulation resets on movement.
 - [x] WGSL validated headlessly via `naga` in `cargo test` (`tests/shaders.rs`).
 - **Done when:** a recognizable, converging Cornell Box renders natively (and web).
-  _Builds native + wasm; clippy/fmt clean; shader tests pass. Visual confirmation
-  pending — run `cargo run` / the web steps._
+  _Confirmed 2026-06-02: renders correctly in both targets, converges on hold,
+  resets on camera move._
 
 **WGSL note:** `from` and `target` are reserved keywords in WGSL — the naga test
 caught both at `cargo test` time (no GPU needed). Worth keeping that test as the
