@@ -243,34 +243,44 @@ pub async fn run() {
 
     let mut state = State::new(window.clone()).await;
 
-    event_loop
-        .run(move |event, elwt| {
-            if let Event::WindowEvent { window_id, event } = event {
-                if window_id != state.window.id() {
-                    return;
-                }
-                match event {
-                    WindowEvent::CloseRequested
-                    | WindowEvent::KeyboardInput {
-                        event:
-                            KeyEvent {
-                                state: ElementState::Pressed,
-                                physical_key: PhysicalKey::Code(KeyCode::Escape),
-                                ..
-                            },
-                        ..
-                    } => elwt.exit(),
-                    WindowEvent::Resized(size) => state.resize(size),
-                    WindowEvent::RedrawRequested => {
-                        // Keep the loop alive: queue the next frame.
-                        state.window.request_redraw();
-                        state.render();
-                    }
-                    _ => {}
-                }
+    let handler = move |event: Event<()>, elwt: &winit::event_loop::EventLoopWindowTarget<()>| {
+        if let Event::WindowEvent { window_id, event } = event {
+            if window_id != state.window.id() {
+                return;
             }
-        })
-        .expect("event loop error");
+            match event {
+                WindowEvent::CloseRequested
+                | WindowEvent::KeyboardInput {
+                    event:
+                        KeyEvent {
+                            state: ElementState::Pressed,
+                            physical_key: PhysicalKey::Code(KeyCode::Escape),
+                            ..
+                        },
+                    ..
+                } => elwt.exit(),
+                WindowEvent::Resized(size) => state.resize(size),
+                WindowEvent::RedrawRequested => {
+                    // Keep the loop alive: queue the next frame.
+                    state.window.request_redraw();
+                    state.render();
+                }
+                _ => {}
+            }
+        }
+    };
+
+    // On native, run() drives the loop to completion. On the web, run() never
+    // returns and unwinds via an exception ("control flow" sentinel in the
+    // console); spawn() integrates with the browser's event loop instead.
+    #[cfg(not(target_arch = "wasm32"))]
+    event_loop.run(handler).expect("event loop error");
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        use winit::platform::web::EventLoopExtWebSys;
+        event_loop.spawn(handler);
+    }
 }
 
 /// Web entry point: invoked automatically when the wasm module initializes.

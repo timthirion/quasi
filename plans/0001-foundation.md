@@ -61,7 +61,7 @@ all as quads with per-quad materials. A `look_at` orbit camera.
 
 ## Milestones
 
-### M0 — Foundation: pixels, native + web ✅ code complete (visual check pending)
+### M0 — Foundation: pixels, native + web ✅ DONE
 - [x] Cargo project; single package as both native bin and wasm `cdylib` + `rlib`.
       (Kept as one crate for M0 rather than a separate `core` crate; split out when
       the renderer grows.)
@@ -70,7 +70,9 @@ all as quads with per-quad materials. A `look_at` orbit camera.
 - [x] `wasm-pack build --target web` succeeds; `index.html` attaches winit's
       canvas to `#quasi-canvas` and runs the same render.
 - **Done when:** the gradient shows in both a desktop window and a browser tab.
-  _Native confirmed (gradient renders). Web: in-progress — see note below._
+  _Confirmed: gradient renders natively and in the browser (WebGPU). On the web,
+  use winit's `EventLoopExtWebSys::spawn` rather than `run` so it doesn't unwind
+  via the "control flow" exception._
 
 **wgpu version note:** pin **current** wgpu (29), not an older release. An initial
 0.20 pin compiled but failed at `requestDevice` in a 2025 browser, which rejects
