@@ -80,12 +80,22 @@ the long-removed `maxInterStageShaderComponents` limit that old wgpu still sends
 Lesson for a browser-targeting renderer: track current wgpu. (winit kept at 0.29;
 compatible via raw-window-handle 0.6.)
 
-### M1 — Cornell Box path tracer (native first)
-- [ ] Scene structs (quad, material, camera) + Cornell Box factory.
-- [ ] WGSL path tracer: ray gen, quad intersection, Lambertian, NEE+MIS, RNG.
-- [ ] Progressive accumulation (ping-pong HDR) + Reinhard tonemap.
-- [ ] Orbit camera (drag/zoom) with accumulation reset on movement.
-- **Done when:** a recognizable, converging Cornell Box renders natively.
+### M1 — Cornell Box path tracer ✅ code complete (visual check pending)
+- [x] Scene structs (quad, material) + Cornell Box factory (`scene.rs`), with a
+      GPU-packed `Uniforms` matching WGSL alignment (vec3 on 16-byte boundaries).
+- [x] WGSL path tracer (`shaders/pathtrace.wgsl`): ray gen, quad intersection,
+      Lambertian, NEE+MIS, PCG. Faithful port of the verified reference integrator.
+- [x] Progressive accumulation: 3-pass pipeline (pathtrace → accumulate ping-pong
+      HDR → present), `textureLoad` keeps passes pixel-aligned (no sampler/flips).
+- [x] Orbit camera (drag/zoom), accumulation resets on movement.
+- [x] WGSL validated headlessly via `naga` in `cargo test` (`tests/shaders.rs`).
+- **Done when:** a recognizable, converging Cornell Box renders natively (and web).
+  _Builds native + wasm; clippy/fmt clean; shader tests pass. Visual confirmation
+  pending — run `cargo run` / the web steps._
+
+**WGSL note:** `from` and `target` are reserved keywords in WGSL — the naga test
+caught both at `cargo test` time (no GPU needed). Worth keeping that test as the
+first line of defense for shader changes.
 
 ### M2 — Samplers, AOVs, output
 - [ ] Selectable samplers: PCG / Halton / Sobol; sampler test (sequences off-GPU).

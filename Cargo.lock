@@ -1273,11 +1273,13 @@ checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 name = "quasi"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "cfg-if",
  "console_error_panic_hook",
  "console_log",
  "env_logger",
  "log",
+ "naga",
  "pollster",
  "wasm-bindgen",
  "wasm-bindgen-futures",

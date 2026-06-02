@@ -12,10 +12,14 @@ winit = "0.29"
 wgpu = "29"
 log = "0.4"
 cfg-if = "1"
+bytemuck = { version = "1", features = ["derive"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 pollster = "0.3"
 env_logger = "0.11"
+
+[dev-dependencies]
+naga = { version = "29", features = ["wgsl-in"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
