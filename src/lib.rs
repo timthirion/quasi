@@ -29,7 +29,16 @@ struct State {
 
 impl State {
     async fn new(window: Arc<Window>) -> State {
-        let size = window.inner_size();
+        // `mut` is only used on the wasm path below.
+        #[allow(unused_mut)]
+        let mut size = window.inner_size();
+        // On the web, inner_size() can still be 0 here (sizing is deferred), which
+        // would configure a 1x1 surface that never shows. Fall back to the canvas
+        // size we set explicitly below.
+        #[cfg(target_arch = "wasm32")]
+        if size.width == 0 || size.height == 0 {
+            size = winit::dpi::PhysicalSize::new(720, 720);
+        }
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
@@ -48,7 +57,8 @@ impl State {
                 force_fallback_adapter: false,
             })
             .await
-            .expect("no suitable GPU adapter found");
+            .expect("no suitable GPU adapter found (does this browser support WebGPU?)");
+        log::info!("adapter: {:?}", adapter.get_info());
 
         let (device, queue) = adapter
             .request_device(
@@ -193,7 +203,7 @@ pub async fn run() {
             .expect("failed to create window"),
     );
 
-    // On the web, attach winit's canvas to the page and give it a size.
+    // On the web, attach winit's canvas to the page and give it an explicit size.
     #[cfg(target_arch = "wasm32")]
     {
         use winit::platform::web::WindowExtWebSys;
@@ -202,11 +212,19 @@ pub async fn run() {
             .and_then(|win| win.document())
             .and_then(|doc| {
                 let host = doc.get_element_by_id("quasi-canvas")?;
-                let canvas = web_sys::Element::from(window.canvas()?);
-                host.append_child(&canvas).ok()?;
+                let canvas = window.canvas()?;
+                // Set the backing-store and CSS size directly; don't rely on
+                // request_inner_size having propagated yet.
+                canvas.set_width(720);
+                canvas.set_height(720);
+                let style = canvas.style();
+                let _ = style.set_property("width", "720px");
+                let _ = style.set_property("height", "720px");
+                host.append_child(canvas.as_ref()).ok()?;
                 Some(())
             })
             .expect("couldn't attach canvas to #quasi-canvas");
+        log::info!("canvas attached (720x720)");
     }
 
     let mut state = State::new(window.clone()).await;
@@ -253,6 +271,7 @@ pub async fn run() {
 #[wasm_bindgen(start)]
 pub fn start() {
     std::panic::set_hook(Box::new(console_error_panic_hook::hook));
-    console_log::init_with_level(log::Level::Warn).expect("failed to init logger");
+    console_log::init_with_level(log::Level::Info).expect("failed to init logger");
+    log::info!("quasi: starting web renderer");
     wasm_bindgen_futures::spawn_local(run());
 }
