@@ -1,0 +1,78 @@
+# AGENTS.md
+
+Guidance for AI agents working on this repository.
+
+## Project Goal
+
+Quasi is a high-quality global illumination renderer. The end goal is publishable
+output — polished technical blog posts and, ideally, novel research — so the work
+prioritizes physical correctness, measurability (convergence / variance /
+MSE-vs-reference), and modern-API techniques over breadth of features.
+
+This repository is the **Rust** implementation. Its distinctive purpose: run in
+the browser via WebAssembly (`wasm-pack`) so blog posts can embed **interactive,
+live renders** — orbit the camera, flip the integrator, watch convergence — not
+just static images. It must therefore build for both native (desktop) and web
+(wasm) from one codebase.
+
+See `plans/ROADMAP.md` for direction and `plans/` for current, machine-portable
+plans.
+
+## Tech Stack
+
+- **Language:** Rust (edition 2021).
+- **GPU:** [`wgpu`](https://wgpu.rs) — one API that targets Vulkan/Metal/DX12
+  natively and WebGPU (with a WebGL2 fallback) in the browser. This is the reason
+  the renderer can be both native and web from one source.
+- **Shaders:** WGSL (wgpu's native language; runs unmodified in the browser).
+- **Windowing/input:** `winit` (supports a native window and an HTML canvas).
+- **Async:** `pollster` to block on `wgpu` futures natively; `wasm-bindgen-futures`
+  on web.
+- **Web packaging:** `wasm-bindgen` + `wasm-pack`, with a minimal HTML/JS harness
+  for embedding in posts.
+- **Image I/O (native):** `image` (PNG) and `exr` (HDR EXR) for output and for the
+  verification harness.
+
+## Build & Run
+
+```bash
+# Native
+cargo run                      # desktop window
+cargo test                     # unit tests (metrics, samplers, ...)
+cargo clippy --all-targets     # lint
+cargo fmt                      # format
+
+# Web (once the wasm entry point exists)
+wasm-pack build --target web   # produces pkg/ for the HTML harness
+```
+
+Keep the native and web builds working in lockstep — a change that only compiles
+natively is half-done. Guard platform-specific code with `#[cfg(target_arch =
+"wasm32")]` / `#[cfg(not(target_arch = "wasm32"))]`.
+
+## Architecture (intended)
+
+- A core renderer crate that owns the `wgpu` device/queue, scene, and the WGSL
+  path-tracing pipeline; platform-agnostic.
+- Thin native and web entry points (winit window vs. canvas) that drive the core.
+- Path tracing as a WGSL megakernel rendering to an HDR texture, progressively
+  accumulated across frames (ping-pong textures), then tonemapped to the surface.
+- Verification (metrics, convergence) lives in native-only code and tests.
+
+## Coding Style
+
+- `rustfmt` defaults; keep `cargo clippy` clean (no warnings).
+- snake_case items, CamelCase types, SCREAMING_SNAKE_CASE consts.
+- Errors via `Result` with a typed error enum (`thiserror`); avoid `unwrap()`
+  outside tests and clearly-infallible setup.
+- Document public items with `///`; module overviews with `//!`.
+- One responsibility per module; keep WGSL shaders in their own `.wgsl` files
+  (include via `include_str!`) rather than inline string literals.
+- All features must have automated tests where they can run off-GPU (sampler
+  sequences, image metrics, scene math).
+
+## Git Workflow
+
+- Solo repo: commit directly to `main` and push freely.
+- End commit messages with the standard Co-Authored-By trailer.
+- Use `git mv` for moves/renames to preserve history.
