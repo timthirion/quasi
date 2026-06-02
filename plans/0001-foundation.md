@@ -97,6 +97,13 @@ compatible via raw-window-handle 0.6.)
 caught both at `cargo test` time (no GPU needed). Worth keeping that test as the
 first line of defense for shader changes.
 
+**Uniform layout gotcha:** a `vec3<u32>` (or `vec3<f32>`) in a WGSL uniform forces
+16-byte alignment, so `struct { u32, vec3<u32> }` is **32 bytes**, not 16 — which
+silently mismatched the packed 16-byte Rust struct and failed only at runtime
+("buffer too small"). The naga test can't catch this (it's a cross-language size
+mismatch, not a WGSL error). Rule: keep uniform structs to scalar fields or full
+16-byte quartets, and make the Rust and WGSL sizes obviously identical.
+
 ### M2 — Samplers, AOVs, output
 - [ ] Selectable samplers: PCG / Halton / Sobol; sampler test (sequences off-GPU).
 - [ ] AOVs: albedo / normal / depth via MRT, each accumulated.
