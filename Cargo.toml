@@ -9,7 +9,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 winit = "0.29"
-wgpu = "0.20"
+wgpu = "29"
 log = "0.4"
 cfg-if = "1"
 

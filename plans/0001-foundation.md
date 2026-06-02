@@ -70,9 +70,13 @@ all as quads with per-quad materials. A `look_at` orbit camera.
 - [x] `wasm-pack build --target web` succeeds; `index.html` attaches winit's
       canvas to `#quasi-canvas` and runs the same render.
 - **Done when:** the gradient shows in both a desktop window and a browser tab.
-  _Both targets compile (cargo build + wasm-pack build); clippy/fmt clean. Visual
-  confirmation needs a display/browser — run `cargo run` and the web steps in the
-  README to verify._
+  _Native confirmed (gradient renders). Web: in-progress — see note below._
+
+**wgpu version note:** pin **current** wgpu (29), not an older release. An initial
+0.20 pin compiled but failed at `requestDevice` in a 2025 browser, which rejects
+the long-removed `maxInterStageShaderComponents` limit that old wgpu still sends.
+Lesson for a browser-targeting renderer: track current wgpu. (winit kept at 0.29;
+compatible via raw-window-handle 0.6.)
 
 ### M1 — Cornell Box path tracer (native first)
 - [ ] Scene structs (quad, material, camera) + Cornell Box factory.

@@ -42,7 +42,7 @@ impl State {
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
 
         // Arc<Window> yields a 'static surface, sidestepping borrow lifetimes.
@@ -61,20 +61,18 @@ impl State {
         log::info!("adapter: {:?}", adapter.get_info());
 
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("quasi-device"),
-                    required_features: wgpu::Features::empty(),
-                    // Keep within WebGL2-class limits so the same code is portable;
-                    // revisit when path tracing needs more (see plan 0001 M1).
-                    required_limits: if cfg!(target_arch = "wasm32") {
-                        wgpu::Limits::downlevel_webgl2_defaults()
-                    } else {
-                        wgpu::Limits::default()
-                    },
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("quasi-device"),
+                required_features: wgpu::Features::empty(),
+                // Keep within WebGL2-class limits so the same code is portable;
+                // revisit when path tracing needs more (see plan 0001 M1).
+                required_limits: if cfg!(target_arch = "wasm32") {
+                    wgpu::Limits::downlevel_webgl2_defaults()
+                } else {
+                    wgpu::Limits::default()
                 },
-                None,
-            )
+                ..Default::default()
+            })
             .await
             .expect("failed to create device");
 
@@ -105,7 +103,7 @@ impl State {
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("pipeline-layout"),
             bind_group_layouts: &[],
-            push_constant_ranges: &[],
+            immediate_size: 0,
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -113,13 +111,13 @@ impl State {
             layout: Some(&layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
                 buffers: &[],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: config.format,
                     blend: Some(wgpu::BlendState::REPLACE),
@@ -130,7 +128,8 @@ impl State {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
+            cache: None,
         });
 
         surface.configure(&device, &config);
@@ -155,9 +154,23 @@ impl State {
         }
     }
 
-    fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        let output = self.surface.get_current_texture()?;
-        let view = output
+    fn render(&mut self) {
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                // Reconfigure and skip this frame; the next one will be fine.
+                self.surface.configure(&self.device, &self.config);
+                return;
+            }
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => return,
+            wgpu::CurrentSurfaceTexture::Validation => {
+                log::warn!("surface validation error acquiring frame");
+                return;
+            }
+        };
+
+        let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
@@ -172,6 +185,7 @@ impl State {
                 label: Some("gradient-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -181,14 +195,14 @@ impl State {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             rpass.set_pipeline(&self.pipeline);
             rpass.draw(0..3, 0..1);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
-        output.present();
-        Ok(())
+        frame.present();
     }
 }
 
@@ -250,14 +264,7 @@ pub async fn run() {
                     WindowEvent::RedrawRequested => {
                         // Keep the loop alive: queue the next frame.
                         state.window.request_redraw();
-                        match state.render() {
-                            Ok(()) => {}
-                            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                                state.resize(state.size)
-                            }
-                            Err(wgpu::SurfaceError::OutOfMemory) => elwt.exit(),
-                            Err(e) => log::warn!("render error: {e:?}"),
-                        }
+                        state.render();
                     }
                     _ => {}
                 }
