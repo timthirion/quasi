@@ -7,26 +7,18 @@
 //! 2. accumulate it into a ping-pong running average,
 //! 3. tonemap the average to the surface.
 //!
-//! An orbit camera drives the view; moving it restarts accumulation.
+//! `State` is platform-agnostic (no windowing). Native is driven by a single
+//! winit event loop; the web is driven per-instance by `requestAnimationFrame`
+//! (see the `web` module), which allows multiple independent canvases on one page
+//! — something a single winit event loop cannot do.
 
 mod scene;
 
-use std::sync::Arc;
-
 use bytemuck::{Pod, Zeroable};
-use winit::{
-    event::{ElementState, Event, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent},
-    event_loop::EventLoop,
-    keyboard::{KeyCode, PhysicalKey},
-    window::{Window, WindowBuilder},
-};
-
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen::prelude::*;
 
 const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
-/// Small uniform for the accumulate pass.
+/// Small uniform for the accumulate pass. 16 bytes — must match WGSL `AccumU`.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct AccumUniform {
@@ -80,6 +72,16 @@ impl OrbitCamera {
         [d[0] / len, d[1] / len, d[2] / len]
     }
 
+    /// Records the cursor without rotating (use on press to set the drag origin).
+    fn press(&mut self, x: f64, y: f64) {
+        self.dragging = true;
+        self.last_cursor = (x, y);
+    }
+
+    fn release(&mut self) {
+        self.dragging = false;
+    }
+
     fn on_cursor(&mut self, x: f64, y: f64) {
         if self.dragging {
             let dx = (x - self.last_cursor.0) as f32;
@@ -105,13 +107,12 @@ struct Targets {
     present_bg: [wgpu::BindGroup; 2],
 }
 
+/// The platform-agnostic renderer: owns the surface, pipelines, and scene state.
 struct State {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
-    size: winit::dpi::PhysicalSize<u32>,
-    window: Arc<Window>,
 
     pathtrace_pipeline: wgpu::RenderPipeline,
     accumulate_pipeline: wgpu::RenderPipeline,
@@ -132,6 +133,13 @@ struct State {
     read_idx: usize,
 }
 
+fn make_instance() -> wgpu::Instance {
+    wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::all(),
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    })
+}
+
 fn create_hdr_texture(device: &wgpu::Device, w: u32, h: u32, label: &str) -> wgpu::TextureView {
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
@@ -150,7 +158,6 @@ fn create_hdr_texture(device: &wgpu::Device, w: u32, h: u32, label: &str) -> wgp
     tex.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_targets(
     device: &wgpu::Device,
     w: u32,
@@ -205,22 +212,13 @@ fn build_targets(
 }
 
 impl State {
-    async fn new(window: Arc<Window>) -> State {
-        // `mut` is only used on the wasm path below.
-        #[allow(unused_mut)]
-        let mut size = window.inner_size();
-        #[cfg(target_arch = "wasm32")]
-        if size.width == 0 || size.height == 0 {
-            size = winit::dpi::PhysicalSize::new(720, 720);
-        }
-
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            ..wgpu::InstanceDescriptor::new_without_display_handle()
-        });
-        let surface = instance
-            .create_surface(window.clone())
-            .expect("failed to create surface");
+    /// Builds the renderer for an already-created surface of the given size.
+    async fn new(
+        instance: wgpu::Instance,
+        surface: wgpu::Surface<'static>,
+        width: u32,
+        height: u32,
+    ) -> State {
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::default(),
@@ -257,8 +255,8 @@ impl State {
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
-            width: size.width.max(1),
-            height: size.height.max(1),
+            width: width.max(1),
+            height: height.max(1),
             present_mode: surface_caps.present_modes[0],
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
@@ -416,8 +414,6 @@ impl State {
             device,
             queue,
             config,
-            size,
-            window,
             pathtrace_pipeline,
             accumulate_pipeline,
             present_pipeline,
@@ -434,16 +430,15 @@ impl State {
         }
     }
 
-    fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
-        if new_size.width > 0 && new_size.height > 0 {
-            self.size = new_size;
-            self.config.width = new_size.width;
-            self.config.height = new_size.height;
+    fn resize(&mut self, width: u32, height: u32) {
+        if width > 0 && height > 0 && (width != self.config.width || height != self.config.height) {
+            self.config.width = width;
+            self.config.height = height;
             self.surface.configure(&self.device, &self.config);
             self.targets = build_targets(
                 &self.device,
-                self.config.width,
-                self.config.height,
+                width,
+                height,
                 &self.accumulate_bgl,
                 &self.present_bgl,
                 &self.accum_uniform_buf,
@@ -475,7 +470,6 @@ impl State {
             self.read_idx = 0;
         }
 
-        // Update uniforms from the camera.
         let pos = self.camera.position();
         let dir = self.camera.direction();
         self.uniforms.camera.position = pos;
@@ -509,21 +503,16 @@ impl State {
                 label: Some("frame-encoder"),
             });
 
-        // Pass 1: path-trace one sample into sample_view.
         pass(&mut encoder, &self.targets.sample_view, |rp| {
             rp.set_pipeline(&self.pathtrace_pipeline);
             rp.set_bind_group(0, &self.pathtrace_bg, &[]);
             rp.draw(0..3, 0..1);
         });
-
-        // Pass 2: accumulate into accum[dst] reading accum[src].
         pass(&mut encoder, &self.targets.accum_views[dst], |rp| {
             rp.set_pipeline(&self.accumulate_pipeline);
             rp.set_bind_group(0, &self.targets.accumulate_bg[src], &[]);
             rp.draw(0..3, 0..1);
         });
-
-        // Pass 3: tonemap accum[dst] to the surface.
         pass(&mut encoder, &surface_view, |rp| {
             rp.set_pipeline(&self.present_pipeline);
             rp.set_bind_group(0, &self.targets.present_bg[dst], &[]);
@@ -563,8 +552,20 @@ fn pass<F: FnOnce(&mut wgpu::RenderPass)>(
     draw(&mut rp);
 }
 
-/// Creates the window and runs the event loop.
-pub async fn run() {
+// ---------------------------------------------------------------------------
+// Native: a single winit window + event loop.
+// ---------------------------------------------------------------------------
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn run() {
+    use std::sync::Arc;
+    use winit::{
+        event::{ElementState, Event, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent},
+        event_loop::EventLoop,
+        keyboard::{KeyCode, PhysicalKey},
+        window::WindowBuilder,
+    };
+
     let event_loop = EventLoop::new().expect("failed to create event loop");
     let window = Arc::new(
         WindowBuilder::new()
@@ -572,91 +573,286 @@ pub async fn run() {
             .build(&event_loop)
             .expect("failed to create window"),
     );
+    let size = window.inner_size();
 
-    #[cfg(target_arch = "wasm32")]
-    {
-        use winit::platform::web::WindowExtWebSys;
-        let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(720, 720));
-        web_sys::window()
-            .and_then(|win| win.document())
-            .and_then(|doc| {
-                let host = doc.get_element_by_id("quasi-canvas")?;
-                let canvas = window.canvas()?;
-                canvas.set_width(720);
-                canvas.set_height(720);
-                let style = canvas.style();
-                let _ = style.set_property("width", "720px");
-                let _ = style.set_property("height", "720px");
-                host.append_child(canvas.as_ref()).ok()?;
-                Some(())
-            })
-            .expect("couldn't attach canvas to #quasi-canvas");
-        log::info!("canvas attached (720x720)");
-    }
+    let instance = make_instance();
+    let surface = instance
+        .create_surface(window.clone())
+        .expect("failed to create surface");
+    let mut state = pollster::block_on(State::new(
+        instance,
+        surface,
+        size.width.max(1),
+        size.height.max(1),
+    ));
 
-    let mut state = State::new(window.clone()).await;
-
-    let handler = move |event: Event<()>, elwt: &winit::event_loop::EventLoopWindowTarget<()>| {
-        if let Event::WindowEvent { window_id, event } = event {
-            if window_id != state.window.id() {
-                return;
+    event_loop
+        .run(move |event, elwt| {
+            if let Event::WindowEvent { window_id, event } = event {
+                if window_id != window.id() {
+                    return;
+                }
+                match event {
+                    WindowEvent::CloseRequested
+                    | WindowEvent::KeyboardInput {
+                        event:
+                            KeyEvent {
+                                state: ElementState::Pressed,
+                                physical_key: PhysicalKey::Code(KeyCode::Escape),
+                                ..
+                            },
+                        ..
+                    } => elwt.exit(),
+                    WindowEvent::Resized(s) => state.resize(s.width, s.height),
+                    WindowEvent::MouseInput {
+                        state: btn_state,
+                        button: MouseButton::Left,
+                        ..
+                    } => {
+                        if btn_state == ElementState::Pressed {
+                            let (x, y) = state.camera.last_cursor;
+                            state.camera.press(x, y);
+                        } else {
+                            state.camera.release();
+                        }
+                    }
+                    WindowEvent::CursorMoved { position, .. } => {
+                        state.camera.on_cursor(position.x, position.y);
+                    }
+                    WindowEvent::MouseWheel { delta, .. } => {
+                        let dy = match delta {
+                            MouseScrollDelta::LineDelta(_, y) => y,
+                            MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.05,
+                        };
+                        state.camera.zoom(dy);
+                    }
+                    WindowEvent::RedrawRequested => {
+                        window.request_redraw();
+                        state.render();
+                    }
+                    _ => {}
+                }
             }
-            match event {
-                WindowEvent::CloseRequested
-                | WindowEvent::KeyboardInput {
-                    event:
-                        KeyEvent {
-                            state: ElementState::Pressed,
-                            physical_key: PhysicalKey::Code(KeyCode::Escape),
-                            ..
-                        },
-                    ..
-                } => elwt.exit(),
-                WindowEvent::Resized(size) => state.resize(size),
-                WindowEvent::MouseInput {
-                    state: btn_state,
-                    button: MouseButton::Left,
-                    ..
-                } => {
-                    state.camera.dragging = btn_state == ElementState::Pressed;
-                }
-                WindowEvent::CursorMoved { position, .. } => {
-                    state.camera.on_cursor(position.x, position.y);
-                }
-                WindowEvent::MouseWheel { delta, .. } => {
-                    let dy = match delta {
-                        MouseScrollDelta::LineDelta(_, y) => y,
-                        MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.05,
-                    };
-                    state.camera.zoom(dy);
-                }
-                WindowEvent::RedrawRequested => {
-                    state.window.request_redraw();
-                    state.render();
-                }
-                _ => {}
-            }
-        }
-    };
-
-    #[cfg(not(target_arch = "wasm32"))]
-    event_loop.run(handler).expect("event loop error");
-
-    #[cfg(target_arch = "wasm32")]
-    {
-        use winit::platform::web::EventLoopExtWebSys;
-        event_loop.spawn(handler);
-    }
+        })
+        .expect("event loop error");
 }
 
-/// Web entry point: invoked automatically when the wasm module initializes.
+// ---------------------------------------------------------------------------
+// Web: one renderer per host element, driven by requestAnimationFrame. Multiple
+// instances can coexist on a page (each owns its canvas, rAF loop, observer, and
+// input listeners). Canvas size follows the host element's clientWidth/Height
+// (× devicePixelRatio), updated via a ResizeObserver.
+// ---------------------------------------------------------------------------
+
 #[cfg(target_arch = "wasm32")]
-#[wasm_bindgen(start)]
-pub fn start() {
-    std::panic::set_hook(Box::new(console_error_panic_hook::hook));
-    console_log::init_with_level(log::Level::Info).expect("failed to init logger");
-    log::info!("quasi: starting web renderer");
-    wasm_bindgen_futures::spawn_local(run());
+mod web {
+    use super::{make_instance, State};
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+    use wasm_bindgen::prelude::*;
+    use wasm_bindgen::JsCast;
+
+    type EventClosure = Closure<dyn FnMut(web_sys::Event)>;
+    type RenderLoop = Rc<RefCell<Option<Closure<dyn FnMut()>>>>;
+
+    /// One-time setup: panic hook + console logging.
+    #[wasm_bindgen(start)]
+    pub fn start() {
+        std::panic::set_hook(Box::new(console_error_panic_hook::hook));
+        let _ = console_log::init_with_level(log::Level::Info);
+        log::info!("quasi: wasm module loaded");
+    }
+
+    fn web_window() -> web_sys::Window {
+        web_sys::window().expect("no global window")
+    }
+
+    fn request_animation_frame(cb: &Closure<dyn FnMut()>) {
+        web_window()
+            .request_animation_frame(cb.as_ref().unchecked_ref())
+            .expect("requestAnimationFrame failed");
+    }
+
+    /// Backing-store size for the canvas: the host's CSS size × device pixel ratio.
+    fn backing_size(host: &web_sys::Element) -> (u32, u32) {
+        let dpr = web_window().device_pixel_ratio().max(1.0);
+        let w = (host.client_width().max(1) as f64 * dpr).round() as u32;
+        let h = (host.client_height().max(1) as f64 * dpr).round() as u32;
+        (w.max(1), h.max(1))
+    }
+
+    struct Inner {
+        state: State,
+        host: web_sys::Element,
+        canvas: web_sys::HtmlCanvasElement,
+        pending_resize: Cell<Option<(u32, u32)>>,
+    }
+
+    impl Inner {
+        fn frame(&mut self) {
+            if let Some((w, h)) = self.pending_resize.take() {
+                self.canvas.set_width(w);
+                self.canvas.set_height(h);
+                self.state.resize(w, h);
+            }
+            self.state.render();
+        }
+    }
+
+    /// A live renderer bound to a host element. Keep this handle alive for the
+    /// lifetime of the widget (dropping it detaches the input/resize listeners).
+    #[wasm_bindgen]
+    pub struct QuasiInstance {
+        _inner: Rc<RefCell<Inner>>,
+        _raf: RenderLoop,
+        _observer: web_sys::ResizeObserver,
+        _observer_cb: Closure<dyn FnMut()>,
+        _listeners: Vec<(String, EventClosure)>,
+    }
+
+    /// Creates a renderer inside the element with the given id, sized to it.
+    #[wasm_bindgen]
+    pub async fn create(host_id: String) -> Result<QuasiInstance, JsValue> {
+        let document = web_window()
+            .document()
+            .ok_or_else(|| JsValue::from_str("no document"))?;
+        let host = document
+            .get_element_by_id(&host_id)
+            .ok_or_else(|| JsValue::from_str(&format!("no element #{host_id}")))?;
+
+        let canvas: web_sys::HtmlCanvasElement = document.create_element("canvas")?.dyn_into()?;
+        let style = canvas.style();
+        style.set_property("width", "100%")?;
+        style.set_property("height", "100%")?;
+        style.set_property("display", "block")?;
+        host.append_child(&canvas)?;
+
+        let (w, h) = backing_size(&host);
+        canvas.set_width(w);
+        canvas.set_height(h);
+
+        let instance = make_instance();
+        let surface = instance
+            .create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))
+            .map_err(|e| JsValue::from_str(&format!("create_surface: {e:?}")))?;
+        let state = State::new(instance, surface, w, h).await;
+
+        let inner = Rc::new(RefCell::new(Inner {
+            state,
+            host: host.clone(),
+            canvas: canvas.clone(),
+            pending_resize: Cell::new(None),
+        }));
+
+        // requestAnimationFrame loop (self-rescheduling).
+        let raf: RenderLoop = Rc::new(RefCell::new(None));
+        {
+            let raf2 = raf.clone();
+            let inner2 = inner.clone();
+            *raf.borrow_mut() = Some(Closure::wrap(Box::new(move || {
+                inner2.borrow_mut().frame();
+                if let Some(cb) = raf2.borrow().as_ref() {
+                    request_animation_frame(cb);
+                }
+            }) as Box<dyn FnMut()>));
+        }
+        request_animation_frame(raf.borrow().as_ref().unwrap());
+
+        // ResizeObserver: re-read the host size on layout changes.
+        let observer_cb = {
+            let inner3 = inner.clone();
+            Closure::wrap(Box::new(move || {
+                let inner = inner3.borrow();
+                inner.pending_resize.set(Some(backing_size(&inner.host)));
+            }) as Box<dyn FnMut()>)
+        };
+        let observer = web_sys::ResizeObserver::new(observer_cb.as_ref().unchecked_ref())?;
+        observer.observe(&host);
+
+        // Pointer + wheel input on the canvas.
+        let mut listeners: Vec<(String, EventClosure)> = Vec::new();
+        let mut add = |event: &str, cb: EventClosure| -> Result<(), JsValue> {
+            canvas.add_event_listener_with_callback(event, cb.as_ref().unchecked_ref())?;
+            listeners.push((event.to_string(), cb));
+            Ok(())
+        };
+
+        {
+            let inner = inner.clone();
+            add(
+                "pointerdown",
+                Closure::wrap(Box::new(move |e: web_sys::Event| {
+                    if let Ok(m) = e.dyn_into::<web_sys::MouseEvent>() {
+                        inner
+                            .borrow_mut()
+                            .state
+                            .camera
+                            .press(m.client_x() as f64, m.client_y() as f64);
+                    }
+                }) as Box<dyn FnMut(web_sys::Event)>),
+            )?;
+        }
+        {
+            let inner = inner.clone();
+            add(
+                "pointermove",
+                Closure::wrap(Box::new(move |e: web_sys::Event| {
+                    if let Ok(m) = e.dyn_into::<web_sys::MouseEvent>() {
+                        inner
+                            .borrow_mut()
+                            .state
+                            .camera
+                            .on_cursor(m.client_x() as f64, m.client_y() as f64);
+                    }
+                }) as Box<dyn FnMut(web_sys::Event)>),
+            )?;
+        }
+        {
+            let inner = inner.clone();
+            add(
+                "pointerup",
+                Closure::wrap(Box::new(move |_e: web_sys::Event| {
+                    inner.borrow_mut().state.camera.release();
+                }) as Box<dyn FnMut(web_sys::Event)>),
+            )?;
+        }
+        {
+            let inner = inner.clone();
+            add(
+                "wheel",
+                Closure::wrap(Box::new(move |e: web_sys::Event| {
+                    if let Ok(w) = e.dyn_into::<web_sys::WheelEvent>() {
+                        w.prevent_default();
+                        inner
+                            .borrow_mut()
+                            .state
+                            .camera
+                            .zoom(-(w.delta_y() as f32) * 0.01);
+                    }
+                }) as Box<dyn FnMut(web_sys::Event)>),
+            )?;
+        }
+
+        Ok(QuasiInstance {
+            _inner: inner,
+            _raf: raf,
+            _observer: observer,
+            _observer_cb: observer_cb,
+            _listeners: listeners,
+        })
+    }
+
+    impl Drop for QuasiInstance {
+        fn drop(&mut self) {
+            self._observer.disconnect();
+            let inner = self._inner.borrow();
+            for (event, cb) in &self._listeners {
+                let _ = inner
+                    .canvas
+                    .remove_event_listener_with_callback(event, cb.as_ref().unchecked_ref());
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -700,8 +896,7 @@ mod tests {
         let mut c = OrbitCamera::new();
         c.on_cursor(10.0, 10.0); // not dragging: no rotation, just records cursor
         assert_eq!(c.azimuth, 0.0);
-        c.dragging = true;
-        c.on_cursor(10.0, 10.0); // baseline (zero delta)
+        c.press(10.0, 10.0); // begin drag at the current cursor
         c.on_cursor(110.0, 10.0); // dx = 100 -> azimuth -= 100 * 0.005
         assert!((c.azimuth + 0.5).abs() < 1e-5);
     }
@@ -709,15 +904,13 @@ mod tests {
     #[test]
     fn elevation_is_clamped() {
         let mut c = OrbitCamera::new();
-        c.dragging = true;
-        c.on_cursor(0.0, 0.0);
+        c.press(0.0, 0.0);
         c.on_cursor(0.0, 1.0e6); // huge upward drag
         assert!((c.elevation - 1.5).abs() < 1e-4);
     }
 
     #[test]
     fn accum_uniform_is_16_bytes() {
-        // Must match the 16-byte WGSL AccumU in shaders/accumulate.wgsl.
         assert_eq!(std::mem::size_of::<AccumUniform>(), 16);
     }
 }

@@ -7,20 +7,36 @@
     <!-- Empty inline icon so the browser doesn't request /favicon.ico. -->
     <link rel="icon" href="data:," />
     <style>
-      html, body { margin: 0; height: 100%; background: #111; }
-      #quasi-canvas { display: flex; align-items: center; justify-content: center; height: 100%; }
-      #quasi-canvas canvas { outline: none; }
+      html, body { margin: 0; background: #111; color: #ccc; font-family: sans-serif; }
+      .row { display: flex; gap: 16px; padding: 16px; flex-wrap: wrap; }
+      /* The renderer fills each host element; size is read from these boxes. */
+      .quasi { background: #000; }
+      #a { width: 480px; height: 480px; }
+      #b { width: 300px; height: 300px; }
+      /* A resizable box to exercise the ResizeObserver. */
+      #c { width: 360px; height: 360px; resize: both; overflow: hidden; border: 1px solid #444; }
+      p { padding: 0 16px; }
     </style>
   </head>
   <body>
-    <!-- winit appends its <canvas> here. -->
-    <div id="quasi-canvas"></div>
+    <p>Multiple independent Quasi instances on one page. Drag to orbit, scroll to
+       zoom. The third box is resizable (drag its bottom-right corner).</p>
+    <div class="row">
+      <div class="quasi" id="a"></div>
+      <div class="quasi" id="b"></div>
+      <div class="quasi" id="c"></div>
+    </div>
 
     <script type="module">
-      // wasm-pack --target web emits ./pkg/quasi.js. The #[wasm_bindgen(start)]
-      // entry point runs automatically once init() resolves.
-      import init from "./pkg/quasi.js";
-      init().catch(console.error);
+      import init, { create } from "./pkg/quasi.js";
+
+      // Keep handles alive for the lifetime of the page.
+      const instances = [];
+      init().then(async () => {
+        for (const id of ["a", "b", "c"]) {
+          instances.push(await create(id));
+        }
+      }).catch(console.error);
     </script>
   </body>
 </html>

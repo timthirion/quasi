@@ -80,6 +80,14 @@ the long-removed `maxInterStageShaderComponents` limit that old wgpu still sends
 Lesson for a browser-targeting renderer: track current wgpu. (winit kept at 0.29;
 compatible via raw-window-handle 0.6.)
 
+**Web architecture (post-M1):** the web path no longer uses winit. winit allows
+only one event loop per process, which blocks **multiple instances on one page**.
+Instead `State` is platform-agnostic and the web is driven per-instance by
+`requestAnimationFrame` (`web` module: `QuasiInstance` + `create(host_id)`). Each
+instance owns its canvas, rAF loop, pointer/wheel listeners, and a `ResizeObserver`
+that sizes the canvas to the host element's `clientWidth/Height × devicePixelRatio`.
+Native still uses a single winit window/event loop. This is the groundwork for M4.
+
 ### M1 — Cornell Box path tracer ✅ DONE (visually confirmed, native + web)
 - [x] Scene structs (quad, material) + Cornell Box factory (`scene.rs`), with a
       GPU-packed `Uniforms` matching WGSL alignment (vec3 on 16-byte boundaries).
