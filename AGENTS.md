@@ -21,9 +21,10 @@ plans.
 ## Tech Stack
 
 - **Language:** Rust (edition 2021).
-- **GPU:** [`wgpu`](https://wgpu.rs) — one API that targets Vulkan/Metal/DX12
-  natively and WebGPU (with a WebGL2 fallback) in the browser. This is the reason
-  the renderer can be both native and web from one source.
+- **GPU:** [`wgpu`](https://wgpu.rs) — the renderer codes against **one API
+  surface: WebGPU**, and one shading language: WGSL. `wgpu` *implements* WebGPU and
+  maps it down to a native backend (Metal/Vulkan/DX12) automatically, or to WebGPU
+  (with a WebGL2 fallback) in the browser.
 - **Shaders:** WGSL (wgpu's native language; runs unmodified in the browser).
 - **Windowing/input:** `winit` (supports a native window and an HTML canvas).
 - **Async:** `pollster` to block on `wgpu` futures natively; `wasm-bindgen-futures`
@@ -32,6 +33,24 @@ plans.
   for embedding in posts.
 - **Image I/O (native):** `image` (PNG) and `exr` (HDR EXR) for output and for the
   verification harness.
+
+## Scope: single API, no backend abstraction
+
+This is a deliberate divergence worth stating plainly: **Quasi (Rust) is
+WebGPU-only at the API level, and has no GPU-backend abstraction layer.** We write
+WebGPU/WGSL once and let `wgpu` choose the native backend.
+
+- This is *not* "Metal-only" or "Vulkan-only" — running natively, `wgpu` still
+  talks to Metal under the hood on macOS, Vulkan on Linux, etc. We just never
+  write those APIs; the abstraction is `wgpu`'s job, not ours.
+- We do **not** build a pluggable multi-backend system. Targeting a single API
+  with a single shading language is precisely what makes the same source drop into
+  a blog post as a WebAssembly widget — that one-source-to-browser story is the
+  reason this implementation exists, and a backend abstraction would work against
+  it.
+
+(For contrast: a separate native implementation of Quasi is free to be
+backend-agnostic and write Metal/Vulkan/etc. directly. This repo is not.)
 
 ## Build & Run
 

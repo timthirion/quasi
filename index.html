@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Quasi</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #111; }
+      #quasi-canvas { display: flex; align-items: center; justify-content: center; height: 100%; }
+      #quasi-canvas canvas { outline: none; }
+    </style>
+  </head>
+  <body>
+    <!-- winit appends its <canvas> here. -->
+    <div id="quasi-canvas"></div>
+
+    <script type="module">
+      // wasm-pack --target web emits ./pkg/quasi.js. The #[wasm_bindgen(start)]
+      // entry point runs automatically once init() resolves.
+      import init from "./pkg/quasi.js";
+      init().catch((err) => {
+        if (!err.message?.startsWith("Using exceptions for control flow")) throw err;
+      });
+    </script>
+  </body>
+</html>

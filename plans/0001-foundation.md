@@ -61,13 +61,18 @@ all as quads with per-quad materials. A `look_at` orbit camera.
 
 ## Milestones
 
-### M0 — Foundation: pixels, native + web
-- [ ] Cargo project; `core` + native bin + web lib targets.
-- [ ] `wgpu` init (adapter/device/queue/surface) working natively.
-- [ ] Fullscreen-triangle pass drawing a gradient to the window.
-- [ ] `wasm-pack build --target web` + minimal HTML harness rendering the same
-      gradient on a canvas.
+### M0 — Foundation: pixels, native + web ✅ code complete (visual check pending)
+- [x] Cargo project; single package as both native bin and wasm `cdylib` + `rlib`.
+      (Kept as one crate for M0 rather than a separate `core` crate; split out when
+      the renderer grows.)
+- [x] `wgpu` init (adapter/device/queue/surface) — builds and links natively.
+- [x] Fullscreen-triangle pass drawing a gradient (`src/shader.wgsl`).
+- [x] `wasm-pack build --target web` succeeds; `index.html` attaches winit's
+      canvas to `#quasi-canvas` and runs the same render.
 - **Done when:** the gradient shows in both a desktop window and a browser tab.
+  _Both targets compile (cargo build + wasm-pack build); clippy/fmt clean. Visual
+  confirmation needs a display/browser — run `cargo run` and the web steps in the
+  README to verify._
 
 ### M1 — Cornell Box path tracer (native first)
 - [ ] Scene structs (quad, material, camera) + Cornell Box factory.
