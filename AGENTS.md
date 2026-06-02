@@ -90,6 +90,24 @@ natively is half-done. Guard platform-specific code with `#[cfg(target_arch =
 - All features must have automated tests where they can run off-GPU (sampler
   sequences, image metrics, scene math).
 
+## Testing
+
+Automated tests are a first-class priority, not an afterthought. Aim for broad,
+fast, deterministic coverage — heavy on unit tests — and land new code together
+with tests for it in the same change.
+
+Test everything that can run off-GPU/off-hardware:
+- **Scene & geometry math** — Cornell Box construction, transforms, helpers.
+- **CPU↔GPU struct layout** — assert `size_of`/`offset_of` for every uniform/buffer
+  struct against the WGSL layout. This class of bug (e.g. `vec3` forcing 16-byte
+  alignment) only fails at runtime otherwise; pin it with a test.
+- **Sampler sequences**, **image metrics**, camera math — pure, so test directly.
+- **WGSL shaders** — validate with `naga` in `cargo test` (`tests/shaders.rs`).
+
+For anything that genuinely needs the GPU (pipeline/binding validation, real
+renders), keep a headless validation path where feasible and note what remains
+manual. `cargo test` should stay green and meaningful at every commit.
+
 ## Git Workflow
 
 - Solo repo: commit directly to `main` and push freely.

@@ -192,3 +192,62 @@ pub fn cornell_box() -> Scene {
 
     scene
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::{offset_of, size_of};
+
+    // These sizes/offsets MUST match the WGSL `Uniforms` layout in
+    // shaders/pathtrace.wgsl. A mismatch fails only at runtime ("buffer too
+    // small"), so this test is the off-GPU guard for that class of bug.
+    #[test]
+    fn gpu_struct_layout_matches_wgsl() {
+        assert_eq!(size_of::<GpuCamera>(), 48);
+        assert_eq!(size_of::<GpuQuad>(), 48);
+        assert_eq!(size_of::<GpuMaterial>(), 32);
+        // camera (48) + 8 * u32 scalar block (32) = 80, then the arrays.
+        assert_eq!(offset_of!(Uniforms, quads), 80);
+        assert_eq!(offset_of!(Uniforms, materials), 80 + MAX_QUADS * 48);
+        assert_eq!(size_of::<Uniforms>(), 80 + MAX_QUADS * 48 + MAX_QUADS * 32);
+    }
+
+    #[test]
+    fn cornell_box_geometry() {
+        let s = cornell_box();
+        // 5 walls + 1 light + 2 boxes * 5 visible faces.
+        assert_eq!(s.quads.len(), 16);
+        assert_eq!(s.quads.len(), s.materials.len());
+        assert!(s.quads.len() <= MAX_QUADS);
+        assert!((s.light_index as usize) < s.quads.len());
+    }
+
+    #[test]
+    fn only_the_light_is_emissive() {
+        let s = cornell_box();
+        for (i, m) in s.materials.iter().enumerate() {
+            let emissive = m.emission.iter().any(|&e| e > 0.0);
+            assert_eq!(
+                emissive,
+                i == s.light_index as usize,
+                "material {i} emissive={emissive} but light_index={}",
+                s.light_index
+            );
+        }
+    }
+
+    #[test]
+    fn rotate_y_quarter_turn() {
+        // +X rotated 90° about Y lands on -Z.
+        let r = rotate_y([1.0, 0.0, 0.0], 90.0);
+        assert!(r[0].abs() < 1e-5);
+        assert!(r[1].abs() < 1e-5);
+        assert!((r[2] + 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn add_and_sub_basics() {
+        assert_eq!(add([1.0, 2.0, 3.0], [4.0, 5.0, 6.0]), [5.0, 7.0, 9.0]);
+        assert_eq!(sub([3.0, 2.0, 1.0], [1.0, 1.0, 1.0]), [2.0, 1.0, 0.0]);
+    }
+}

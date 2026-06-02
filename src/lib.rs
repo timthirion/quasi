@@ -658,3 +658,66 @@ pub fn start() {
     log::info!("quasi: starting web renderer");
     wasm_bindgen_futures::spawn_local(run());
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn close(a: [f32; 3], b: [f32; 3]) {
+        for i in 0..3 {
+            assert!((a[i] - b[i]).abs() < 1e-4, "{a:?} vs {b:?}");
+        }
+    }
+
+    #[test]
+    fn default_camera_looks_down_negative_z() {
+        let c = OrbitCamera::new();
+        close(c.position(), [0.0, 1.0, 3.5]);
+        close(c.direction(), [0.0, 0.0, -1.0]);
+    }
+
+    #[test]
+    fn direction_is_normalized() {
+        let mut c = OrbitCamera::new();
+        c.azimuth = 0.7;
+        c.elevation = 0.4;
+        let d = c.direction();
+        let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        assert!((len - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn zoom_clamps_distance() {
+        let mut c = OrbitCamera::new();
+        c.zoom(1000.0);
+        assert!((c.distance - 1.0).abs() < 1e-6);
+        c.zoom(-1000.0);
+        assert!((c.distance - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rotation_only_while_dragging() {
+        let mut c = OrbitCamera::new();
+        c.on_cursor(10.0, 10.0); // not dragging: no rotation, just records cursor
+        assert_eq!(c.azimuth, 0.0);
+        c.dragging = true;
+        c.on_cursor(10.0, 10.0); // baseline (zero delta)
+        c.on_cursor(110.0, 10.0); // dx = 100 -> azimuth -= 100 * 0.005
+        assert!((c.azimuth + 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn elevation_is_clamped() {
+        let mut c = OrbitCamera::new();
+        c.dragging = true;
+        c.on_cursor(0.0, 0.0);
+        c.on_cursor(0.0, 1.0e6); // huge upward drag
+        assert!((c.elevation - 1.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn accum_uniform_is_16_bytes() {
+        // Must match the 16-byte WGSL AccumU in shaders/accumulate.wgsl.
+        assert_eq!(std::mem::size_of::<AccumUniform>(), 16);
+    }
+}
