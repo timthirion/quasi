@@ -57,7 +57,28 @@ Real geometry (triangle meshes + acceleration / hardware ray tracing where
 available), richer BSDFs (GGX, dielectrics), many-light sampling, denoising. Each
 becomes a post in its own right.
 
+## Parallel track — real-time rasterization
+
+A second renderer track runs in parallel with the path tracer. Quasi grows
+from a single-pipeline path tracer into a **dual-pipeline renderer**: a
+path-traced pipeline (above) for offline-quality stills and the convergence
+story, plus a **real-time rasterized pipeline** for 60fps interactive scenes
+that the path tracer can't serve.
+
+The two pipelines stay **wholly separate** at the renderer layer — different
+scenes, different shaders, different draw paths — and share only the
+platform plumbing (`gpu` module: wgpu device / queue / surface, frame loop,
+canvas attachment). Each pipeline ships its own browser instance type;
+each widget picks one.
+
+The driving consumer is [`motum`](https://github.com/timthirion/motum)'s
+Phase 4: live in-browser planning demos (drag a goal, watch RRT-Connect
+solve, scrub the resulting trajectory). The path-tracer track keeps its
+own audience (the Cornell Box / convergence widget at `0001`'s M4).
+
 ## Active plans
 
 - [`0001-foundation.md`](0001-foundation.md) — Bring the renderer up to a complete
   interactive Cornell Box path tracer (Phases 0–3, staged as milestones). **active**
+- [`0002-realtime-rasterization.md`](0002-realtime-rasterization.md) — Dual-
+  pipeline split + a real-time rasterized renderer (milestones R0–R4). **active**
