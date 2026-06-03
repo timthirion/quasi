@@ -14,15 +14,24 @@ fn validate(name: &str, src: &str) {
 
 #[test]
 fn pathtrace_shader_is_valid() {
-    validate("pathtrace", include_str!("../src/shaders/pathtrace.wgsl"));
+    validate(
+        "pathtrace",
+        include_str!("../src/pathtrace/shaders/pathtrace.wgsl"),
+    );
 }
 
 #[test]
 fn accumulate_shader_is_valid() {
-    validate("accumulate", include_str!("../src/shaders/accumulate.wgsl"));
+    validate(
+        "accumulate",
+        include_str!("../src/pathtrace/shaders/accumulate.wgsl"),
+    );
 }
 
 #[test]
 fn present_shader_is_valid() {
-    validate("present", include_str!("../src/shaders/present.wgsl"));
+    validate(
+        "present",
+        include_str!("../src/pathtrace/shaders/present.wgsl"),
+    );
 }

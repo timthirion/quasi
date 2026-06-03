@@ -112,24 +112,32 @@ pipelines. Mouse drag / wheel zoom semantics stay the same.
 This plan is staged like `0001-foundation`: each milestone is independently
 shippable.
 
-### R0 — Module split & shared GPU plumbing
+### R0 — Module split & shared GPU plumbing ✅ DONE
 Refactor without behavior change. Path tracer keeps working native + web;
-empty `raster` module compiles. Then the existing renderer lives at
-`quasi::pathtrace::*` and the platform glue at `quasi::gpu::*`.
+empty `raster` module compiles. Existing renderer now lives at
+`quasi::pathtrace::*` and the shared bits at `quasi::gpu::*`.
 
-- [ ] Extract `OrbitCamera` to `gpu::camera`.
-- [ ] Extract wgpu instance/adapter/device/queue init to `gpu`.
-- [ ] Move current `State`, `Targets`, accumulate / present passes, and
+- [x] Extract `OrbitCamera` to `gpu::camera`.
+- [x] Extract the wgpu `Instance` factory (`make_instance`) to `gpu`.
+      Device / adapter / queue creation stays inside the per-pipeline
+      `State::new` since it's bound up with surface configuration; we'll
+      revisit if both pipelines end up requesting them identically.
+- [x] Move current `State`, `Targets`, accumulate / present passes, and
       `scene.rs` into `pathtrace`.
-- [ ] Move `mod web` into `gpu::web` (kept pipeline-agnostic by injecting
-      the renderer as a generic / trait object — pipeline owns the
-      per-frame work, `gpu::web` owns rAF + observers).
-- [ ] Empty `raster` module compiles and is wired into `lib.rs` re-exports.
-- [ ] Native `cargo run` still shows the Cornell Box; web `wasm-pack`
-      build still produces a working widget; `cargo test` still green.
+- [ ] ~~Move `mod web` into `gpu::web` (kept pipeline-agnostic by injecting
+      the renderer)~~ — **deferred to R1.** The web driver touches a few
+      path-tracer-specific bits (`camera.dirty`, `frame_count`,
+      `SAMPLE_BUDGET`); the right abstraction emerges once we have a
+      second consumer (a `RasterInstance`) to inform whether to generify
+      via a `Renderer` trait or to keep two clean side-by-side drivers.
+- [x] Empty `raster` module compiles and is wired into `lib.rs` re-exports.
+- [x] Native `cargo build` + `cargo test` green; `cargo check` for
+      `wasm32-unknown-unknown` green; clippy `-D warnings` clean; fmt
+      clean. The Cornell Box widget on `index.html` keeps working
+      unchanged because the wasm-bindgen `create()` entry is preserved.
 
 **Done when:** all of M0 + M1's existing functionality keeps working
-with no visible change; the new module boundaries are in place.
+with no visible change; the new module boundaries are in place. ✓
 
 ### R1 — Forward triangle pipeline
 First raster pixel-on-screen. A single triangle mesh rendered with simple
