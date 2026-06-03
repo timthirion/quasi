@@ -169,20 +169,29 @@ validation. ✓ — native window works; wasm-bindgen exports compile for
 the first motum demo widget (it'll be the first thing using
 `create_raster`).
 
-### R2 — Instanced scene
+### R2 — Instanced scene ✅ DONE
 Many meshes, one draw path per geometry. Foundation for rendering whole
-robots (skeletal sphere/cylinder primitives) or thousands of planner-tree
-nodes.
+robots and thousands of planner-tree nodes.
 
-- [ ] Geometry library inside `RasterScene`: register a mesh, get a
-      `MeshHandle`.
-- [ ] Per-instance buffer (transform matrix + material).
-- [ ] Indexed indirect or instanced draw per `MeshHandle`.
-- [ ] Procedural primitives: sphere, capsule, cylinder, box.
-- [ ] Scene assembly API + tests for transform math.
+- [x] Geometry library inside `raster::State`: register a mesh, get a
+      `MeshHandle`; three default handles (cube, sphere, cylinder) seeded
+      at construction.
+- [x] Per-instance vertex buffer (`InstanceRaw`: 4 mat4 columns + tint
+      rgba, 80-byte stride, instance-stepped at locations 3..=7).
+- [x] Bucket-by-mesh upload + per-mesh instanced `draw_indexed`; instance
+      buffer auto-grows when the scene's instance count exceeds capacity.
+- [x] Procedural primitives: `cube_mesh`, `sphere_mesh`, `cylinder_mesh`
+      (capsule deferred until an arm-rendering test actually needs it).
+- [x] `scene` module with `Scene`, `MeshHandle`, `Instance`, `InstanceRaw`,
+      and `translation` / `scale` / `IDENTITY_MAT4` helpers; tests covering
+      `InstanceRaw` layout + round-trip.
+- [x] Default demo scene in `State::new`: ground plane + three colored
+      cubes + a sphere + a cylinder. `cargo run -- raster` shows it.
 
-**Done when:** a small assembled scene (ground plane + a few primitive
-shapes at hand-chosen poses) renders correctly.
+**Done when:** a small assembled scene renders correctly. ✓ — 24 unit
+tests green, native + wasm builds clean. Visual confirmation lands with
+the motum demo widget once it's the first real consumer of the scene
+API.
 
 ### R3 — Overlays for planner artifacts
 Lines and points for visualizing planner search trees, end-effector

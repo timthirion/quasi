@@ -1,9 +1,10 @@
 //! Triangle meshes for the rasterized pipeline.
 //!
-//! Phase R1 keeps this tiny: one `Vertex` layout (position + normal + color),
-//! one `Mesh` type (owned vertex + index data), and a procedural cube. R2
-//! grows this with capsules / cylinders / spheres for representing robot
-//! link geometry.
+//! A small library: one `Vertex` layout (position + normal + color) and a
+//! handful of procedural primitives — cube, sphere, cylinder — that cover
+//! everything an articulated-robot demo needs to render (link bodies,
+//! joint spheres, obstacle markers). Real mesh I/O (OBJ / glTF) lands when
+//! a use case actually demands it, likely via the `morsel` sibling crate.
 
 use bytemuck::{Pod, Zeroable};
 
@@ -116,6 +117,144 @@ pub fn cube_mesh(size: f32, color: [f32; 3]) -> Mesh {
     Mesh { vertices, indices }
 }
 
+/// UV-sphere centered at the origin with the given radius.
+///
+/// `lat_segments` is the number of horizontal rings (excluding poles);
+/// `lon_segments` is the number of vertical wedges. Vertex normals point
+/// outward from the sphere's center.
+pub fn sphere_mesh(radius: f32, lat_segments: u32, lon_segments: u32, color: [f32; 3]) -> Mesh {
+    use std::f32::consts::PI;
+
+    let lat = lat_segments.max(2);
+    let lon = lon_segments.max(3);
+
+    let mut vertices = Vec::with_capacity(((lat + 1) * (lon + 1)) as usize);
+    for i in 0..=lat {
+        let v = i as f32 / lat as f32;
+        let theta = v * PI; // 0 at +y pole, PI at -y pole
+        let (st, ct) = theta.sin_cos();
+        for j in 0..=lon {
+            let u = j as f32 / lon as f32;
+            let phi = u * 2.0 * PI;
+            let (sp, cp) = phi.sin_cos();
+            let n = [sp * st, ct, cp * st];
+            vertices.push(Vertex {
+                position: [radius * n[0], radius * n[1], radius * n[2]],
+                normal: n,
+                color,
+            });
+        }
+    }
+
+    let stride = lon + 1;
+    let mut indices = Vec::with_capacity((lat * lon * 6) as usize);
+    for i in 0..lat {
+        for j in 0..lon {
+            let a = (i * stride + j) as u16;
+            let b = (i * stride + j + 1) as u16;
+            let c = ((i + 1) * stride + j) as u16;
+            let d = ((i + 1) * stride + j + 1) as u16;
+            indices.extend_from_slice(&[a, c, b, b, c, d]);
+        }
+    }
+
+    Mesh { vertices, indices }
+}
+
+/// Cylinder centered at the origin with its axis along +Y, with flat caps.
+///
+/// `height` is the total length along Y; `radius` is the side radius.
+/// `segments` is the number of circumferential segments. Side normals point
+/// radially outward; cap normals point along ±Y.
+pub fn cylinder_mesh(radius: f32, height: f32, segments: u32, color: [f32; 3]) -> Mesh {
+    use std::f32::consts::PI;
+
+    let segs = segments.max(3);
+    let half = height * 0.5;
+
+    let mut vertices: Vec<Vertex> = Vec::new();
+    let mut indices: Vec<u16> = Vec::new();
+
+    // --- Side wall ---
+    let side_base = vertices.len() as u16;
+    for i in 0..=segs {
+        let t = i as f32 / segs as f32;
+        let phi = t * 2.0 * PI;
+        let (sp, cp) = phi.sin_cos();
+        let n = [sp, 0.0, cp];
+        // Bottom ring
+        vertices.push(Vertex {
+            position: [radius * sp, -half, radius * cp],
+            normal: n,
+            color,
+        });
+        // Top ring
+        vertices.push(Vertex {
+            position: [radius * sp, half, radius * cp],
+            normal: n,
+            color,
+        });
+    }
+    for i in 0..segs {
+        let b0 = side_base + (i * 2) as u16;
+        let t0 = b0 + 1;
+        let b1 = b0 + 2;
+        let t1 = b0 + 3;
+        indices.extend_from_slice(&[b0, t0, b1, b1, t0, t1]);
+    }
+
+    // --- Top cap (+Y) ---
+    let top_center = vertices.len() as u16;
+    vertices.push(Vertex {
+        position: [0.0, half, 0.0],
+        normal: [0.0, 1.0, 0.0],
+        color,
+    });
+    let top_ring_start = vertices.len() as u16;
+    for i in 0..=segs {
+        let t = i as f32 / segs as f32;
+        let phi = t * 2.0 * PI;
+        let (sp, cp) = phi.sin_cos();
+        vertices.push(Vertex {
+            position: [radius * sp, half, radius * cp],
+            normal: [0.0, 1.0, 0.0],
+            color,
+        });
+    }
+    for i in 0..segs {
+        let a = top_ring_start + i as u16;
+        let b = a + 1;
+        indices.extend_from_slice(&[top_center, a, b]);
+    }
+
+    // --- Bottom cap (-Y) ---
+    let bot_center = vertices.len() as u16;
+    vertices.push(Vertex {
+        position: [0.0, -half, 0.0],
+        normal: [0.0, -1.0, 0.0],
+        color,
+    });
+    let bot_ring_start = vertices.len() as u16;
+    for i in 0..=segs {
+        let t = i as f32 / segs as f32;
+        let phi = t * 2.0 * PI;
+        let (sp, cp) = phi.sin_cos();
+        vertices.push(Vertex {
+            position: [radius * sp, -half, radius * cp],
+            normal: [0.0, -1.0, 0.0],
+            color,
+        });
+    }
+    for i in 0..segs {
+        let a = bot_ring_start + i as u16;
+        let b = a + 1;
+        // Reverse winding so bottom faces outward.
+        indices.extend_from_slice(&[bot_center, b, a]);
+    }
+
+    Mesh { vertices, indices }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,6 +278,41 @@ mod tests {
         for v in &m.vertices {
             let len: f32 = v.normal.iter().map(|x| x * x).sum::<f32>().sqrt();
             assert!((len - 1.0).abs() < 1e-6, "non-unit normal {:?}", v.normal);
+        }
+    }
+
+    #[test]
+    fn sphere_has_expected_counts() {
+        let m = sphere_mesh(1.0, 8, 16, [1.0; 3]);
+        assert_eq!(m.vertices.len(), 9 * 17);
+        assert_eq!(m.indices.len(), 8 * 16 * 6);
+    }
+
+    #[test]
+    fn sphere_vertices_are_on_the_sphere() {
+        let r = 2.5;
+        let m = sphere_mesh(r, 8, 16, [1.0; 3]);
+        for v in &m.vertices {
+            let len: f32 = v.position.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!(
+                (len - r).abs() < 1e-4,
+                "vertex not on sphere: {:?}",
+                v.position
+            );
+            let n: f32 = v.normal.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!((n - 1.0).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn cylinder_side_radii_match() {
+        let r = 0.4;
+        let m = cylinder_mesh(r, 1.0, 12, [1.0; 3]);
+        // Side ring vertices are at exactly radius r in xz; first 26
+        // are the side wall (12 segs + 1) * 2.
+        for v in m.vertices.iter().take(26) {
+            let rho = (v.position[0].powi(2) + v.position[2].powi(2)).sqrt();
+            assert!((rho - r).abs() < 1e-5);
         }
     }
 }

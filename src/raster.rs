@@ -1,30 +1,30 @@
 //! Real-time rasterized renderer.
 //!
-//! Forward-shaded triangle pipeline targeting 60fps interactive scenes —
-//! the second of Quasi's two pipelines (see plan `0002-realtime-
-//! rasterization`). R1 lands a single shaded mesh; R2 grows this into an
-//! instanced scene with a geometry library; R3 adds line / point overlays
-//! for planner artifacts; R4 wires up the motum-shaped JSON ingestion and
-//! a draggable goal handle.
+//! Forward-shaded triangle pipeline with per-instance model transforms,
+//! targeting 60fps interactive scenes. R2 lands the instanced scene
+//! shape; R3 adds line / point overlays; R4 ingests motum's serialized
+//! scene + trajectory and adds a draggable goal handle.
 //!
 //! Shares nothing with [`pathtrace`](crate::pathtrace) below the
-//! [`gpu`](crate::gpu) seam — different scene representation, different
-//! shaders, different draw path.
+//! [`gpu`](crate::gpu) seam.
 
 pub mod mesh;
+pub mod scene;
 
 #[cfg(target_arch = "wasm32")]
 pub mod web;
 
+use std::collections::BTreeMap;
+
 use bytemuck::{Pod, Zeroable};
 
 use crate::gpu::OrbitCamera;
-use mesh::{cube_mesh, Vertex};
+use mesh::{cube_mesh, cylinder_mesh, sphere_mesh, Mesh, Vertex};
+use scene::{translation, Instance, InstanceRaw, MeshHandle, Scene};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-/// Per-frame uniforms passed to `forward.wgsl`. Layout pinned with size
-/// assertions; vec3s align on 16-byte boundaries with an explicit pad.
+/// Per-frame uniforms passed to `forward.wgsl`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct FrameUniforms {
@@ -37,7 +37,14 @@ struct FrameUniforms {
     _pad2: f32,
 }
 
-/// The rasterized renderer.
+struct GpuMesh {
+    vertex_buf: wgpu::Buffer,
+    index_buf: wgpu::Buffer,
+    index_count: u32,
+}
+
+/// Live raster renderer. Owns a geometry library and a [`Scene`] of
+/// instances; the caller mutates the scene each frame as needed.
 pub struct State {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -48,13 +55,14 @@ pub struct State {
     bind_group: wgpu::BindGroup,
     frame_uniform_buf: wgpu::Buffer,
 
-    vertex_buf: wgpu::Buffer,
-    index_buf: wgpu::Buffer,
-    index_count: u32,
+    meshes: Vec<GpuMesh>,
+    instance_buf: wgpu::Buffer,
+    instance_capacity: u64,
 
     depth_view: wgpu::TextureView,
 
     pub camera: OrbitCamera,
+    pub scene: Scene,
 }
 
 fn create_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
@@ -73,6 +81,39 @@ fn create_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
         view_formats: &[],
     });
     tex.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+fn upload_mesh(device: &wgpu::Device, queue: &wgpu::Queue, mesh: &Mesh, label: &str) -> GpuMesh {
+    let vertex_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: (mesh.vertices.len() as u64) * Vertex::STRIDE,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&vertex_buf, 0, bytemuck::cast_slice(&mesh.vertices));
+
+    let index_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: (mesh.indices.len() as u64) * 2,
+        usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&index_buf, 0, bytemuck::cast_slice(&mesh.indices));
+
+    GpuMesh {
+        vertex_buf,
+        index_buf,
+        index_count: mesh.index_count(),
+    }
+}
+
+/// Default mesh handles produced by the renderer's seeded geometry library
+/// — small set of useful primitives, the order is stable.
+#[derive(Copy, Clone, Debug)]
+pub struct DefaultMeshes {
+    pub cube: MeshHandle,
+    pub sphere: MeshHandle,
+    pub cylinder: MeshHandle,
 }
 
 impl State {
@@ -107,8 +148,6 @@ impl State {
             .expect("failed to create device");
 
         let surface_caps = surface.get_capabilities(&adapter);
-        // Non-sRGB surface — the shader applies gamma itself, matching the
-        // path tracer's present.
         let surface_format = surface_caps
             .formats
             .iter()
@@ -159,7 +198,7 @@ impl State {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[Vertex::layout()],
+                buffers: &[Vertex::layout(), InstanceRaw::layout()],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -193,24 +232,24 @@ impl State {
             cache: None,
         });
 
-        // Test mesh: a unit cube colored a warm gray.
-        let mesh = cube_mesh(1.0, [0.85, 0.7, 0.55]);
-        let vertex_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("raster-vertices"),
-            size: (mesh.vertices.len() as u64) * Vertex::STRIDE,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        queue.write_buffer(&vertex_buf, 0, bytemuck::cast_slice(&mesh.vertices));
-
-        let index_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("raster-indices"),
-            size: (mesh.indices.len() as u64) * 2,
-            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        queue.write_buffer(&index_buf, 0, bytemuck::cast_slice(&mesh.indices));
-        let index_count = mesh.index_count();
+        // Seed the geometry library with a small useful set: cube, sphere,
+        // cylinder. Callers wanting custom meshes can extend it via
+        // `register_mesh`.
+        let cube = Mesh {
+            ..cube_mesh(1.0, [1.0, 1.0, 1.0])
+        };
+        let sphere = sphere_mesh(0.5, 12, 24, [1.0, 1.0, 1.0]);
+        let cylinder = cylinder_mesh(0.5, 1.0, 24, [1.0, 1.0, 1.0]);
+        let meshes = vec![
+            upload_mesh(&device, &queue, &cube, "mesh-cube"),
+            upload_mesh(&device, &queue, &sphere, "mesh-sphere"),
+            upload_mesh(&device, &queue, &cylinder, "mesh-cylinder"),
+        ];
+        let defaults = DefaultMeshes {
+            cube: MeshHandle(0),
+            sphere: MeshHandle(1),
+            cylinder: MeshHandle(2),
+        };
 
         let frame_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("raster-frame-uniforms"),
@@ -228,7 +267,49 @@ impl State {
             }],
         });
 
+        let instance_capacity: u64 = 256;
+        let instance_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("raster-instances"),
+            size: instance_capacity * InstanceRaw::STRIDE,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let depth_view = create_depth(&device, config.width, config.height);
+
+        let mut scene = Scene::new();
+        // Default demo scene: a ground plane and three colored cubes in
+        // a row, plus a sphere — gives `cargo run -- raster` something
+        // immediately useful to look at.
+        scene.push(Instance {
+            mesh: defaults.cube,
+            model: mul(translation(0.0, -0.5, 0.0), scene::scale(6.0, 0.05, 6.0)),
+            tint: [0.25, 0.27, 0.32, 1.0],
+        });
+        for (i, color) in [
+            [0.9, 0.3, 0.3, 1.0],
+            [0.3, 0.85, 0.4, 1.0],
+            [0.35, 0.55, 0.95, 1.0],
+        ]
+        .iter()
+        .enumerate()
+        {
+            scene.push(Instance {
+                mesh: defaults.cube,
+                model: translation(-1.6 + 1.6 * i as f32, 0.0, 0.0),
+                tint: *color,
+            });
+        }
+        scene.push(Instance {
+            mesh: defaults.sphere,
+            model: translation(0.0, 1.2, -1.4),
+            tint: [0.95, 0.9, 0.6, 1.0],
+        });
+        scene.push(Instance {
+            mesh: defaults.cylinder,
+            model: translation(2.0, 0.0, -1.0),
+            tint: [0.75, 0.6, 0.95, 1.0],
+        });
 
         State {
             surface,
@@ -238,11 +319,29 @@ impl State {
             pipeline,
             bind_group,
             frame_uniform_buf,
-            vertex_buf,
-            index_buf,
-            index_count,
+            meshes,
+            instance_buf,
+            instance_capacity,
             depth_view,
             camera: OrbitCamera::new(),
+            scene,
+        }
+    }
+
+    /// Register an additional mesh and return its handle.
+    pub fn register_mesh(&mut self, mesh: &Mesh, label: &str) -> MeshHandle {
+        let gpu = upload_mesh(&self.device, &self.queue, mesh, label);
+        self.meshes.push(gpu);
+        MeshHandle(self.meshes.len() as u32 - 1)
+    }
+
+    /// Handles for the three default meshes (cube, sphere, cylinder) seeded
+    /// by `State::new`.
+    pub fn default_meshes(&self) -> DefaultMeshes {
+        DefaultMeshes {
+            cube: MeshHandle(0),
+            sphere: MeshHandle(1),
+            cylinder: MeshHandle(2),
         }
     }
 
@@ -286,6 +385,42 @@ impl State {
         self.queue
             .write_buffer(&self.frame_uniform_buf, 0, bytemuck::bytes_of(&uniforms));
 
+        // Bucket the scene's instances by mesh handle and pack them into a
+        // single buffer so each mesh becomes one instanced draw.
+        let mut by_mesh: BTreeMap<u32, Vec<InstanceRaw>> = BTreeMap::new();
+        for inst in self.scene.instances() {
+            by_mesh
+                .entry(inst.mesh.0)
+                .or_default()
+                .push(InstanceRaw::from(inst));
+        }
+        let total: u64 = by_mesh.values().map(|v| v.len() as u64).sum();
+        if total > self.instance_capacity {
+            let new_capacity = total.next_power_of_two().max(self.instance_capacity * 2);
+            self.instance_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("raster-instances"),
+                size: new_capacity * InstanceRaw::STRIDE,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.instance_capacity = new_capacity;
+        }
+        // Pack: each mesh's instances are contiguous in the buffer. Record
+        // the (mesh_handle, offset, count) draws so we can issue them in the
+        // render pass.
+        let mut packed: Vec<InstanceRaw> = Vec::with_capacity(total as usize);
+        let mut draws: Vec<(u32, u32, u32)> = Vec::with_capacity(by_mesh.len());
+        for (handle, list) in by_mesh {
+            let start = packed.len() as u32;
+            let count = list.len() as u32;
+            packed.extend(list);
+            draws.push((handle, start, count));
+        }
+        if !packed.is_empty() {
+            self.queue
+                .write_buffer(&self.instance_buf, 0, bytemuck::cast_slice(&packed));
+        }
+
         let surface_view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -326,9 +461,18 @@ impl State {
             });
             rp.set_pipeline(&self.pipeline);
             rp.set_bind_group(0, &self.bind_group, &[]);
-            rp.set_vertex_buffer(0, self.vertex_buf.slice(..));
-            rp.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint16);
-            rp.draw_indexed(0..self.index_count, 0, 0..1);
+            for (handle, start, count) in draws {
+                let mesh = match self.meshes.get(handle as usize) {
+                    Some(m) => m,
+                    None => continue,
+                };
+                rp.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                let inst_byte_start = start as u64 * InstanceRaw::STRIDE;
+                let inst_byte_end = inst_byte_start + count as u64 * InstanceRaw::STRIDE;
+                rp.set_vertex_buffer(1, self.instance_buf.slice(inst_byte_start..inst_byte_end));
+                rp.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint16);
+                rp.draw_indexed(0..mesh.index_count, 0, 0..count);
+            }
         }
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
@@ -336,9 +480,8 @@ impl State {
 }
 
 // ---------------------------------------------------------------------------
-// Matrix math: just enough for a view-projection. Kept inline to avoid
-// pulling in a linear-algebra crate for this small need. Native + WGSL agree
-// on column-major mat4x4<f32> with the array-of-columns convention.
+// Matrix math: hand-rolled to keep deps light. Native + WGSL agree on
+// column-major mat4x4<f32> with the array-of-columns convention.
 // ---------------------------------------------------------------------------
 
 fn normalize3(v: [f32; 3]) -> [f32; 3] {
@@ -385,7 +528,7 @@ fn perspective_rh_zo(fov_y_rad: f32, aspect: f32, near: f32, far: f32) -> [[f32;
 }
 
 /// Column-major 4x4 multiply.
-fn mul_mat4(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
+pub fn mul(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
     let mut out = [[0.0f32; 4]; 4];
     for col in 0..4 {
         for row in 0..4 {
@@ -404,7 +547,7 @@ fn view_projection_matrix(camera: &OrbitCamera, aspect: f32) -> [[f32; 4]; 4] {
     let target = camera.target;
     let view = look_at_rh(eye, target, [0.0, 1.0, 0.0]);
     let proj = perspective_rh_zo(camera.fov.to_radians(), aspect, 0.1, 100.0);
-    mul_mat4(proj, view)
+    mul(proj, view)
 }
 
 #[cfg(test)]
@@ -413,14 +556,12 @@ mod tests {
 
     #[test]
     fn frame_uniforms_size_matches_wgsl_layout() {
-        // mat4 (64) + (vec3+pad, 16) * 3 = 112 bytes.
         assert_eq!(std::mem::size_of::<FrameUniforms>(), 112);
     }
 
     #[test]
     fn look_at_eye_maps_to_origin() {
         let m = look_at_rh([0.0, 0.0, 5.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
-        // Apply view to eye -> should land at origin in view space.
         let p = transform([0.0, 0.0, 5.0, 1.0], m);
         for k in 0..3 {
             assert!(p[k].abs() < 1e-5, "eye -> {p:?}");
@@ -440,6 +581,21 @@ mod tests {
         let p = perspective_rh_zo(60f32.to_radians(), 1.0, 0.1, 100.0);
         let q = transform([0.0, 0.0, -5.0, 1.0], p);
         assert!(q[0].abs() < 1e-5 && q[1].abs() < 1e-5);
+    }
+
+    #[test]
+    fn mul_with_identity_is_a_noop() {
+        let a = [
+            [1.0, 2.0, 3.0, 4.0],
+            [5.0, 6.0, 7.0, 8.0],
+            [9.0, 10.0, 11.0, 12.0],
+            [13.0, 14.0, 15.0, 16.0],
+        ];
+        let id = scene::IDENTITY_MAT4;
+        let ab = mul(a, id);
+        let ba = mul(id, a);
+        assert_eq!(ab, a);
+        assert_eq!(ba, a);
     }
 
     /// Column-major matrix * column vector.
