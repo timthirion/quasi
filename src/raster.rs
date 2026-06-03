@@ -13,6 +13,9 @@
 
 pub mod mesh;
 
+#[cfg(target_arch = "wasm32")]
+pub mod web;
+
 use bytemuck::{Pod, Zeroable};
 
 use crate::gpu::OrbitCamera;

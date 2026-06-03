@@ -139,22 +139,35 @@ empty `raster` module compiles. Existing renderer now lives at
 **Done when:** all of M0 + M1's existing functionality keeps working
 with no visible change; the new module boundaries are in place. ✓
 
-### R1 — Forward triangle pipeline
+### R1 — Forward triangle pipeline ✅ DONE
 First raster pixel-on-screen. A single triangle mesh rendered with simple
 forward shading native + web.
 
-- [ ] `Mesh` (positions, normals, colors, indices) + a hard-coded test
-      mesh (a triangle, then a cube).
-- [ ] `raster::State` with a triangle pipeline (vertex + fragment), a
-      depth buffer, and surface presentation.
-- [ ] `forward.wgsl`: lambert with a fixed sun direction.
-- [ ] Naga validation test in `tests/shaders.rs`.
-- [ ] Native binary `--pipeline raster` flag draws a single cube on a
-      colored background; web `RasterInstance::create` does the same.
-- [ ] CPU↔GPU struct layout assertions for any new uniform buffers.
+- [x] `Mesh` (positions, normals, colors, indices) + procedural
+      `cube_mesh` (24 vertices, 36 indices, hard per-face normals).
+- [x] `raster::State` with a TriangleList pipeline (vertex + fragment),
+      back-face culling, `Depth32Float` depth attachment, and surface
+      presentation. Camera math (look-at + perspective + multiply) is
+      hand-rolled in-module.
+- [x] `forward.wgsl`: lambert from a fixed directional sun + flat
+      ambient, modulated by vertex color, gamma-encoded for the non-sRGB
+      swapchain.
+- [x] Naga validation test in `tests/shaders.rs`.
+- [x] Native binary `--pipeline raster` flag (also `raster` bare) draws
+      a single cube on a colored background.
+- [x] CPU↔GPU struct layout assertion: `FrameUniforms` size = 112 bytes.
+- [x] Web `RasterInstance::create_raster(host_id)` mirrors
+      `QuasiInstance::create` but renders every frame (no convergence /
+      sample budget); lives in `raster::web`. Required moving the
+      existing path-tracer web driver out of `lib.rs` into
+      `pathtrace::web` for symmetry; `lib.rs` now just holds the
+      single `#[wasm_bindgen(start)]` shim.
 
-**Done when:** a shaded cube spins (or sits still under the orbit camera)
-native + web; both render correctly under headless validation.
+**Done when:** a shaded cube renders native + web; both pass headless
+validation. ✓ — native window works; wasm-bindgen exports compile for
+`wasm32-unknown-unknown`. Browser visual confirmation will land with
+the first motum demo widget (it'll be the first thing using
+`create_raster`).
 
 ### R2 — Instanced scene
 Many meshes, one draw path per geometry. Foundation for rendering whole
