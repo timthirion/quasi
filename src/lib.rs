@@ -22,9 +22,91 @@ pub mod pathtrace;
 pub mod raster;
 
 // ---------------------------------------------------------------------------
-// Native: a single winit window + event loop, driving the path tracer.
-// (The raster pipeline gets its own native entry point in R1.)
+// Native: a single winit window + event loop, driving one of the two
+// renderers. `run` (path tracer) is the default. `run_raster` opens a
+// window for the rasterized pipeline; main.rs picks based on argv.
 // ---------------------------------------------------------------------------
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn run_raster() {
+    use std::sync::Arc;
+    use winit::{
+        event::{ElementState, Event, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent},
+        event_loop::EventLoop,
+        keyboard::{KeyCode, PhysicalKey},
+        window::WindowBuilder,
+    };
+
+    let event_loop = EventLoop::new().expect("failed to create event loop");
+    let window = Arc::new(
+        WindowBuilder::new()
+            .with_title("Quasi — raster")
+            .build(&event_loop)
+            .expect("failed to create window"),
+    );
+    let size = window.inner_size();
+
+    let instance = gpu::make_instance();
+    let surface = instance
+        .create_surface(window.clone())
+        .expect("failed to create surface");
+    let mut state = pollster::block_on(raster::State::new(
+        instance,
+        surface,
+        size.width.max(1),
+        size.height.max(1),
+    ));
+
+    event_loop
+        .run(move |event, elwt| {
+            if let Event::WindowEvent { window_id, event } = event {
+                if window_id != window.id() {
+                    return;
+                }
+                match event {
+                    WindowEvent::CloseRequested
+                    | WindowEvent::KeyboardInput {
+                        event:
+                            KeyEvent {
+                                state: ElementState::Pressed,
+                                physical_key: PhysicalKey::Code(KeyCode::Escape),
+                                ..
+                            },
+                        ..
+                    } => elwt.exit(),
+                    WindowEvent::Resized(s) => state.resize(s.width, s.height),
+                    WindowEvent::MouseInput {
+                        state: btn_state,
+                        button: MouseButton::Left,
+                        ..
+                    } => {
+                        if btn_state == ElementState::Pressed {
+                            let (x, y) = state.camera.last_cursor;
+                            state.camera.press(x, y);
+                        } else {
+                            state.camera.release();
+                        }
+                    }
+                    WindowEvent::CursorMoved { position, .. } => {
+                        state.camera.on_cursor(position.x, position.y);
+                    }
+                    WindowEvent::MouseWheel { delta, .. } => {
+                        let dy = match delta {
+                            MouseScrollDelta::LineDelta(_, y) => y,
+                            MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.05,
+                        };
+                        state.camera.zoom(dy);
+                    }
+                    WindowEvent::RedrawRequested => {
+                        window.request_redraw();
+                        state.render();
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .expect("event loop error");
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn run() {

@@ -35,3 +35,11 @@ fn present_shader_is_valid() {
         include_str!("../src/pathtrace/shaders/present.wgsl"),
     );
 }
+
+#[test]
+fn forward_shader_is_valid() {
+    validate(
+        "forward",
+        include_str!("../src/raster/shaders/forward.wgsl"),
+    );
+}
