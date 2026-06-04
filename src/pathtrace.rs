@@ -22,6 +22,7 @@
 //! shares nothing with this code below the `gpu` seam.
 
 pub mod integrator;
+pub mod mesh;
 pub mod sampler;
 pub mod scene;
 

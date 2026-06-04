@@ -109,21 +109,63 @@ natively is half-done. Guard platform-specific code with `#[cfg(target_arch =
 
 ## Testing
 
-Automated tests are a first-class priority, not an afterthought. Aim for broad,
-fast, deterministic coverage — heavy on unit tests — and land new code together
-with tests for it in the same change.
+Automated tests are a **first-class, non-negotiable** priority. A strong test
+suite is part of how this project earns the right to publish quality claims —
+convergence numbers, BSDF correctness, MSE-vs-reference — and the bar applies
+to every change.
 
-Test everything that can run off-GPU/off-hardware:
-- **Scene & geometry math** — Cornell Box construction, transforms, helpers.
-- **CPU↔GPU struct layout** — assert `size_of`/`offset_of` for every uniform/buffer
-  struct against the WGSL layout. This class of bug (e.g. `vec3` forcing 16-byte
-  alignment) only fails at runtime otherwise; pin it with a test.
-- **Sampler sequences**, **image metrics**, camera math — pure, so test directly.
-- **WGSL shaders** — validate with `naga` in `cargo test` (`tests/shaders.rs`).
+**Rules of the road:**
+- **No new module without tests.** Land code and its tests in the same change.
+  A PR that bumps a module without exercising its public surface is incomplete.
+- **No drift from green.** `cargo test` (native) and `cargo check --target
+  wasm32-unknown-unknown` both stay green at every commit. `cargo clippy
+  --all-targets -- -D warnings` clean too.
+- **Test what you can; document what you can't.** GPU pipeline / binding
+  validation needs hardware; say so explicitly when reporting work as done,
+  and prefer landing a CPU-runnable regression alongside (e.g. an RMSE-vs-
+  reference metric over a known scene).
 
-For anything that genuinely needs the GPU (pipeline/binding validation, real
-renders), keep a headless validation path where feasible and note what remains
-manual. `cargo test` should stay green and meaningful at every commit.
+**Categories that have an obligatory test, in priority order:**
+1. **CPU↔GPU struct layout** — every uniform/storage struct used by WGSL gets
+   a `size_of` / `offset_of` assertion (e.g. `vertex_is_32_bytes`). This
+   class of bug — `vec3` forcing 16-byte alignment, scalar pads in the wrong
+   place — fails only at runtime ("buffer too small") otherwise; pin it with
+   a test.
+2. **Cross-language constants** — when a Rust enum's discriminant is read by
+   WGSL (`SamplerKind`, `IntegratorKind`, `AOV_*`), pin both sides:
+   `as_u32()` returns the expected number AND the WGSL source literally
+   contains `const NAME: u32 = N;` (see `tests/shaders.rs`).
+3. **WGSL parses + validates** — every `.wgsl` file is covered by a naga
+   validation test in `tests/shaders.rs`. The M1 `from` / `target` reserved-
+   keyword save is what these earn.
+4. **Pure math, samplers, metrics, transforms** — these are inherently
+   testable; cover them directly, including canonical reference values
+   (van der Corput, Halton bases 2/3, Sobol dim 0/1, identity / rotation
+   transforms, identical-images = 0, black-reference rel-MSE = `1/ε`).
+5. **File-format round-trips** — EXR round-trip, PNG header check, glTF
+   round-trip (vertex / material / emissive counts). External format
+   compat regressions get caught at `cargo test` instead of at "load the
+   bunny" time.
+6. **Error paths** — every typed error variant gets a test that triggers it
+   (`MeshError::NoNormals`, size-mismatch panics in metrics).
+
+**For GPU work that genuinely can't run headlessly:**
+- Provide a CPU-runnable regression where any is feasible (e.g. the M3
+  convergence runner scores RMSE against a high-spp reference — that
+  works as a render regression at any time).
+- Land a smoke command (`cargo run -- render --spp 32 …`) and reference
+  it in the plan's "Done when" so a future contributor knows what to run.
+- Note explicitly in the PR / commit / plan update what remained
+  manual — never claim success on something the test suite didn't see.
+
+**Symptoms of suite rot to watch for:**
+- A new file lands with zero tests "because it's just glue". Glue has bugs.
+- Tests are commented out or marked `#[ignore]` "for now".
+- A failing test gets its assertion loosened instead of the underlying
+  behaviour fixed.
+- The cross-language constant-pinning test starts skipping new variants.
+If any of these surface, the right move is to stop and refit the test
+suite before adding more surface area.
 
 ## Git Workflow
 

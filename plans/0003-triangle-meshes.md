@@ -1,8 +1,8 @@
 # Triangle meshes + BVH (path tracer)
 
-- **Status:** proposed
+- **Status:** active
 - **Last updated:** 2026-06-04
-- **Last touched on:** planning (no code yet)
+- **Last touched on:** T0 landed — glTF ingest into `pathtrace::mesh`
 
 ## Goal
 
@@ -116,19 +116,57 @@ plan.
 
 ## Steps
 
-### T0 — glTF ingest (CPU)
+### T0 — glTF ingest (CPU) ✅ DONE
 
-- [ ] Add `gltf` to native + wasm deps; pin to current 1.x.
-- [ ] `pathtrace::mesh::load_glb(path) -> TriangleScene` for native and
-      `load_glb_bytes(&[u8])` for the wasm side (browser can `fetch`
-      bytes).
-- [ ] Flatten the glTF node hierarchy into world-space triangles at
-      load (premultiplied transforms; no instancing yet).
-- [ ] Materials: `baseColorFactor` → `albedo`, `emissiveFactor` →
-      `emission`, `roughnessFactor` / `metallicFactor` stored for
-      later. Default material if absent.
-- [ ] Unit tests: a programmatic 2-triangle glTF round-trips
-      vertex counts, material indices, and an emissive triangle list.
+- [x] Added `gltf = "1"` (1.4.1) as a shared dep — compiles for both
+      native and `wasm32-unknown-unknown` via its `import_slice` API.
+- [x] `pathtrace::mesh::load_glb(path)` (native, reads via `std::fs`)
+      and `load_glb_bytes(&[u8])` (cross-target — the wasm side can
+      pass `fetch`ed bytes).
+- [x] Node hierarchy flattened by walking each scene's root nodes
+      with an accumulated parent×local transform; per-vertex
+      `transform_point` and per-vertex `transform_normal` (cofactor-
+      based so non-uniform scale is correct). No instancing yet — each
+      glTF "node referenced from two places" is currently re-walked,
+      which would matter once we ship two-level BVH; T0 doesn't.
+- [x] Materials: glTF's `baseColorFactor` → `albedo`,
+      `emissiveFactor` → `emission`, `roughnessFactor` /
+      `metallicFactor` stored alongside (unused by today's Lambertian).
+      Slot 0 of `TriangleScene::materials` is always the default
+      Lambertian white, so a primitive with no material binds to it.
+- [x] Tests (12 in `pathtrace::mesh::tests`):
+      Vertex / Material layouts pinned at 32 bytes (and Material =
+      `scene::GpuMaterial` byte-for-byte); `Material::is_emissive`
+      and `TriangleScene::recompute_emissive` correctness;
+      `identity / translation / Y-rotation / non-uniform scale`
+      transforms; `mat4_mul` identity; a programmatic 2-triangle
+      glTF (inline JSON + base64-embedded buffer, no fixture file)
+      round-trips through `load_glb_bytes` for vertex counts, material
+      assignment, and the emissive triangle list; missing-NORMAL
+      attribute returns `MeshError::NoNormals`.
+
+**Vertex dedup decision.** The loader doesn't dedupe vertices across
+primitives that share an accessor; each primitive's accessor read is
+appended to the global vertex buffer with its own `vertex_offset`. The
+2-triangle test catches this explicitly (12 vertices for 2 primitives
+sharing one POSITION accessor) so the behaviour is intentional, not a
+bug. Trades a small constant amount of memory for a simpler ingest
+that matches real-world glTF files where primitives usually have
+distinct attributes.
+
+**Glb-via-data-URI test trick.** The round-trip test embeds the binary
+buffer as a `data:application/octet-stream;base64,...` URI inside an
+inline JSON glTF, so the entire test is self-contained — no
+`gltf-json` dev-dep, no fixture file in the repo. A 24-line inline
+base64 encoder lives next to the test.
+
+**Implication for the testing principle.** This change also rewrote
+`AGENTS.md`'s **Testing** section to spell out the discipline as
+non-negotiable: no module ships without tests, a layout-pinning test
+per uniform/buffer struct, cross-language constant pinning (Rust
+discriminant ↔ WGSL `const`), naga validation, error-path tests, and
+explicit honesty about GPU-only paths. Codifies what M0–M4 already
+practised so future contributors don't drift.
 
 ### T1 — Triangle intersection, no BVH
 
