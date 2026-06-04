@@ -1,8 +1,10 @@
 # Foundation: interactive Cornell Box path tracer (native + web)
 
-- **Status:** active
+- **Status:** done — all five milestones (M0–M4) shipped 2026-06-04. The
+  plan is kept here as a record; advanced-transport work continues
+  under a new `plans/000N-*.md`.
 - **Last updated:** 2026-06-04
-- **Last touched on:** M3 landed — verification harness (metrics + convergence CSV)
+- **Last touched on:** M4 landed — interactive blog widget (controls + readout)
 
 ## Goal
 
@@ -218,12 +220,57 @@ intensities the ε contribution shrinks, perturbing rel-MSE by a few
 percent. That's the standard PBRT trade-off; documented here so a
 future scale-invariance test isn't written against the wrong claim.
 
-### M4 — Interactive blog demo
-- [ ] `wasm-pack` package + embeddable HTML/JS harness.
-- [ ] Live controls: orbit camera, sample-count readout, sampler + integrator
-      toggles, progressive refinement that resets on interaction.
-- **Done when:** the widget runs smoothly in a browser and is drop-in embeddable
-      in a post.
+### M4 — Interactive blog demo ✅ DONE
+- [x] `wasm-pack build --target web` produces a self-contained `pkg/`.
+      The web build now exposes `create(host_id)` (chrome mode) and
+      `createHeadless(host_id)` (bare canvas) plus the runtime setters
+      `setSampler`, `setIntegrator`, `reset`, `frameCount` on
+      `QuasiInstance`.
+- [x] Live controls: orbit camera (M0/M1), drag to orbit + wheel to zoom
+      (M0); sample-count readout updated each rAF tick when the
+      displayed count changes; sampler + integrator `<select>` toggles
+      that reset accumulation when their value changes; explicit
+      **Reset** button. All progressive refinement resets-on-interaction
+      paths funnel through `State::reset_accumulation`.
+- [x] DOM injection: `create` wraps the host's child canvas in a
+      `<div class="quasi-wrapper">` that gives a positioning context
+      without mutating the embedder's host element, then appends a
+      `<div class="quasi-controls">` panel with the selects, the
+      `<span class="quasi-spp">` readout, and the `<button
+      class="quasi-reset">` button.
+- [x] Default styles ship inside the wasm module — `inject_default_styles_once`
+      appends one `<style id="quasi-default-styles">` element to `<head>`
+      on the first `create` call, idempotently. Embedders override via
+      class selectors (`#my-host .quasi-controls { ... }`); `index.html`
+      demonstrates a warm-palette override on `#a`.
+- [x] Embedder escape hatch: `createHeadless` attaches only the canvas
+      and returns the same `QuasiInstance` whose setters/getter are
+      callable from the embedder's own UI. `index.html` exercises this
+      with hand-written `<select>` controls + a JS polling readout on `#c`.
+- **Done when:** the widget runs smoothly in a browser and is drop-in
+      embeddable in a post.
+  _Build-verified 2026-06-04: `wasm-pack build --target web` clean,
+  generated TS types include the four new methods + `createHeadless`,
+  the served `pkg/quasi.js` carries them, native + wasm clippy clean,
+  fmt clean, all 48 unit tests + 6 shader tests + naga validation pass._
+  **Visual confirmation pending** — I can't drive a real browser from
+  this environment; the build and generated bindings are correct but
+  the embedder should reload `index.html` once to confirm the three
+  variants render and interact as expected.
+
+**DOM contract for embedders:**
+- `<div id="host"></div>` → call `create("host")`, get default chrome.
+- `<div id="host"></div>` → call `createHeadless("host")`, drive the
+  setters from your own UI (matches `index.html`'s `#c`).
+- CSS overrides: scope by host id (`#host .quasi-controls { ... }`)
+  so multiple instances on one page can be styled independently.
+
+**Listener handle pattern:** the controls panel attaches change/click
+listeners to its own elements, not the canvas. The earlier
+`Vec<(String, EventClosure)>` was canvas-only; now `ListenerHandle`
+carries `(target: EventTarget, event, closure)` so `Drop` removes
+listeners from whatever element they were attached to. Keeps tabs
+clean across wasm-module reloads.
 
 ## Open questions
 

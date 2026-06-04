@@ -12,30 +12,92 @@
       /* The renderer fills each host element; size is read from these boxes. */
       .quasi { background: #000; }
       #a { width: 480px; height: 480px; }
-      #b { width: 300px; height: 300px; }
-      /* A resizable box to exercise the ResizeObserver. */
-      #c { width: 360px; height: 360px; resize: both; overflow: hidden; border: 1px solid #444; }
+      #b { width: 360px; height: 360px; resize: both; overflow: hidden; border: 1px solid #444; }
+      #c { width: 360px; height: 360px; }
+      .caption { padding: 0 16px; font-size: 13px; opacity: 0.8; }
       p { padding: 0 16px; }
+
+      /* Demonstrates blog-style chrome override: warmer palette than the default. */
+      #a .quasi-controls {
+        background: rgba(120, 80, 20, 0.75);
+        border-radius: 10px;
+      }
+
+      /* Custom controls panel for the headless instance below #c. */
+      .headless-controls {
+        display: flex; gap: 12px; align-items: center; padding: 8px 16px;
+        font-size: 13px;
+      }
+      .headless-controls select { font: inherit; }
     </style>
   </head>
   <body>
-    <p>Multiple independent Quasi instances on one page. Drag to orbit, scroll to
-       zoom. The third box is resizable (drag its bottom-right corner).</p>
+    <p>Three independent Quasi instances on one page. Drag to orbit, scroll to
+       zoom.</p>
+
     <div class="row">
-      <div class="quasi" id="a"></div>
-      <div class="quasi" id="b"></div>
-      <div class="quasi" id="c"></div>
+      <div>
+        <div class="quasi" id="a"></div>
+        <div class="caption">Chrome mode + CSS override (#a .quasi-controls).</div>
+      </div>
+
+      <div>
+        <div class="quasi" id="b"></div>
+        <div class="caption">Default chrome, resizable host (drag bottom-right).</div>
+      </div>
+
+      <div>
+        <div class="quasi" id="c"></div>
+        <div class="headless-controls">
+          <label>Sampler
+            <select id="c-sampler">
+              <option value="pcg">PCG</option>
+              <option value="halton">Halton</option>
+              <option value="sobol">Sobol</option>
+            </select>
+          </label>
+          <label>Integrator
+            <select id="c-integrator">
+              <option value="misnee">MIS+NEE</option>
+              <option value="bsdf">Pure BSDF</option>
+            </select>
+          </label>
+          <span id="c-spp">0 spp</span>
+          <button id="c-reset" type="button">Reset</button>
+        </div>
+        <div class="caption">Headless mode + embedder-provided controls.</div>
+      </div>
     </div>
 
     <script type="module">
-      import init, { create } from "./pkg/quasi.js";
+      import init, { create, createHeadless } from "./pkg/quasi.js";
 
-      // Keep handles alive for the lifetime of the page.
       const instances = [];
       init().then(async () => {
-        for (const id of ["a", "b", "c"]) {
-          instances.push(await create(id));
-        }
+        // Default chrome (CSS-overridden in #a).
+        instances.push(await create("a"));
+        instances.push(await create("b"));
+
+        // Headless: embedder drives the canvas via setters + a polling readout.
+        const headless = await createHeadless("c");
+        instances.push(headless);
+
+        document.getElementById("c-sampler").addEventListener("change", e => {
+          headless.setSampler(e.target.value);
+        });
+        document.getElementById("c-integrator").addEventListener("change", e => {
+          headless.setIntegrator(e.target.value);
+        });
+        document.getElementById("c-reset").addEventListener("click", () => {
+          headless.reset();
+        });
+
+        const spp = document.getElementById("c-spp");
+        const tick = () => {
+          spp.textContent = `${headless.frameCount()} spp`;
+          requestAnimationFrame(tick);
+        };
+        requestAnimationFrame(tick);
       }).catch(console.error);
     </script>
   </body>

@@ -503,6 +503,13 @@ impl State {
         }
     }
 
+    /// Clears the running average so the next rendered frame becomes
+    /// sample 0. Used by the web widget's `reset` control.
+    pub fn reset_accumulation(&mut self) {
+        self.frame_count = 0;
+        self.read_idx = 0;
+    }
+
     pub fn render(&mut self) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
