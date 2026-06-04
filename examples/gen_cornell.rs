@@ -56,6 +56,7 @@ fn main() {
         roughness: 1.0,
         emission: [0.0, 0.0, 0.0],
         metallic: 0.0,
+        ior: 0.0,
     };
     let (sphere_positions, sphere_normals, sphere_indices) = icosphere(5, [0.0, 0.5, 0.0], 0.5);
     let bytes = build_gltf_with_extra_mesh(
@@ -101,6 +102,7 @@ fn main() {
         roughness: 1.0,
         emission: [0.0, 0.0, 0.0],
         metallic: 0.0,
+        ior: 0.0,
     };
     let bytes = build_gltf_with_extra_mesh(
         &room_quads,
@@ -130,6 +132,7 @@ fn main() {
         roughness: 0.3,
         emission: [0.0, 0.0, 0.0],
         metallic: 1.0,
+        ior: 0.0,
     };
     let bytes = build_gltf_with_extra_mesh(
         &room_quads,
@@ -148,7 +151,39 @@ fn main() {
         room_quads.len() * 2 + bunny_indices.len() / 3,
     );
 
-    // 5) Cornell with a textured floor — the PT-textures publishable
+    // 5) Cornell with a clear-glass icosphere — the PT-dielectrics
+    //    publishable scene. Same geometry as cornell_sphere, but the
+    //    sphere material is smooth glass (ior=1.5, roughness=0,
+    //    metallic=0). The path tracer routes hits with `ior > 0` onto
+    //    the smooth-dielectric branch (Snell + Fresnel + TIR).
+    let glass_sphere_mat = GpuMaterial {
+        // Tiny tint to avoid sterility — the WGSL multiplies it into
+        // the transmitted radiance, so we keep it close to (1,1,1)
+        // and let the caustic do the visual work.
+        albedo: [1.0, 1.0, 1.0],
+        roughness: 0.0,
+        emission: [0.0, 0.0, 0.0],
+        metallic: 0.0,
+        ior: 1.5,
+    };
+    let bytes = build_gltf_with_extra_mesh(
+        &room_quads,
+        &room_materials,
+        &sphere_positions,
+        &sphere_normals,
+        &sphere_indices,
+        glass_sphere_mat,
+    );
+    let path = out_dir.join("cornell_glass_sphere.gltf");
+    fs::write(&path, &bytes).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    println!(
+        "wrote {} ({} bytes, room + glass icosphere → {} triangles)",
+        path.display(),
+        bytes.len(),
+        room_quads.len() * 2 + sphere_indices.len() / 3,
+    );
+
+    // 6) Cornell with a textured floor — the PT-textures publishable
     //    scene. Same geometry as cornell_quads, but the floor's
     //    material samples the embedded uv_checker_color.png.
     let bytes = build_cornell_textured_floor();
@@ -564,6 +599,7 @@ fn build_cornell_textured_floor() -> Vec<u8> {
         roughness: 1.0,
         emission: [0.0; 3],
         metallic: 0.0,
+        ior: 0.0,
     });
     // Quad 0 is the floor (per `cornell_box`); rebind it to the new
     // textured material.
@@ -704,8 +740,18 @@ fn emit_gltf(
                 Some(idx) => format!(r#","baseColorTexture":{{"index":{idx}}}"#),
                 None => String::new(),
             };
+            // PT-dielectrics: ior round-trips through `extras` (the
+            // `KHR_materials_ior` extension would be more "standard"
+            // but requires per-extension gltf-crate features that
+            // aren't on by default). Only emitted when non-zero so
+            // existing scenes' on-disk JSON stays byte-stable.
+            let extras = if m.ior > 0.0 {
+                format!(r#","extras":{{"ior":{ior}}}"#, ior = m.ior)
+            } else {
+                String::new()
+            };
             format!(
-                r#"{{"name":"{name}","pbrMetallicRoughness":{{"baseColorFactor":[{ar},{ag},{ab},1.0],"metallicFactor":{met},"roughnessFactor":{rough}{tex}}},"emissiveFactor":[{er},{eg},{eb}]}}"#,
+                r#"{{"name":"{name}","pbrMetallicRoughness":{{"baseColorFactor":[{ar},{ag},{ab},1.0],"metallicFactor":{met},"roughnessFactor":{rough}{tex}}},"emissiveFactor":[{er},{eg},{eb}]{extras}}}"#,
                 name = material_label(m, i),
                 ar = m.albedo[0], ag = m.albedo[1], ab = m.albedo[2],
                 met = m.metallic, rough = m.roughness,

@@ -44,6 +44,11 @@ pub struct GpuMaterial {
     pub roughness: f32,
     pub emission: [f32; 3],
     pub metallic: f32,
+    /// Index of refraction. `0.0` = "not a dielectric"; non-zero
+    /// routes the BSDF onto the smooth-glass branch in `pathtrace.wgsl`.
+    /// Kept out of the in-scene `cornell_box()` palette (all matte
+    /// walls), but written by the example glTF emitter when set.
+    pub ior: f32,
 }
 
 /// Camera + scalars uniform — the only data the WGSL shader still reads
@@ -110,6 +115,7 @@ fn mat(albedo: V3, emission: V3) -> GpuMaterial {
         roughness: 1.0,
         emission,
         metallic: 0.0,
+        ior: 0.0,
     }
 }
 
@@ -223,7 +229,11 @@ mod tests {
     fn gpu_struct_layout_matches_wgsl() {
         assert_eq!(size_of::<GpuCamera>(), 48);
         assert_eq!(size_of::<GpuQuad>(), 48);
-        assert_eq!(size_of::<GpuMaterial>(), 32);
+        // 32-byte stride pre-PT-dielectrics; PT-dielectrics appends
+        // `ior: f32` for the WGSL → CPU round-trip, bumping to 36.
+        // (The runtime `Material` in `mesh.rs` lives separately and
+        // stays std430-padded at 48 bytes.)
+        assert_eq!(size_of::<GpuMaterial>(), 36);
         // camera (48) + 8 × u32 = 80. T1 dropped the per-quad arrays;
         // triangle data lives in storage buffers now. T2 added
         // `use_bvh` in what used to be the trailing pad slot.

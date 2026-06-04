@@ -22,6 +22,7 @@
 //! shares nothing with this code below the `gpu` seam.
 
 pub mod bvh;
+pub mod dielectric;
 pub mod ggx;
 pub mod integrator;
 pub mod mesh;

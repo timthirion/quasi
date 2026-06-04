@@ -1,8 +1,8 @@
 # PBR materials + textures (path tracer)
 
-- **Status:** active
+- **Status:** done
 - **Last updated:** 2026-06-04
-- **Last touched on:** PT-ggx landed
+- **Last touched on:** PT-dielectrics landed — plan closed
 
 ## Goal
 
@@ -209,24 +209,52 @@ always assign materials, so the safer placeholder is matte white.
 If we ever ingest a glTF with material-less primitives, this is a
 deliberate, documented mismatch with the spec.
 
-### PT-dielectrics
+### PT-dielectrics ✅
 Glass + clear plastics. Snell + Fresnel, transmission allowed.
 
-- [ ] Material grows an `ior: f32` (sentinel `0.0` = not a
-      dielectric). When non-zero, the BSDF chooses reflection or
-      refraction based on the dielectric Fresnel term, importance-
-      sampled.
-- [ ] Refraction direction via Snell's law; total internal
-      reflection handled.
-- [ ] Path tracer: throughput multiplies by `1.0` (no albedo
-      attenuation for clear dielectrics by default); colored
-      glass uses `albedo` as Beer-Lambert absorption coefficient
-      along the medium path.
-- [ ] New test scene: `cornell_glass_sphere.gltf` — the icosphere
-      from `0003` PT-stress with `ior = 1.5`, sitting on the
-      Cornell floor. Reference render.
-- [ ] Tests: Snell vector matches the analytic formula; total
-      internal reflection kicks in at the right angle.
+- [x] Material grows an `ior: f32` (sentinel `0.0` = not a
+      dielectric). Round-trips through glTF `extras`: gen_cornell
+      emits `"extras":{"ior":1.5}` and `mesh::extract_material`
+      parses it back via a `MaterialExtras` deserialise. (Cleaner
+      than gating on `KHR_materials_ior` and per-extension feature
+      flags in the gltf crate.) Ior sits at offset 36, keeping the
+      48-byte stride.
+- [x] Smooth-dielectric BSDF in WGSL: full unpolarised Fresnel
+      equations, Snell refraction, TIR-on-fail. The BSDF is a
+      δ-function — `eval_bsdf` and `bsdf_pdf` return 0 for
+      dielectric materials so NEE shadow rays carry no contribution
+      and the direct-emission path takes over. Throughput updates by
+      `(η_i/η_t)²` on the transmit branch — the radiance change
+      across the interface; cancels on closed enter-then-exit
+      walks.
+- [x] `Hit::front_face` (1 = entering, 0 = exiting) restores the
+      info that `record_hit`'s "flip normal toward ray" convention
+      throws away. The dielectric branch reads it to pick eta_i /
+      eta_t.
+- [x] Ray-origin offset flips for transmission — `dot(hit.normal,
+      bs.wi) < 0` ⇒ offset on the opposite side of the surface so
+      the refracted ray actually enters the medium instead of
+      grazing it from outside.
+- [x] New test scene: `cornell_glass_sphere.gltf` — the level-5
+      icosphere with ior = 1.5, roughness = 0, metallic = 0,
+      albedo = white. Reference render at 512² / 1024 spp is
+      `data/output/cornell_glass_sphere_reference.png`. Shows the
+      expected inverted refraction, a tight floor caustic, and a
+      Fresnel rim.
+- [x] CPU mirror in `pathtrace::dielectric`; tests in
+      `tests/dielectric.rs` pin: Fresnel at normal incidence matches
+      `((η_t - η_i)/(η_t + η_i))²`; Fresnel → 1 at grazing; energy
+      conservation across the full angle range; Snell agreement at
+      multiple angles; refraction is identity at θ_i = 0; TIR
+      activates exactly past `asin(η_t/η_i)`; no TIR going into the
+      denser medium.
+
+**Deferred to a follow-up plan** (out of scope here): Beer-Lambert
+absorption inside coloured glass. The current code multiplies the
+transmit branch by `albedo` so a tint is visible, but it isn't
+distance-modulated — a glass bunny would be uniformly coloured
+instead of darker at the thicker parts. That needs ray-marching
+inside the medium and is a worthy mini-plan on its own.
 
 ## Open questions
 

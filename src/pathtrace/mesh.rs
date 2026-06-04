@@ -72,12 +72,17 @@ pub const NO_TEXTURE: u32 = u32::MAX;
 
 /// PBR-aligned material. 48 bytes (Lambertian-only today reads
 /// `albedo`, `emission`, and `base_color_texture_idx`; `roughness` /
-/// `metallic` are still inert pending `PT-ggx`).
+/// `metallic` + `ior` drive the BSDF dispatch in `pathtrace.wgsl`:
+///   - `ior > 0.0`             → smooth dielectric (Snell + Fresnel)
+///   - `metallic > 0.5`        → GGX conductor
+///   - else                    → Lambertian
 ///
 /// std430 layout (4-byte scalars need no extra padding):
 ///   albedo:                    vec3 + scalar → 16 bytes
 ///   emission:                  vec3 + scalar → 16 bytes
-///   base_color_texture_idx:    u32 + 3 × u32 pad → 16 bytes
+///   base_color_texture_idx:    u32 +
+///   ior:                       f32 +
+///   _pad:                      2 × u32       → 16 bytes
 ///   total: 48 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable, PartialEq)]
@@ -89,7 +94,12 @@ pub struct Material {
     /// Layer index in the path tracer's texture array, or
     /// [`NO_TEXTURE`] for "use `albedo` as a constant."
     pub base_color_texture_idx: u32,
-    pub _pad: [u32; 3],
+    /// Index of refraction. `0.0` is the sentinel for "this material
+    /// is *not* a dielectric" — the WGSL BSDF dispatch falls through
+    /// to the metallic/Lambertian branches. `1.5` is a reasonable
+    /// default for glass; `1.33` for water.
+    pub ior: f32,
+    pub _pad: [u32; 2],
 }
 
 impl Default for Material {
@@ -106,7 +116,8 @@ impl Default for Material {
             emission: [0.0, 0.0, 0.0],
             metallic: 0.0,
             base_color_texture_idx: NO_TEXTURE,
-            _pad: [0; 3],
+            ior: 0.0,
+            _pad: [0; 2],
         }
     }
 }
@@ -402,14 +413,31 @@ fn extract_material(material: &gltf::Material, texture_remap: &[u32]) -> Materia
             texture_remap.get(src).copied()
         })
         .unwrap_or(NO_TEXTURE);
+    // PT-dielectrics: glTF has a standard extension
+    // `KHR_materials_ior` for this, but loading extensions through the
+    // gltf crate requires per-extension features. We round-trip ior
+    // through `extras` instead — same effect, zero feature gates.
+    let ior = material
+        .extras()
+        .as_ref()
+        .and_then(|raw| serde_json::from_str::<MaterialExtras>(raw.get()).ok())
+        .map(|e| e.ior)
+        .unwrap_or(0.0);
     Material {
         albedo: [base[0], base[1], base[2]],
         roughness: pbr.roughness_factor(),
         emission: emissive,
         metallic: pbr.metallic_factor(),
         base_color_texture_idx,
-        _pad: [0; 3],
+        ior,
+        _pad: [0; 2],
     }
+}
+
+#[derive(serde::Deserialize, Default)]
+struct MaterialExtras {
+    #[serde(default)]
+    ior: f32,
 }
 
 fn walk_node(
@@ -527,14 +555,17 @@ mod tests {
     }
 
     #[test]
-    fn material_is_48_bytes_with_texture_index_at_32() {
+    fn material_is_48_bytes_with_texture_index_at_32_and_ior_at_36() {
         // PT-textures grew the Material from 32 bytes (albedo + roughness +
         // emission + metallic) to 48 bytes (+ base_color_texture_idx + pad).
+        // PT-dielectrics packs `ior` into the first slot of that pad,
+        // keeping the total stride at 48 bytes.
         assert_eq!(std::mem::size_of::<Material>(), 48);
         assert_eq!(
             std::mem::offset_of!(Material, base_color_texture_idx),
             32,
         );
+        assert_eq!(std::mem::offset_of!(Material, ior), 36);
     }
 
     // ---- Material ----

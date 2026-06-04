@@ -60,9 +60,11 @@ struct Material {
     emission: vec3<f32>,
     metallic: f32,
     base_color_texture_idx: u32,
+    // PT-dielectrics: 0 = "not a dielectric"; > 0 routes the BSDF
+    // onto the smooth-glass branch (sees Snell + Fresnel + TIR).
+    ior: f32,
     _pad0: u32,
     _pad1: u32,
-    _pad2: u32,
 };
 
 struct Uniforms {
@@ -297,6 +299,12 @@ struct Hit {
     tri: u32,
     mat: u32,
     hit: bool,
+    // PT-dielectrics: the BSDF needs to know whether the ray is
+    // entering (hit the geometric front face) or exiting (hit from
+    // inside the medium). `normal` already gets flipped to face the
+    // ray for shading convenience — front_face restores that info.
+    // 1 = hit front face / entering; 0 = hit back face / exiting.
+    front_face: u32,
 };
 
 /// Barycentric-interpolated UV at a triangle hit. The `(u, v)` come
@@ -349,11 +357,18 @@ fn record_hit(
     (*closest).tri = tri;
     (*closest).mat = tri_materials[tri];
     (*closest).uv = triangle_uv(tri, bary_uv.x, bary_uv.y);
-    var n = normalize(cross(verts.v1 - verts.v0, verts.v2 - verts.v0));
-    if (dot(n, ray.dir) > 0.0) {
+    let geom_n = normalize(cross(verts.v1 - verts.v0, verts.v2 - verts.v0));
+    let front = dot(geom_n, ray.dir) < 0.0;
+    var n = geom_n;
+    if (!front) {
         n = -n;
     }
     (*closest).normal = n;
+    if (front) {
+        (*closest).front_face = 1u;
+    } else {
+        (*closest).front_face = 0u;
+    }
 }
 
 fn trace_scene_linear(ray: Ray) -> Hit {
@@ -682,6 +697,51 @@ fn ggx_pdf(n_dot_h: f32, v_dot_h: f32, alpha: f32) -> f32 {
     return ggx_d(n_dot_h, alpha) * n_dot_h / (4.0 * max(v_dot_h, 1e-6));
 }
 
+// ----- Smooth dielectric (PT-dielectrics) -----
+//
+// Snell + the full unpolarised Fresnel equations. The "smooth" in
+// the name is load-bearing: we treat the BSDF as a δ-function, so
+// NEE shadow rays can't evaluate it (they get 0 from `eval_bsdf` /
+// `bsdf_pdf` below). Visibility on a glass hit rides on the
+// importance-sampled bounce hitting an emitter directly.
+//
+// Refraction is non-symmetric across the interface: the radiance
+// changes by `(eta_t/eta_i)²` going into a denser medium (and the
+// reverse coming out). We track that through `throughput *=
+// (eta_i/eta_t)²` on the transmit branch — over a closed
+// enter-then-exit path the factors cancel.
+
+fn fresnel_dielectric(cos_theta_i: f32, eta_i: f32, eta_t: f32) -> f32 {
+    let cti = clamp(cos_theta_i, 0.0, 1.0);
+    let eta_ratio = eta_i / eta_t;
+    let sin_t2 = eta_ratio * eta_ratio * max(1.0 - cti * cti, 0.0);
+    if (sin_t2 >= 1.0) {
+        return 1.0;
+    }
+    let cos_theta_t = sqrt(1.0 - sin_t2);
+    let r_par = (eta_t * cti - eta_i * cos_theta_t)
+              / (eta_t * cti + eta_i * cos_theta_t);
+    let r_perp = (eta_i * cti - eta_t * cos_theta_t)
+               / (eta_i * cti + eta_t * cos_theta_t);
+    return 0.5 * (r_par * r_par + r_perp * r_perp);
+}
+
+// Snell. `wo` points away from the surface (towards the camera) and
+// `n` is oriented into the incident side. Returns the refracted
+// direction (also away from the surface, into the transmitted side),
+// or a length-zero vector on total internal reflection — the caller
+// is responsible for the TIR fallback.
+fn refract_through(wo: vec3<f32>, n: vec3<f32>, eta_i: f32, eta_t: f32) -> vec3<f32> {
+    let cos_i = dot(n, wo);
+    let eta_ratio = eta_i / eta_t;
+    let sin_t2 = eta_ratio * eta_ratio * max(1.0 - cos_i * cos_i, 0.0);
+    if (sin_t2 >= 1.0) {
+        return vec3<f32>(0.0);
+    }
+    let cos_t = sqrt(1.0 - sin_t2);
+    return -wo * eta_ratio + n * (eta_ratio * cos_i - cos_t);
+}
+
 // ----- Unified BSDF dispatch -----
 //
 // `metallic > 0.5` picks GGX; else Lambertian. Both branches return
@@ -702,6 +762,7 @@ fn sample_bsdf(
     albedo: vec3<f32>,
     normal: vec3<f32>,
     wo: vec3<f32>,
+    front_face: u32,
     s: ptr<function, SamplerState>,
 ) -> BsdfSample {
     var out: BsdfSample;
@@ -709,6 +770,57 @@ fn sample_bsdf(
     out.wi = vec3<f32>(0.0);
     out.weight = vec3<f32>(0.0);
     out.pdf = 0.0;
+
+    // Smooth dielectric branch — fires first because dielectric
+    // materials are typically also Lambertian-default-coloured
+    // (metallic=0, albedo=white).
+    if (mat.ior > 0.0) {
+        // `normal` is already flipped to face `wo` (shading
+        // convention from record_hit). `front_face = 1` means the
+        // ray hit the geometric front (entering the medium); 0 means
+        // it hit from inside (exiting). The shading normal is
+        // already the incident-side normal in both cases.
+        let n = normal;
+        var eta_i: f32 = 1.0;
+        var eta_t: f32 = mat.ior;
+        if (front_face == 0u) {
+            eta_i = mat.ior;
+            eta_t = 1.0;
+        }
+        let cos_i = dot(n, wo);
+        let fr = fresnel_dielectric(cos_i, eta_i, eta_t);
+        let u = next_1d(s);
+        if (u < fr) {
+            // Reflect — F/F = 1, no eta² scaling.
+            out.wi = reflect(-wo, n);
+            out.weight = vec3<f32>(1.0);
+            out.pdf = fr;
+            out.valid = dot(n, out.wi) > 0.0;
+        } else {
+            let wi_t = refract_through(wo, n, eta_i, eta_t);
+            if (length(wi_t) < 0.5) {
+                // TIR — fall back to mirror reflection. fresnel
+                // already returned 1.0 here, so in practice we
+                // shouldn't reach this branch, but the guard keeps
+                // floating-point edge cases honest.
+                out.wi = reflect(-wo, n);
+                out.weight = vec3<f32>(1.0);
+                out.pdf = 1.0;
+                out.valid = dot(n, out.wi) > 0.0;
+            } else {
+                let eta_ratio = eta_i / eta_t;
+                // (1-F)/(1-F) * (eta_i/eta_t)² · albedo, where the
+                // eta² accounts for the radiance change across the
+                // interface. Albedo lets us tint glass without
+                // mediating absorption.
+                out.wi = wi_t;
+                out.weight = albedo * vec3<f32>(eta_ratio * eta_ratio);
+                out.pdf = 1.0 - fr;
+                out.valid = true;
+            }
+        }
+        return out;
+    }
 
     if (mat.metallic > 0.5) {
         let alpha = ggx_alpha(mat.roughness);
@@ -748,6 +860,12 @@ fn eval_bsdf(
     wo: vec3<f32>,
     wi: vec3<f32>,
 ) -> vec3<f32> {
+    if (mat.ior > 0.0) {
+        // δ-function BSDF — NEE shadow rays can't see it. The
+        // BSDF-sample-then-direct-emission path handles glass
+        // visibility.
+        return vec3<f32>(0.0);
+    }
     if (mat.metallic > 0.5) {
         let n_dot_l = dot(normal, wi);
         let n_dot_v = dot(normal, wo);
@@ -770,6 +888,9 @@ fn eval_bsdf(
 }
 
 fn bsdf_pdf(mat: Material, normal: vec3<f32>, wo: vec3<f32>, wi: vec3<f32>) -> f32 {
+    if (mat.ior > 0.0) {
+        return 0.0;
+    }
     if (mat.metallic > 0.5) {
         let n_dot_l = dot(normal, wi);
         let n_dot_v = dot(normal, wo);
@@ -905,15 +1026,18 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
         // `material.metallic`. Mirror-like roughness collapses into a
         // δ-spike that NEE shadow rays cannot evaluate, so the
         // BSDF-then-emission path carries the visibility.
-        let bs = sample_bsdf(m, albedo, hit.normal, wo_dir, s);
+        let bs = sample_bsdf(m, albedo, hit.normal, wo_dir, hit.front_face, s);
         if (!bs.valid || bs.pdf <= 0.0) {
             break;
         }
         prev_bsdf_pdf = bs.pdf;
         prev_point = hit.point;
-        // Sharp GGX (low roughness) reads as "specular" for the next
-        // emission hit — fold full emission in there, not MIS-weighted.
-        specular_bounce = m.metallic > 0.5 && m.roughness < 0.2;
+        // Smooth dielectrics and sharp GGX are δ-function BSDFs;
+        // their NEE shadow rays carry no contribution, so the next-
+        // bounce direct-emission hit must collect the full unweighted
+        // radiance.
+        specular_bounce = m.ior > 0.0
+            || (m.metallic > 0.5 && m.roughness < 0.2);
         throughput = throughput * bs.weight;
 
         if (bounce > 2) {
@@ -924,7 +1048,14 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
             throughput = throughput / pr;
         }
 
-        ray.origin = hit.point + hit.normal * 0.001;
+        // Offset along the *outgoing* hemisphere — `hit.normal`
+        // faces wo, so a reflected wi sits on the same side and the
+        // offset prevents self-intersection. For dielectric
+        // transmission, wi is on the *opposite* side, so flip the
+        // offset to land inside the medium instead of grazing the
+        // surface from outside.
+        let offset_n = select(hit.normal, -hit.normal, dot(hit.normal, bs.wi) < 0.0);
+        ray.origin = hit.point + offset_n * 0.001;
         ray.dir = bs.wi;
     }
     return result;

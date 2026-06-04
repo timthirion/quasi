@@ -17,6 +17,7 @@ const CORNELL_TRIS: &[u8] = include_bytes!("../data/gltf/cornell_tris.gltf");
 const CORNELL_SPHERE: &[u8] = include_bytes!("../data/gltf/cornell_sphere.gltf");
 const CORNELL_BUNNY: &[u8] = include_bytes!("../data/gltf/cornell_bunny.gltf");
 const CORNELL_METAL_BUNNY: &[u8] = include_bytes!("../data/gltf/cornell_metal_bunny.gltf");
+const CORNELL_GLASS_SPHERE: &[u8] = include_bytes!("../data/gltf/cornell_glass_sphere.gltf");
 const CORNELL_TEXTURED_FLOOR: &[u8] =
     include_bytes!("../data/gltf/cornell_textured_floor.gltf");
 
@@ -98,6 +99,35 @@ fn cornell_metal_bunny_topology_matches_clay_bunny_but_material_is_metallic() {
     // metallic value sneaking into the all-Lambertian scenes.
     let any_metal_in_clay = clay.materials.iter().any(|m| m.metallic >= 0.5);
     assert!(!any_metal_in_clay, "cornell_bunny should be pure Lambertian");
+}
+
+#[test]
+fn cornell_glass_sphere_topology_matches_lambertian_sphere_but_carries_ior() {
+    let lambertian = load_glb_bytes(CORNELL_SPHERE).expect("load cornell_sphere.gltf");
+    let glass = load_glb_bytes(CORNELL_GLASS_SPHERE).expect("load cornell_glass_sphere.gltf");
+
+    // Same icosphere geometry, just a different sphere material.
+    assert_eq!(glass.triangle_count(), lambertian.triangle_count());
+    assert_eq!(glass.materials.len(), lambertian.materials.len());
+    assert_eq!(glass.emissive_triangles.len(), lambertian.emissive_triangles.len());
+
+    // Round-trip the ior through `extras` and out — the glass
+    // scene must carry exactly one dielectric material with
+    // ior ≈ 1.5 and no emission.
+    let glass_mats: Vec<_> = glass
+        .materials
+        .iter()
+        .filter(|m| m.ior > 0.0 && m.emission.iter().all(|&e| e < 0.1))
+        .collect();
+    assert_eq!(glass_mats.len(), 1, "expected exactly one dielectric material");
+    let m = glass_mats[0];
+    assert!((m.ior - 1.5).abs() < 1e-3, "ior should round-trip to 1.5; got {}", m.ior);
+
+    // ...and the Lambertian sphere scene has *no* dielectrics —
+    // pins that the extras round-trip doesn't accidentally fire for
+    // scenes that omit it.
+    let any_dielectric = lambertian.materials.iter().any(|m| m.ior > 0.0);
+    assert!(!any_dielectric, "cornell_sphere should carry no dielectrics");
 }
 
 #[test]
