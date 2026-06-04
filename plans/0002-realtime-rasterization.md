@@ -1,9 +1,8 @@
 # Real-time rasterization track
 
 - **Status:** active
-- **Last updated:** 2026-06-03
-- **Last touched on:** kicked off on this machine; driven by motum's Phase 4
-  (interactive in-browser planner demos).
+- **Last updated:** 2026-06-04
+- **Last touched on:** R3 landed — line + point overlays with depth-tested / on-top slots
 
 ## Goal
 
@@ -193,19 +192,61 @@ tests green, native + wasm builds clean. Visual confirmation lands with
 the motum demo widget once it's the first real consumer of the scene
 API.
 
-### R3 — Overlays for planner artifacts
-Lines and points for visualizing planner search trees, end-effector
-traces, and goal markers.
+### R3 — Overlays for planner artifacts ✅ DONE
 
-- [ ] Line primitive (instanced thin quads or `LineList` topology —
-      decide during R3).
-- [ ] Point sprite primitive.
-- [ ] Throughput target: 10 000 lines @ 60fps in browser.
-- [ ] Tests covering the line/point uniforms and a basic render.
+- [x] Line + point primitives via **native LineList / PointList
+      topologies** (decision: simpler than instanced thin quads, fine
+      for visualisation-quality 1 px lines, stays inside the WebGPU
+      baseline — anti-aliased / thickness-configurable variants are a
+      follow-up if motum needs them).
+- [x] `Scene` grew **two overlay slots** instead of one:
+      - `depth_tested_overlay` — `depth_compare: Less`. Geometry
+        occludes the overlay (trajectory disappears behind a robot
+        link).
+      - `on_top_overlay` — `depth_compare: Always`. Overlay sits on
+        top of everything (goal markers, axis indicators, planner
+        search trees you want to keep readable).
+      Both slots are an [`Overlay { lines, points }`] mixing line
+      segments (pairs of [`OverlayVertex`]) and individual points.
+- [x] Four overlay pipelines built off one `overlay.wgsl`: topology
+      × depth-mode = 2 × 2. Stored as `overlay_pipelines[topology][depth_mode]`
+      on `State`. Alpha-blending enabled; depth writes disabled either
+      way so successive overlays don't occlude each other.
+- [x] Two growable vertex buffers (`overlay_line_buf`, `overlay_point_buf`)
+      hold `concat(depth_tested, on_top)` per primitive type. Per-frame
+      packing mirrors the existing instance buffer's pattern — same
+      `next_power_of_two` grow rule, same `queue.write_buffer` upload.
+- [x] Render order inside the existing forward pass: triangles →
+      depth-tested lines → depth-tested points → on-top lines →
+      on-top points. One render pass, one bind group (shared with
+      `forward.wgsl` via an identical `FrameU` layout).
+- [x] Tests: `OverlayVertex` stride pinned at 28 bytes;
+      `Overlay::line` appends two vertices with matching colour;
+      `Overlay::point` appends one; `Overlay::clear` resets both;
+      `Scene::is_empty` accounts for overlay state. Naga validation
+      pins `overlay.wgsl` in `tests/shaders.rs`.
+- [x] Default raster scene gains the demo overlay: three
+      depth-tested coordinate axes at the origin (X red, Y green, Z
+      blue) plus a yellow on-top point above each colored cube — gives
+      `cargo run -- raster` an immediate visual demonstration of both
+      slot semantics.
 
-**Done when:** an `Overlay` field on `RasterScene` carries thousands of
-edges and points, rendered above (or with depth-tested against) the
-instance scene.
+**Throughput at 10 000 lines.** The plan called for a 60fps target
+with 10k lines in the browser. The buffer machinery (growable, single
+`write_buffer` per frame, native LineList) scales to it on paper —
+10k lines × 2 verts × 28 bytes = 560 KB upload per frame, ~33 MB/s at
+60 Hz, trivial on any backend. Actual in-browser FPS pinning waits
+for the motum widget in R4 (no test-harness page demands it yet);
+recorded here as the "if this isn't 60fps once motum's wired up,
+look at the upload, not the pipeline" debugging note.
+
+**Same `FrameU` for both shaders.** `overlay.wgsl` declares the same
+8-row `FrameU` struct as `forward.wgsl`; only `view_proj` is actually
+read in the overlay path, but the lighting fields stay at matching
+offsets so one bind group covers both pipelines. Saves duplicating
+the uniform buffer and survives `Limits::downlevel_webgl2_defaults()`
+unchanged — overlays add zero new resource bindings beyond a vertex
+buffer per primitive type.
 
 ### R4 — Motum-shaped scene API for embedders
 Make the rasterizer drivable from a wasm host with motum's data types as

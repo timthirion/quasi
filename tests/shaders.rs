@@ -45,6 +45,14 @@ fn forward_shader_is_valid() {
 }
 
 #[test]
+fn overlay_shader_is_valid() {
+    validate(
+        "overlay",
+        include_str!("../src/raster/shaders/overlay.wgsl"),
+    );
+}
+
+#[test]
 fn pathtrace_sampler_constants_match_cpu_side() {
     // WGSL `SAMPLER_*` constants must match the discriminants of
     // `pathtrace::sampler::SamplerKind`. naga validation doesn't catch a

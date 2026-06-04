@@ -103,11 +103,29 @@ impl InstanceRaw {
     }
 }
 
-/// CPU-side scene: a flat instance list, plus convenience accessors. The
-/// renderer reads this each frame and uploads what it needs.
+/// CPU-side scene: a flat instance list plus two overlay slots, plus
+/// convenience accessors. The renderer reads this each frame and uploads
+/// what it needs.
+///
+/// Overlays come in two flavours and are drawn after the triangle pass:
+///
+/// - [`depth_tested_overlay`](Self::depth_tested_overlay) — drawn with
+///   `depth_compare: Less`, so geometry occludes overlay primitives.
+///   The right choice for trajectory traces that should disappear
+///   behind a robot link.
+/// - [`on_top_overlay`](Self::on_top_overlay) — drawn with
+///   `depth_compare: Always`, so the overlay sits on top of everything.
+///   The right choice for goal markers, axis indicators, or planner
+///   search trees you want to remain readable at all times.
+///
+/// Each slot is an [`Overlay`] that mixes lines and points. Both slots
+/// are gamma-encoded inside the overlay fragment shader (matching the
+/// forward pipeline's non-sRGB swapchain convention).
 #[derive(Clone, Debug, Default)]
 pub struct Scene {
     instances: Vec<Instance>,
+    pub depth_tested_overlay: Overlay,
+    pub on_top_overlay: Overlay,
 }
 
 impl Scene {
@@ -121,6 +139,8 @@ impl Scene {
 
     pub fn clear(&mut self) {
         self.instances.clear();
+        self.depth_tested_overlay.clear();
+        self.on_top_overlay.clear();
     }
 
     pub fn push(&mut self, instance: Instance) {
@@ -137,6 +157,98 @@ impl Scene {
 
     pub fn is_empty(&self) -> bool {
         self.instances.is_empty()
+            && self.depth_tested_overlay.is_empty()
+            && self.on_top_overlay.is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Overlays — line and point primitives for planner artifacts
+// ---------------------------------------------------------------------------
+
+/// A coloured vertex consumed by the overlay shader at locations
+/// `0` (position) and `1` (RGBA). Packed at 28 bytes — vertex buffers
+/// don't carry std140 alignment requirements, so no padding is needed.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable, PartialEq)]
+pub struct OverlayVertex {
+    pub position: [f32; 3],
+    pub color: [f32; 4],
+}
+
+impl OverlayVertex {
+    pub const STRIDE: u64 = 28;
+
+    pub fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: Self::STRIDE,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x3,
+                    offset: 0,
+                    shader_location: 0,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: 12,
+                    shader_location: 1,
+                },
+            ],
+        }
+    }
+}
+
+/// Lines + points sharing a depth-test convention. R3 draws lines with
+/// `PrimitiveTopology::LineList` (every pair of vertices = one line)
+/// and points with `PrimitiveTopology::PointList` (one vertex = one
+/// point sprite).
+///
+/// The decision to use native primitive topologies instead of instanced
+/// thin quads keeps the pipeline simple and stays inside the WebGPU
+/// baseline — lines are 1 px wide and points are 1 px in size, which
+/// is fine for visualising planner trees and end-effector traces.
+/// Anti-aliased / thickness-configurable variants are a follow-up.
+#[derive(Clone, Debug, Default)]
+pub struct Overlay {
+    pub lines: Vec<OverlayVertex>,
+    pub points: Vec<OverlayVertex>,
+}
+
+impl Overlay {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Appends one line segment as a pair of [`OverlayVertex`]es with
+    /// the same colour at both endpoints.
+    pub fn line(&mut self, a: [f32; 3], b: [f32; 3], color: [f32; 4]) {
+        self.lines.push(OverlayVertex { position: a, color });
+        self.lines.push(OverlayVertex { position: b, color });
+    }
+
+    /// Appends one coloured point.
+    pub fn point(&mut self, p: [f32; 3], color: [f32; 4]) {
+        self.points.push(OverlayVertex { position: p, color });
+    }
+
+    /// Drops both line and point lists.
+    pub fn clear(&mut self) {
+        self.lines.clear();
+        self.points.clear();
+    }
+
+    /// Line *segment* count — `self.lines.len() / 2`.
+    pub fn segment_count(&self) -> usize {
+        self.lines.len() / 2
+    }
+
+    pub fn point_count(&self) -> usize {
+        self.points.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty() && self.points.is_empty()
     }
 }
 
@@ -182,5 +294,59 @@ mod tests {
         let raw = InstanceRaw::from(&inst);
         assert_eq!(raw.model_col3, [1.0, 2.0, 3.0, 1.0]);
         assert_eq!(raw.tint, inst.tint);
+    }
+
+    #[test]
+    fn overlay_vertex_stride_matches_const() {
+        assert_eq!(
+            std::mem::size_of::<OverlayVertex>() as u64,
+            OverlayVertex::STRIDE
+        );
+        assert_eq!(OverlayVertex::STRIDE, 28);
+    }
+
+    #[test]
+    fn overlay_line_appends_two_vertices() {
+        let mut o = Overlay::new();
+        assert!(o.is_empty());
+        o.line([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(o.lines.len(), 2);
+        assert_eq!(o.segment_count(), 1);
+        assert_eq!(o.lines[0].position, [0.0, 0.0, 0.0]);
+        assert_eq!(o.lines[1].position, [1.0, 0.0, 0.0]);
+        // Both endpoints carry the same colour.
+        assert_eq!(o.lines[0].color, o.lines[1].color);
+    }
+
+    #[test]
+    fn overlay_point_appends_one_vertex() {
+        let mut o = Overlay::new();
+        o.point([2.0, 3.0, 4.0], [0.5; 4]);
+        assert_eq!(o.point_count(), 1);
+        assert_eq!(o.points[0].position, [2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn overlay_clear_drops_everything() {
+        let mut o = Overlay::new();
+        o.line([0.0; 3], [1.0; 3], [1.0; 4]);
+        o.point([0.5; 3], [1.0; 4]);
+        o.clear();
+        assert!(o.is_empty());
+        assert_eq!(o.segment_count(), 0);
+        assert_eq!(o.point_count(), 0);
+    }
+
+    #[test]
+    fn scene_is_empty_includes_overlay_state() {
+        let mut s = Scene::new();
+        assert!(s.is_empty());
+        s.depth_tested_overlay.point([0.0; 3], [1.0; 4]);
+        assert!(
+            !s.is_empty(),
+            "scene with overlay-only content shouldn't report empty"
+        );
+        s.clear();
+        assert!(s.is_empty());
     }
 }

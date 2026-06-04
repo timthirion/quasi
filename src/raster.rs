@@ -20,7 +20,7 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::gpu::OrbitCamera;
 use mesh::{cube_mesh, cylinder_mesh, sphere_mesh, Mesh, Vertex};
-use scene::{translation, Instance, InstanceRaw, MeshHandle, Scene};
+use scene::{translation, Instance, InstanceRaw, MeshHandle, OverlayVertex, Scene};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
@@ -52,18 +52,33 @@ pub struct State {
     config: wgpu::SurfaceConfiguration,
 
     pipeline: wgpu::RenderPipeline,
+    /// R3 overlay pipelines: `[topology][depth_mode]` where
+    /// topology 0 = LineList, 1 = PointList; depth_mode 0 = Less
+    /// (occluded by geometry), 1 = Always (drawn on top of everything).
+    overlay_pipelines: [[wgpu::RenderPipeline; 2]; 2],
     bind_group: wgpu::BindGroup,
     frame_uniform_buf: wgpu::Buffer,
 
     meshes: Vec<GpuMesh>,
     instance_buf: wgpu::Buffer,
     instance_capacity: u64,
+    /// Concat(depth_tested.lines, on_top.lines) packed each frame.
+    overlay_line_buf: wgpu::Buffer,
+    overlay_line_capacity: u64,
+    /// Concat(depth_tested.points, on_top.points).
+    overlay_point_buf: wgpu::Buffer,
+    overlay_point_capacity: u64,
 
     depth_view: wgpu::TextureView,
 
     pub camera: OrbitCamera,
     pub scene: Scene,
 }
+
+const OVERLAY_LINE_LIST: usize = 0;
+const OVERLAY_POINT_LIST: usize = 1;
+const OVERLAY_DEPTH_TESTED: usize = 0;
+const OVERLAY_ON_TOP: usize = 1;
 
 fn create_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
     let tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -81,6 +96,62 @@ fn create_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
         view_formats: &[],
     });
     tex.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// Builds one overlay pipeline. Topology picks line-list vs point-list;
+/// `depth_compare` picks depth-tested (Less) vs on-top (Always).
+/// Depth writes are disabled either way so overlays don't occlude
+/// triangle geometry drawn in later frames or passes.
+fn build_overlay_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    topology: wgpu::PrimitiveTopology,
+    depth_compare: wgpu::CompareFunction,
+    color_format: wgpu::TextureFormat,
+    label: &str,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            buffers: &[OverlayVertex::layout()],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: color_format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            // Lines and points have no winding; back-face culling would
+            // either be ignored or (on some backends) drop everything.
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(depth_compare),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
 }
 
 fn upload_mesh(device: &wgpu::Device, queue: &wgpu::Queue, mesh: &Mesh, label: &str) -> GpuMesh {
@@ -192,6 +263,12 @@ impl State {
             immediate_size: 0,
         });
 
+        // R3 overlay shader — shared by all four overlay pipelines.
+        let overlay_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("overlay"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("raster/shaders/overlay.wgsl").into()),
+        });
+
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("forward"),
             layout: Some(&layout),
@@ -231,6 +308,49 @@ impl State {
             multiview_mask: None,
             cache: None,
         });
+
+        let overlay_pipelines = [
+            [
+                build_overlay_pipeline(
+                    &device,
+                    &overlay_shader,
+                    &layout,
+                    wgpu::PrimitiveTopology::LineList,
+                    wgpu::CompareFunction::Less,
+                    config.format,
+                    "overlay-line-depth-tested",
+                ),
+                build_overlay_pipeline(
+                    &device,
+                    &overlay_shader,
+                    &layout,
+                    wgpu::PrimitiveTopology::LineList,
+                    wgpu::CompareFunction::Always,
+                    config.format,
+                    "overlay-line-on-top",
+                ),
+            ],
+            [
+                build_overlay_pipeline(
+                    &device,
+                    &overlay_shader,
+                    &layout,
+                    wgpu::PrimitiveTopology::PointList,
+                    wgpu::CompareFunction::Less,
+                    config.format,
+                    "overlay-point-depth-tested",
+                ),
+                build_overlay_pipeline(
+                    &device,
+                    &overlay_shader,
+                    &layout,
+                    wgpu::PrimitiveTopology::PointList,
+                    wgpu::CompareFunction::Always,
+                    config.format,
+                    "overlay-point-on-top",
+                ),
+            ],
+        ];
 
         // Seed the geometry library with a small useful set: cube, sphere,
         // cylinder. Callers wanting custom meshes can extend it via
@@ -275,6 +395,21 @@ impl State {
             mapped_at_creation: false,
         });
 
+        let overlay_line_capacity: u64 = 256;
+        let overlay_line_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("overlay-lines"),
+            size: overlay_line_capacity * OverlayVertex::STRIDE,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let overlay_point_capacity: u64 = 256;
+        let overlay_point_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("overlay-points"),
+            size: overlay_point_capacity * OverlayVertex::STRIDE,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let depth_view = create_depth(&device, config.width, config.height);
 
         let mut scene = Scene::new();
@@ -311,17 +446,40 @@ impl State {
             tint: [0.75, 0.6, 0.95, 1.0],
         });
 
+        // R3 demo overlay: world-space coordinate axes at the origin
+        // (depth-tested so they hide behind geometry), plus bright dots
+        // above each cube (on top of everything for goal-marker feel).
+        scene
+            .depth_tested_overlay
+            .line([0.0, 0.01, 0.0], [2.0, 0.01, 0.0], [1.0, 0.2, 0.2, 1.0]);
+        scene
+            .depth_tested_overlay
+            .line([0.0, 0.01, 0.0], [0.0, 2.0, 0.0], [0.2, 1.0, 0.2, 1.0]);
+        scene
+            .depth_tested_overlay
+            .line([0.0, 0.01, 0.0], [0.0, 0.01, 2.0], [0.2, 0.5, 1.0, 1.0]);
+        for x in [-1.6_f32, 0.0, 1.6] {
+            scene
+                .on_top_overlay
+                .point([x, 1.2, 0.0], [1.0, 1.0, 0.4, 1.0]);
+        }
+
         State {
             surface,
             device,
             queue,
             config,
             pipeline,
+            overlay_pipelines,
             bind_group,
             frame_uniform_buf,
             meshes,
             instance_buf,
             instance_capacity,
+            overlay_line_buf,
+            overlay_line_capacity,
+            overlay_point_buf,
+            overlay_point_capacity,
             depth_view,
             camera: OrbitCamera::new(),
             scene,
@@ -421,6 +579,67 @@ impl State {
                 .write_buffer(&self.instance_buf, 0, bytemuck::cast_slice(&packed));
         }
 
+        // ---- Overlay buffer packing (R3) ----
+        // Pack into `[depth_tested, on_top]` so each pipeline draws a
+        // contiguous range. The buffer slice (rather than a dynamic
+        // first-vertex offset) keeps wgpu's validation happy across
+        // backends without a "min vertex" feature.
+        let dt_lines = &self.scene.depth_tested_overlay.lines;
+        let top_lines = &self.scene.on_top_overlay.lines;
+        let line_total: usize = dt_lines.len() + top_lines.len();
+        if line_total as u64 > self.overlay_line_capacity {
+            let new_cap = (line_total as u64)
+                .next_power_of_two()
+                .max(self.overlay_line_capacity * 2);
+            self.overlay_line_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("overlay-lines"),
+                size: new_cap * OverlayVertex::STRIDE,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.overlay_line_capacity = new_cap;
+        }
+        if line_total > 0 {
+            let mut packed_lines: Vec<OverlayVertex> = Vec::with_capacity(line_total);
+            packed_lines.extend_from_slice(dt_lines);
+            packed_lines.extend_from_slice(top_lines);
+            self.queue.write_buffer(
+                &self.overlay_line_buf,
+                0,
+                bytemuck::cast_slice(&packed_lines),
+            );
+        }
+        let line_dt_count = dt_lines.len() as u32;
+        let line_top_count = top_lines.len() as u32;
+
+        let dt_points = &self.scene.depth_tested_overlay.points;
+        let top_points = &self.scene.on_top_overlay.points;
+        let point_total: usize = dt_points.len() + top_points.len();
+        if point_total as u64 > self.overlay_point_capacity {
+            let new_cap = (point_total as u64)
+                .next_power_of_two()
+                .max(self.overlay_point_capacity * 2);
+            self.overlay_point_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("overlay-points"),
+                size: new_cap * OverlayVertex::STRIDE,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.overlay_point_capacity = new_cap;
+        }
+        if point_total > 0 {
+            let mut packed_points: Vec<OverlayVertex> = Vec::with_capacity(point_total);
+            packed_points.extend_from_slice(dt_points);
+            packed_points.extend_from_slice(top_points);
+            self.queue.write_buffer(
+                &self.overlay_point_buf,
+                0,
+                bytemuck::cast_slice(&packed_points),
+            );
+        }
+        let point_dt_count = dt_points.len() as u32;
+        let point_top_count = top_points.len() as u32;
+
         let surface_view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -472,6 +691,38 @@ impl State {
                 rp.set_vertex_buffer(1, self.instance_buf.slice(inst_byte_start..inst_byte_end));
                 rp.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint16);
                 rp.draw_indexed(0..mesh.index_count, 0, 0..count);
+            }
+
+            // ---- Overlay passes (R3) ----
+            // Order: depth-tested lines, depth-tested points,
+            // on-top lines, on-top points. All inside the same render
+            // pass so each reads the depth buffer the triangle pass
+            // wrote; none of them write back, so successive overlay
+            // passes don't occlude each other.
+            let dt_line_range = 0..line_dt_count;
+            let top_line_range = line_dt_count..(line_dt_count + line_top_count);
+            let dt_point_range = 0..point_dt_count;
+            let top_point_range = point_dt_count..(point_dt_count + point_top_count);
+
+            if !dt_line_range.is_empty() {
+                rp.set_pipeline(&self.overlay_pipelines[OVERLAY_LINE_LIST][OVERLAY_DEPTH_TESTED]);
+                rp.set_vertex_buffer(0, self.overlay_line_buf.slice(..));
+                rp.draw(dt_line_range, 0..1);
+            }
+            if !dt_point_range.is_empty() {
+                rp.set_pipeline(&self.overlay_pipelines[OVERLAY_POINT_LIST][OVERLAY_DEPTH_TESTED]);
+                rp.set_vertex_buffer(0, self.overlay_point_buf.slice(..));
+                rp.draw(dt_point_range, 0..1);
+            }
+            if !top_line_range.is_empty() {
+                rp.set_pipeline(&self.overlay_pipelines[OVERLAY_LINE_LIST][OVERLAY_ON_TOP]);
+                rp.set_vertex_buffer(0, self.overlay_line_buf.slice(..));
+                rp.draw(top_line_range, 0..1);
+            }
+            if !top_point_range.is_empty() {
+                rp.set_pipeline(&self.overlay_pipelines[OVERLAY_POINT_LIST][OVERLAY_ON_TOP]);
+                rp.set_vertex_buffer(0, self.overlay_point_buf.slice(..));
+                rp.draw(top_point_range, 0..1);
             }
         }
         self.queue.submit(std::iter::once(encoder.finish()));
