@@ -54,14 +54,23 @@ currently in flight; Phase 4 is open.
 
 - One `plans/NNNN-*.md` per concrete piece of work, zero-padded and globally
   incrementing across both tracks (next free number: `0004`).
-- Within a plan, milestones use a **track prefix** + per-plan ordinal:
-  - **`PT-1`, `PT-2`, …** for path-tracer milestones (any plan whose work
-    advances the offline path-traced renderer).
-  - **`RT-1`, `RT-2`, …** for real-time / rasterizer milestones.
+- Within a plan, milestones use a **track prefix + a short semantic slug**:
+  - **`PT-<topic>`** for path-tracer milestones (any plan whose work
+    advances the offline path-traced renderer): e.g. `PT-bvh`, `PT-ggx`,
+    `PT-cloud`, `PT-sobol-padded`.
+  - **`RT-<topic>`** for real-time / rasterizer milestones: e.g.
+    `RT-overlays`, `RT-motum-wire`.
+  - Sequencing within a plan comes from the order of checkboxes in the
+    plan doc; cross-plan ordering is the ROADMAP's job. The slugs
+    themselves carry no ordinal — `PT-cloud` doesn't imply it happened
+    after `PT-ggx`, only that both belong to the path-tracer track.
+  - Pick clear topical names up front. Renaming a milestone after work
+    starts pollutes the git log; if scope genuinely drifts, split into
+    two milestones rather than rename one.
 - The historical prefixes in plans `0001` (`M0–M4`), `0002` (`R0–R4`), and
   `0003` (`T0–T4`) stay as they were when those plans shipped — renaming
-  shipped history doesn't earn its confusion cost. The `PT` / `RT`
-  convention applies to plans `0004` onward.
+  shipped history doesn't earn its confusion cost. The `PT-<topic>` /
+  `RT-<topic>` convention applies to plans `0004` onward.
 
 ## Phases
 
