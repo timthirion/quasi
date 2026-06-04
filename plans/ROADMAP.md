@@ -50,6 +50,19 @@ Plans done: [`0001-foundation`](0001-foundation.md) (M0–M4),
 [`0003-triangle-meshes`](0003-triangle-meshes.md) (T0–T4). No plans are
 currently in flight; Phase 4 is open.
 
+## Plan + milestone conventions
+
+- One `plans/NNNN-*.md` per concrete piece of work, zero-padded and globally
+  incrementing across both tracks (next free number: `0004`).
+- Within a plan, milestones use a **track prefix** + per-plan ordinal:
+  - **`PT-1`, `PT-2`, …** for path-tracer milestones (any plan whose work
+    advances the offline path-traced renderer).
+  - **`RT-1`, `RT-2`, …** for real-time / rasterizer milestones.
+- The historical prefixes in plans `0001` (`M0–M4`), `0002` (`R0–R4`), and
+  `0003` (`T0–T4`) stay as they were when those plans shipped — renaming
+  shipped history doesn't earn its confusion cost. The `PT` / `RT`
+  convention applies to plans `0004` onward.
+
 ## Phases
 
 Phases are roughly ordered; boundaries are soft. Each becomes one or more
