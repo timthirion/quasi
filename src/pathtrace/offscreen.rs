@@ -15,11 +15,13 @@ use bytemuck::Zeroable;
 
 use crate::gpu;
 use crate::pathtrace::integrator::IntegratorKind;
+use crate::pathtrace::mesh::TriangleScene;
 use crate::pathtrace::sampler::SamplerKind;
 use crate::pathtrace::scene;
 use crate::pathtrace::{
-    build_accumulate_bgl, make_pipeline, mrt_pass, AccumUniform, AOV_ALBEDO, AOV_DEPTH, AOV_NORMAL,
-    AOV_RADIANCE, NUM_AOVS,
+    build_accumulate_bgl, build_pathtrace_bg, build_pathtrace_bgl, build_scene_buffers,
+    make_pipeline, mrt_pass, AccumUniform, AOV_ALBEDO, AOV_DEPTH, AOV_NORMAL, AOV_RADIANCE,
+    NUM_AOVS,
 };
 
 /// `Rgba32Float`: 16 bytes per pixel; trivially round-trips through host
@@ -121,14 +123,14 @@ fn create_aov_texture(
     })
 }
 
-/// Renders the Cornell Box at `cfg.samples` samples per pixel and reads
-/// back the accumulated AOVs. Blocks the calling thread (intended for
-/// use from a CLI render command).
-pub fn render_offscreen(cfg: RenderConfig) -> Aovs {
-    pollster::block_on(render_offscreen_async(cfg))
+/// Renders `scene` at `cfg.samples` samples per pixel and reads back
+/// the accumulated AOVs. Blocks the calling thread (intended for use
+/// from a CLI render command).
+pub fn render_offscreen(cfg: RenderConfig, scene: &TriangleScene) -> Aovs {
+    pollster::block_on(render_offscreen_async(cfg, scene))
 }
 
-async fn render_offscreen_async(cfg: RenderConfig) -> Aovs {
+async fn render_offscreen_async(cfg: RenderConfig, scene_data: &TriangleScene) -> Aovs {
     assert!(
         cfg.width > 0 && cfg.height > 0,
         "render size must be non-zero"
@@ -160,19 +162,7 @@ async fn render_offscreen_async(cfg: RenderConfig) -> Aovs {
         .await
         .expect("failed to create offscreen device");
 
-    let pathtrace_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("offscreen-pathtrace-bgl"),
-        entries: &[wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        }],
-    });
+    let pathtrace_bgl = build_pathtrace_bgl(&device);
     let accumulate_bgl = build_accumulate_bgl(&device);
 
     let aov_formats = [OFFSCREEN_FORMAT; NUM_AOVS];
@@ -192,13 +182,9 @@ async fn render_offscreen_async(cfg: RenderConfig) -> Aovs {
     );
 
     // --- Scene + uniforms ---
-    let cornell = scene::cornell_box();
     let mut uniforms = scene::Uniforms::zeroed();
-    let n = cornell.quads.len().min(scene::MAX_QUADS);
-    uniforms.quads[..n].copy_from_slice(&cornell.quads[..n]);
-    uniforms.materials[..n].copy_from_slice(&cornell.materials[..n]);
-    uniforms.quad_count = n as u32;
-    uniforms.light_index = cornell.light_index;
+    uniforms.triangle_count = scene_data.triangle_count() as u32;
+    uniforms.emissive_count = scene_data.emissive_triangles.len() as u32;
     uniforms.camera.position = cfg.camera_pos;
     uniforms.camera.direction = cfg.camera_dir;
     uniforms.camera.up = cfg.camera_up;
@@ -209,12 +195,8 @@ async fn render_offscreen_async(cfg: RenderConfig) -> Aovs {
     uniforms.sampler_kind = cfg.sampler.as_u32();
     uniforms.integrator_kind = cfg.integrator.as_u32();
 
-    let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("offscreen-uniforms"),
-        size: std::mem::size_of::<scene::Uniforms>() as u64,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    let scene_buffers = build_scene_buffers(&device, &queue, scene_data);
+    let uniform_buf = scene_buffers.uniform.clone();
     let accum_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("offscreen-accum-uniform"),
         size: std::mem::size_of::<AccumUniform>() as u64,
@@ -222,14 +204,7 @@ async fn render_offscreen_async(cfg: RenderConfig) -> Aovs {
         mapped_at_creation: false,
     });
 
-    let pathtrace_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("offscreen-pathtrace-bg"),
-        layout: &pathtrace_bgl,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: uniform_buf.as_entire_binding(),
-        }],
-    });
+    let pathtrace_bg = build_pathtrace_bg(&device, &pathtrace_bgl, &scene_buffers);
 
     // --- Targets ---
     let sample_textures: [wgpu::Texture; NUM_AOVS] = std::array::from_fn(|i| {

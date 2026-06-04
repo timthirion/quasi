@@ -21,6 +21,8 @@ use std::path::PathBuf;
 #[cfg(not(target_arch = "wasm32"))]
 use quasi::pathtrace::converge::{self, ConvergeConfig};
 #[cfg(not(target_arch = "wasm32"))]
+use quasi::pathtrace::default_triangle_scene;
+#[cfg(not(target_arch = "wasm32"))]
 use quasi::pathtrace::integrator::IntegratorKind;
 #[cfg(not(target_arch = "wasm32"))]
 use quasi::pathtrace::offscreen::{render_offscreen, RenderConfig};
@@ -64,6 +66,9 @@ struct RenderArgs {
     samples: u32,
     sampler: SamplerKind,
     integrator: IntegratorKind,
+    /// `--scene path.gltf` to load a custom triangle scene; default
+    /// uses the Cornell Box embedded in the binary.
+    scene: Option<PathBuf>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -76,6 +81,7 @@ impl Default for RenderArgs {
             samples: 256,
             sampler: SamplerKind::default(),
             integrator: IntegratorKind::default(),
+            scene: None,
         }
     }
 }
@@ -122,6 +128,12 @@ fn parse_render_args(args: &[String]) -> Result<RenderArgs, String> {
                     .ok_or_else(|| "--integrator needs a name".to_string())?;
                 r.integrator = v.parse()?;
             }
+            "--scene" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| "--scene needs a path".to_string())?;
+                r.scene = Some(PathBuf::from(v));
+            }
             "--help" | "-?" => {
                 println!(
                     "render options:\n\
@@ -130,7 +142,8 @@ fn parse_render_args(args: &[String]) -> Result<RenderArgs, String> {
                      \t--height N          image height (default: 512)\n\
                      \t--spp N             samples per pixel (default: 256)\n\
                      \t--sampler NAME      pcg | halton | sobol (default: pcg)\n\
-                     \t--integrator NAME   misnee | bsdf (default: misnee)"
+                     \t--integrator NAME   misnee | bsdf (default: misnee)\n\
+                     \t--scene PATH        load a custom glTF scene (default: embedded Cornell)"
                 );
                 std::process::exit(0);
             }
@@ -162,8 +175,20 @@ fn run_render(args: &[String]) {
         cfg.sampler,
         cfg.integrator,
     );
+    let scene = match cli.scene.as_deref() {
+        Some(path) => quasi::pathtrace::mesh::load_glb(path).unwrap_or_else(|e| {
+            eprintln!("failed to load --scene {}: {e}", path.display());
+            std::process::exit(1);
+        }),
+        None => default_triangle_scene(),
+    };
+    log::info!(
+        "scene: {} triangles, {} emissive",
+        scene.triangle_count(),
+        scene.emissive_triangles.len(),
+    );
     let start = std::time::Instant::now();
-    let aovs = render_offscreen(cfg);
+    let aovs = render_offscreen(cfg, &scene);
     let render_dur = start.elapsed();
     log::info!(
         "render took {:.2}s ({} samples)",

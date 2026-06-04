@@ -9,6 +9,7 @@
 use std::io::Write;
 use std::path::Path;
 
+use crate::pathtrace::default_triangle_scene;
 use crate::pathtrace::integrator::IntegratorKind;
 use crate::pathtrace::metrics;
 use crate::pathtrace::offscreen::{render_offscreen, RenderConfig};
@@ -66,20 +67,25 @@ pub fn spp_schedule(max_spp: u32) -> Vec<u32> {
 /// Runs the sweep and writes the CSV. Returns the number of data rows
 /// written (i.e. excluding the header).
 pub fn run(cfg: ConvergeConfig, out_path: &Path) -> std::io::Result<Vec<ConvergeRow>> {
+    let scene = default_triangle_scene();
     log::info!(
-        "rendering reference: {}x{} @ {} spp (pcg + misnee)",
+        "rendering reference: {}x{} @ {} spp (pcg + misnee, {} triangles)",
         cfg.width,
         cfg.height,
         cfg.reference_spp,
+        scene.triangle_count(),
     );
-    let ref_aovs = render_offscreen(RenderConfig {
-        width: cfg.width,
-        height: cfg.height,
-        samples: cfg.reference_spp,
-        sampler: SamplerKind::Pcg,
-        integrator: IntegratorKind::MisNee,
-        ..RenderConfig::default()
-    });
+    let ref_aovs = render_offscreen(
+        RenderConfig {
+            width: cfg.width,
+            height: cfg.height,
+            samples: cfg.reference_spp,
+            sampler: SamplerKind::Pcg,
+            integrator: IntegratorKind::MisNee,
+            ..RenderConfig::default()
+        },
+        &scene,
+    );
 
     let schedule = spp_schedule(cfg.max_spp);
     let combos = [SamplerKind::Pcg, SamplerKind::Halton, SamplerKind::Sobol];
@@ -98,14 +104,17 @@ pub fn run(cfg: ConvergeConfig, out_path: &Path) -> std::io::Result<Vec<Converge
     for sampler in combos {
         for integrator in integrators {
             for &spp in &schedule {
-                let aovs = render_offscreen(RenderConfig {
-                    width: cfg.width,
-                    height: cfg.height,
-                    samples: spp,
-                    sampler,
-                    integrator,
-                    ..RenderConfig::default()
-                });
+                let aovs = render_offscreen(
+                    RenderConfig {
+                        width: cfg.width,
+                        height: cfg.height,
+                        samples: spp,
+                        sampler,
+                        integrator,
+                        ..RenderConfig::default()
+                    },
+                    &scene,
+                );
                 let rmse = metrics::rmse_rgb(&aovs.radiance, &ref_aovs.radiance);
                 let rel_mse = metrics::rel_mse_rgb(&aovs.radiance, &ref_aovs.radiance);
                 rows.push(ConvergeRow {

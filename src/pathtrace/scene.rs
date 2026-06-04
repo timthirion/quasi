@@ -1,5 +1,11 @@
-//! Cornell Box scene and the GPU-packed uniform layout shared with the WGSL
-//! path tracer.
+//! Analytic Cornell Box description + the path tracer's scene uniform.
+//!
+//! T0/M0-M3 used analytic quads packed into a fat uniform buffer. T1
+//! moves geometry to storage buffers loaded from glTF
+//! ([`crate::pathtrace::mesh`]), and `Uniforms` shrinks to just the
+//! camera + a few scalars. The analytic Cornell description below
+//! survives because [`examples/gen_cornell.rs`] uses it to produce the
+//! triangulated glTF files in `data/gltf/`.
 //!
 //! The `Gpu*` structs are laid out to match WGSL uniform alignment: each
 //! `vec3<f32>` lands on a 16-byte boundary (the trailing scalar in every
@@ -40,13 +46,19 @@ pub struct GpuMaterial {
     pub metallic: f32,
 }
 
+/// Camera + scalars uniform — the only data the WGSL shader still reads
+/// out of a uniform buffer in T1. Triangle geometry and materials live
+/// in storage buffers bound alongside this uniform.
+///
+/// Layout: 80 bytes (camera 48 + 8 × u32 = 80). Must match `Uniforms`
+/// in `pathtrace.wgsl` byte-for-byte.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct Uniforms {
     pub camera: GpuCamera,
-    pub quad_count: u32,
+    pub triangle_count: u32,
+    pub emissive_count: u32,
     pub frame_count: u32,
-    pub light_index: u32,
     pub viewport_width: u32,
     pub viewport_height: u32,
     /// Discriminant of [`crate::pathtrace::sampler::SamplerKind`]. The WGSL
@@ -56,8 +68,6 @@ pub struct Uniforms {
     /// Switches the WGSL path tracer between MIS+NEE and pure BSDF.
     pub integrator_kind: u32,
     pub _pad: u32,
-    pub quads: [GpuQuad; MAX_QUADS],
-    pub materials: [GpuMaterial; MAX_QUADS],
 }
 
 /// CPU description of the Cornell Box.
@@ -212,10 +222,11 @@ mod tests {
         assert_eq!(size_of::<GpuCamera>(), 48);
         assert_eq!(size_of::<GpuQuad>(), 48);
         assert_eq!(size_of::<GpuMaterial>(), 32);
-        // camera (48) + 8 * u32 scalar block (32) = 80, then the arrays.
-        assert_eq!(offset_of!(Uniforms, quads), 80);
-        assert_eq!(offset_of!(Uniforms, materials), 80 + MAX_QUADS * 48);
-        assert_eq!(size_of::<Uniforms>(), 80 + MAX_QUADS * 48 + MAX_QUADS * 32);
+        // camera (48) + 8 × u32 = 80. T1 dropped the per-quad arrays;
+        // triangle data lives in storage buffers now.
+        assert_eq!(size_of::<Uniforms>(), 80);
+        assert_eq!(offset_of!(Uniforms, triangle_count), 48);
+        assert_eq!(offset_of!(Uniforms, integrator_kind), 48 + 6 * 4);
     }
 
     #[test]
