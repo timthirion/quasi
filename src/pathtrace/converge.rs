@@ -11,12 +11,13 @@ use std::path::Path;
 
 use crate::pathtrace::default_triangle_scene;
 use crate::pathtrace::integrator::IntegratorKind;
+use crate::pathtrace::mesh::{load_glb, TriangleScene};
 use crate::pathtrace::metrics;
 use crate::pathtrace::offscreen::{render_offscreen, RenderConfig};
 use crate::pathtrace::sampler::SamplerKind;
 
 /// Knobs for the convergence sweep.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ConvergeConfig {
     pub width: u32,
     pub height: u32,
@@ -25,6 +26,9 @@ pub struct ConvergeConfig {
     /// The high-spp ground truth that every series is scored against.
     /// Rendered once with the lowest-variance pair (PCG + MIS+NEE).
     pub reference_spp: u32,
+    /// Optional custom glTF scene. `None` uses the embedded Cornell
+    /// default.
+    pub scene_path: Option<std::path::PathBuf>,
 }
 
 impl Default for ConvergeConfig {
@@ -34,6 +38,7 @@ impl Default for ConvergeConfig {
             height: 256,
             max_spp: 1024,
             reference_spp: 4096,
+            scene_path: None,
         }
     }
 }
@@ -67,7 +72,10 @@ pub fn spp_schedule(max_spp: u32) -> Vec<u32> {
 /// Runs the sweep and writes the CSV. Returns the number of data rows
 /// written (i.e. excluding the header).
 pub fn run(cfg: ConvergeConfig, out_path: &Path) -> std::io::Result<Vec<ConvergeRow>> {
-    let scene = default_triangle_scene();
+    let scene: TriangleScene = match cfg.scene_path.as_deref() {
+        Some(path) => load_glb(path).map_err(|e| std::io::Error::other(e.to_string()))?,
+        None => default_triangle_scene(),
+    };
     log::info!(
         "rendering reference: {}x{} @ {} spp (pcg + misnee, {} triangles)",
         cfg.width,

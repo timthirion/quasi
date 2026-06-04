@@ -14,6 +14,7 @@ use quasi::pathtrace::mesh::load_glb_bytes;
 
 const CORNELL_QUADS: &[u8] = include_bytes!("../data/gltf/cornell_quads.gltf");
 const CORNELL_TRIS: &[u8] = include_bytes!("../data/gltf/cornell_tris.gltf");
+const CORNELL_SPHERE: &[u8] = include_bytes!("../data/gltf/cornell_sphere.gltf");
 
 #[test]
 fn cornell_quads_has_expected_topology() {
@@ -37,6 +38,22 @@ fn cornell_tris_has_expected_topology() {
     assert_eq!(scene.materials.len(), 5);
     // Light: 1 quad × 4×4 × 2 = 32 emissive triangles.
     assert_eq!(scene.emissive_triangles.len(), 32);
+}
+
+#[test]
+fn cornell_sphere_has_expected_topology() {
+    let scene = load_glb_bytes(CORNELL_SPHERE).expect("load cornell_sphere.gltf");
+    // 6 room quads × 2 triangles + level-5 icosphere (20 × 4^5 = 20480).
+    assert_eq!(scene.triangle_count(), 6 * 2 + 20480);
+    // 1 default + 4 room (white, red, green, light) + 1 sphere material.
+    assert_eq!(scene.materials.len(), 6);
+    // Only the light quad is emissive — 1 quad × 2 triangles.
+    assert_eq!(scene.emissive_triangles.len(), 2);
+    // BVH built at load time — non-empty.
+    assert!(
+        scene.bvh.nodes.len() > 1,
+        "20k-triangle scene should build a multi-node BVH",
+    );
 }
 
 #[test]
@@ -181,5 +198,44 @@ fn bvh_is_faster_than_brute_force_at_512_triangles() {
     assert!(
         speedup >= 2.0,
         "bvh speedup {speedup:.1}x < 2x — the BVH should at least beat a 512-triangle linear scan",
+    );
+}
+
+/// The plan's headline 10× target lives here, on the 20k-triangle
+/// cornell_sphere.gltf (T4 publishable scene). Same #[ignore] gating.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+#[ignore]
+fn bvh_is_at_least_10x_faster_at_20k_triangles() {
+    use quasi::pathtrace::offscreen::{render_offscreen, RenderConfig};
+    use std::time::Instant;
+
+    let scene = load_glb_bytes(CORNELL_SPHERE).expect("sphere");
+    let make_cfg = |use_bvh: bool| RenderConfig {
+        width: 256,
+        height: 256,
+        samples: 64,
+        use_bvh,
+        ..RenderConfig::default()
+    };
+
+    let _ = render_offscreen(make_cfg(true), &scene); // warm-up
+
+    let t = Instant::now();
+    let _ = render_offscreen(make_cfg(true), &scene);
+    let bvh_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+    let t = Instant::now();
+    let _ = render_offscreen(make_cfg(false), &scene);
+    let brute_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+    let speedup = brute_ms / bvh_ms;
+    eprintln!(
+        "cornell_sphere ({} tris) @ 256x256 / 64 spp: bvh = {bvh_ms:.0} ms, brute = {brute_ms:.0} ms, speedup = {speedup:.1}x",
+        scene.triangle_count(),
+    );
+    assert!(
+        speedup >= 10.0,
+        "bvh speedup {speedup:.1}x < 10x — plan target missed at 20k triangles",
     );
 }

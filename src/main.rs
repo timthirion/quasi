@@ -274,6 +274,12 @@ fn parse_converge_args(args: &[String]) -> Result<ConvergeArgs, String> {
                     .ok_or_else(|| "--reference-spp needs a number".to_string())?;
                 r.cfg.reference_spp = v.parse().map_err(|e| format!("--reference-spp: {e}"))?;
             }
+            "--scene" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| "--scene needs a path".to_string())?;
+                r.cfg.scene_path = Some(PathBuf::from(v));
+            }
             "--help" | "-?" => {
                 println!(
                     "converge options:\n\
@@ -281,7 +287,8 @@ fn parse_converge_args(args: &[String]) -> Result<ConvergeArgs, String> {
                      \t--width N              image width  (default: 256)\n\
                      \t--height N             image height (default: 256)\n\
                      \t--max-spp N            largest spp in the sweep (default: 1024)\n\
-                     \t--reference-spp N      spp for the ground-truth reference (default: 4096)"
+                     \t--reference-spp N      spp for the ground-truth reference (default: 4096)\n\
+                     \t--scene PATH           load a custom glTF scene (default: embedded Cornell)"
                 );
                 std::process::exit(0);
             }

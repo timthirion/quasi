@@ -30,9 +30,8 @@ fn main() {
     let quads = scene.quads.clone();
     let materials = scene.materials.clone();
 
-    // (file, subdivision per quad axis)
+    // 1) Whole Cornell (room + two boxes) at two subdivision densities.
     let outputs = [("cornell_quads.gltf", 1), ("cornell_tris.gltf", 4)];
-
     for (filename, subdiv) in outputs {
         let bytes = build_gltf(&quads, &materials, subdiv);
         let path = out_dir.join(filename);
@@ -45,6 +44,35 @@ fn main() {
             quads.len() * subdiv * subdiv * 2,
         );
     }
+
+    // 2) Cornell room + level-5 icosphere — the T4 publishable scene.
+    //    Room only (5 walls + 1 light = first 6 quads of cornell_box());
+    //    the two internal boxes are removed so the sphere is the hero.
+    let room_quads: Vec<GpuQuad> = quads.iter().take(6).copied().collect();
+    let room_materials: Vec<GpuMaterial> = materials.iter().take(6).copied().collect();
+    let sphere_mat = GpuMaterial {
+        albedo: [0.4, 0.5, 0.7],
+        roughness: 1.0,
+        emission: [0.0, 0.0, 0.0],
+        metallic: 0.0,
+    };
+    let (sphere_positions, sphere_normals, sphere_indices) = icosphere(5, [0.0, 0.5, 0.0], 0.5);
+    let bytes = build_gltf_with_sphere(
+        &room_quads,
+        &room_materials,
+        &sphere_positions,
+        &sphere_normals,
+        &sphere_indices,
+        sphere_mat,
+    );
+    let path = out_dir.join("cornell_sphere.gltf");
+    fs::write(&path, &bytes).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    println!(
+        "wrote {} ({} bytes, room + level-5 icosphere → {} triangles)",
+        path.display(),
+        bytes.len(),
+        room_quads.len() * 2 + sphere_indices.len() / 3,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -182,6 +210,104 @@ fn triangulate(
 }
 
 // ---------------------------------------------------------------------------
+// Icosphere — recursive midpoint subdivision starting from an icosahedron,
+// reprojected to the unit sphere at each step. Vertex normals = direction
+// from origin (smooth shading).
+// ---------------------------------------------------------------------------
+
+/// Returns `(positions, normals, indices)` for an icosphere of subdivision
+/// level `level`, scaled to `radius` and translated to `center`.
+///
+/// Vertex count: `10 * 4^level + 2`. Triangle count: `20 * 4^level`.
+/// Level 5 = 10,242 vertices / 20,480 triangles — bunny territory
+/// without an external download.
+fn icosphere(
+    level: usize,
+    center: [f32; 3],
+    radius: f32,
+) -> (Vec<[f32; 3]>, Vec<[f32; 3]>, Vec<u32>) {
+    let phi = (1.0_f32 + 5.0_f32.sqrt()) * 0.5;
+    let mut verts: Vec<[f32; 3]> = vec![
+        [-1.0, phi, 0.0],
+        [1.0, phi, 0.0],
+        [-1.0, -phi, 0.0],
+        [1.0, -phi, 0.0],
+        [0.0, -1.0, phi],
+        [0.0, 1.0, phi],
+        [0.0, -1.0, -phi],
+        [0.0, 1.0, -phi],
+        [phi, 0.0, -1.0],
+        [phi, 0.0, 1.0],
+        [-phi, 0.0, -1.0],
+        [-phi, 0.0, 1.0],
+    ];
+    for v in &mut verts {
+        let n = normalize(*v);
+        *v = n;
+    }
+
+    let mut tris: Vec<u32> = vec![
+        0, 11, 5, 0, 5, 1, 0, 1, 7, 0, 7, 10, 0, 10, 11, 1, 5, 9, 5, 11, 4, 11, 10, 2, 10, 7, 6, 7,
+        1, 8, 3, 9, 4, 3, 4, 2, 3, 2, 6, 3, 6, 8, 3, 8, 9, 4, 9, 5, 2, 4, 11, 6, 2, 10, 8, 6, 7, 9,
+        8, 1,
+    ];
+
+    use std::collections::HashMap;
+    let mut edge_cache: HashMap<(u32, u32), u32> = HashMap::new();
+    for _ in 0..level {
+        let mut new_tris = Vec::with_capacity(tris.len() * 4);
+        edge_cache.clear();
+        for chunk in tris.chunks_exact(3) {
+            let a = chunk[0];
+            let b = chunk[1];
+            let c = chunk[2];
+            let ab = midpoint_index(a, b, &mut verts, &mut edge_cache);
+            let bc = midpoint_index(b, c, &mut verts, &mut edge_cache);
+            let ca = midpoint_index(c, a, &mut verts, &mut edge_cache);
+            new_tris.extend_from_slice(&[a, ab, ca, b, bc, ab, c, ca, bc, ab, bc, ca]);
+        }
+        tris = new_tris;
+    }
+
+    let mut positions = Vec::with_capacity(verts.len());
+    let mut normals = Vec::with_capacity(verts.len());
+    for v in &verts {
+        positions.push([
+            center[0] + v[0] * radius,
+            center[1] + v[1] * radius,
+            center[2] + v[2] * radius,
+        ]);
+        // The un-translated vertex on the unit sphere IS its own outward
+        // normal; translation doesn't change the direction.
+        normals.push(*v);
+    }
+    (positions, normals, tris)
+}
+
+fn midpoint_index(
+    a: u32,
+    b: u32,
+    verts: &mut Vec<[f32; 3]>,
+    cache: &mut std::collections::HashMap<(u32, u32), u32>,
+) -> u32 {
+    let key = if a < b { (a, b) } else { (b, a) };
+    if let Some(&idx) = cache.get(&key) {
+        return idx;
+    }
+    let va = verts[a as usize];
+    let vb = verts[b as usize];
+    let mid = normalize([
+        (va[0] + vb[0]) * 0.5,
+        (va[1] + vb[1]) * 0.5,
+        (va[2] + vb[2]) * 0.5,
+    ]);
+    let idx = verts.len() as u32;
+    verts.push(mid);
+    cache.insert(key, idx);
+    idx
+}
+
+// ---------------------------------------------------------------------------
 // glTF JSON + base64 binary emission
 // ---------------------------------------------------------------------------
 
@@ -207,17 +333,45 @@ fn bounds(positions: &[[f32; 3]]) -> ([f32; 3], [f32; 3]) {
     (lo, hi)
 }
 
+/// Same as [`build_gltf`] but also appends a single triangle mesh
+/// (positions + normals + indices, one shared material). Used to ship
+/// the icosphere alongside the room.
+fn build_gltf_with_sphere(
+    quads: &[GpuQuad],
+    materials: &[GpuMaterial],
+    sphere_positions: &[[f32; 3]],
+    sphere_normals: &[[f32; 3]],
+    sphere_indices: &[u32],
+    sphere_material: GpuMaterial,
+) -> Vec<u8> {
+    let (mut palette, quad_material) = unique_materials(materials);
+    let sphere_mat_idx = palette.len();
+    palette.push(sphere_material);
+
+    let mut batches = triangulate(quads, &quad_material, palette.len(), 1);
+    batches.push(PrimitiveBatch {
+        material_idx: sphere_mat_idx,
+        positions: sphere_positions.to_vec(),
+        normals: sphere_normals.to_vec(),
+        indices: sphere_indices.to_vec(),
+    });
+    emit_gltf(&palette, &batches)
+}
+
 fn build_gltf(quads: &[GpuQuad], materials: &[GpuMaterial], subdiv: usize) -> Vec<u8> {
     let (palette, quad_material) = unique_materials(materials);
     let batches = triangulate(quads, &quad_material, palette.len(), subdiv);
+    emit_gltf(&palette, &batches)
+}
 
+fn emit_gltf(palette: &[GpuMaterial], batches: &[PrimitiveBatch]) -> Vec<u8> {
     // --- Binary buffer + accessors ---
     let mut bin: Vec<u8> = Vec::new();
     let mut accessors_json: Vec<String> = Vec::new();
     let mut buffer_views_json: Vec<String> = Vec::new();
     let mut primitives_json: Vec<String> = Vec::new();
 
-    for batch in &batches {
+    for batch in batches {
         let pos_offset = bin.len();
         for p in &batch.positions {
             for &v in p {
