@@ -1,9 +1,11 @@
-// Progressive accumulation: weighted average of the new sample into the running
-// estimate. textureLoad with integer pixel coords keeps all passes pixel-aligned
-// (no sampler, no flips).
+// Progressive accumulation across four AOV channels:
+//   @location(0) radiance, @location(1) albedo,
+//   @location(2) normal,   @location(3) depth.
+//
+// Each channel is a weighted running average of (prev, new). textureLoad
+// with integer pixel coords keeps every AOV pixel-aligned (no samplers,
+// no flips, no edge tap).
 
-// Scalar pads (not vec3<u32>, which would force 16-byte alignment and make this
-// struct 32 bytes, mismatching the 16-byte Rust side). This is 16 bytes.
 struct AccumU {
     frame_count: u32,
     _pad0: u32,
@@ -12,8 +14,16 @@ struct AccumU {
 };
 
 @group(0) @binding(0) var<uniform> A: AccumU;
-@group(0) @binding(1) var sample_tex: texture_2d<f32>;
-@group(0) @binding(2) var accum_prev: texture_2d<f32>;
+
+@group(0) @binding(1) var sample_rad: texture_2d<f32>;
+@group(0) @binding(2) var sample_alb: texture_2d<f32>;
+@group(0) @binding(3) var sample_nor: texture_2d<f32>;
+@group(0) @binding(4) var sample_dep: texture_2d<f32>;
+
+@group(0) @binding(5) var prev_rad: texture_2d<f32>;
+@group(0) @binding(6) var prev_alb: texture_2d<f32>;
+@group(0) @binding(7) var prev_nor: texture_2d<f32>;
+@group(0) @binding(8) var prev_dep: texture_2d<f32>;
 
 struct VsOut {
     @builtin(position) position: vec4<f32>,
@@ -29,11 +39,22 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
     return out;
 }
 
+struct AccumOut {
+    @location(0) rad: vec4<f32>,
+    @location(1) alb: vec4<f32>,
+    @location(2) nor: vec4<f32>,
+    @location(3) dep: vec4<f32>,
+};
+
 @fragment
-fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+fn fs_main(in: VsOut) -> AccumOut {
     let coord = vec2<i32>(in.position.xy);
-    let s = textureLoad(sample_tex, coord, 0);
-    let p = textureLoad(accum_prev, coord, 0);
-    let weight = 1.0 / f32(A.frame_count + 1u);
-    return mix(p, s, weight);
+    let w = 1.0 / f32(A.frame_count + 1u);
+
+    var out: AccumOut;
+    out.rad = mix(textureLoad(prev_rad, coord, 0), textureLoad(sample_rad, coord, 0), w);
+    out.alb = mix(textureLoad(prev_alb, coord, 0), textureLoad(sample_alb, coord, 0), w);
+    out.nor = mix(textureLoad(prev_nor, coord, 0), textureLoad(sample_nor, coord, 0), w);
+    out.dep = mix(textureLoad(prev_dep, coord, 0), textureLoad(sample_dep, coord, 0), w);
+    return out;
 }

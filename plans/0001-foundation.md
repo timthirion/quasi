@@ -1,8 +1,8 @@
 # Foundation: interactive Cornell Box path tracer (native + web)
 
 - **Status:** active
-- **Last updated:** 2026-06-02
-- **Last touched on:** planning (no code yet)
+- **Last updated:** 2026-06-04
+- **Last touched on:** M2 landed — samplers, AOVs via MRT, native PNG + EXR output
 
 ## Goal
 
@@ -122,11 +122,49 @@ silently mismatched the packed 16-byte Rust struct and failed only at runtime
 mismatch, not a WGSL error). Rule: keep uniform structs to scalar fields or full
 16-byte quartets, and make the Rust and WGSL sizes obviously identical.
 
-### M2 — Samplers, AOVs, output
-- [ ] Selectable samplers: PCG / Halton / Sobol; sampler test (sequences off-GPU).
-- [ ] AOVs: albedo / normal / depth via MRT, each accumulated.
-- [ ] Native image output: PNG (tonemapped) + EXR (HDR + AOVs).
+### M2 — Samplers, AOVs, output ✅ DONE
+- [x] Selectable samplers: PCG / Halton / Sobol (`pathtrace::sampler`).
+      All three dispatched at runtime by a `sampler_kind` uniform; the
+      WGSL `next_2d(s)` branches on the kind. CPU mirrors exist for every
+      sampler so canonical sequence values (van der Corput, Halton bases
+      2/3, Sobol dims 0/1) are pinned in `cargo test`.
+- [x] AOVs: radiance / albedo / normal / depth via 4-attachment MRT, each
+      accumulated through the ping-pong pass. Accumulate bind group has
+      9 entries (1 uniform + 8 textures). `max_color_attachments=4` on
+      `downlevel_webgl2_defaults` is exactly enough; preserves web build.
+- [x] Native image output (`pathtrace::output`): PNG (Reinhard + gamma
+      1/2.2, matches the present shader) and multi-channel HDR EXR
+      carrying RGB radiance plus `albedo.{R,G,B}`, `N.{X,Y,Z}`, `Z`
+      (depth) in one layer. Encoders run on **scoped threads**
+      (`std::thread::scope`) so PNG and EXR overlap — first exercise of
+      AGENTS.md's "Use the language" guidance.
+- [x] CLI: `cargo run -- render --out <base> [--width W --height H --spp N
+      --sampler pcg|halton|sobol]` for headless renders. Offscreen path
+      uses its own `Rgba32Float` targets (clean `bytemuck::cast_slice`
+      readback, no f16 decode) and asks for `adapter.limits()` to clear
+      the default `max_color_attachment_bytes_per_sample=32` cap.
 - **Done when:** AOVs and an HDR EXR can be written from a native render.
+  _Confirmed 2026-06-04: `cargo run -- render --width 256 --spp 128
+  --sampler {pcg,halton,sobol}` produces a recognisable Cornell Box PNG
+  and a 10-channel EXR; the EXR round-trips back through `exr::read_all_*`
+  in the test suite._
+
+**MRT format gotcha:** wgpu validates `BlendState::REPLACE` against the
+texture format's blendability, even though "replace" is semantically
+no-blend. `Rgba32Float` is non-blendable, so the unified `make_pipeline`
+helper now passes `blend: None`. Switching all pipelines to `None` was
+the right move — neither pipeline ever uses blending.
+
+**Limit gotcha:** four `Rgba32Float` attachments add up to 64 bytes per
+sample, which exceeds the WebGPU baseline of 32. The native offscreen
+device requests `adapter.limits()` (always ≥ 64 on the backends we
+target). The windowed renderer stays on `Rgba16Float` (32 bytes total)
+and keeps `Limits::downlevel_webgl2_defaults()` on web.
+
+**"Use the language" pattern:** image encoding is CPU-bound and trivially
+splittable per format. `std::thread::scope` borrows `&Aovs` across the
+PNG and EXR closures without an `Arc`, and the scope guarantees the
+borrow doesn't outlive `write_render`. Clean fit; no `async` theatre.
 
 ### M3 — Verification harness (native)
 - [ ] Image metrics (MSE / RMSE / rel-MSE) + `cargo test` on synthetic images and

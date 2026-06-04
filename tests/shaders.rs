@@ -43,3 +43,22 @@ fn forward_shader_is_valid() {
         include_str!("../src/raster/shaders/forward.wgsl"),
     );
 }
+
+#[test]
+fn pathtrace_sampler_constants_match_cpu_side() {
+    // WGSL `SAMPLER_*` constants must match the discriminants of
+    // `pathtrace::sampler::SamplerKind`. naga validation doesn't catch a
+    // drift here (each side parses fine independently); this guard does.
+    let src = include_str!("../src/pathtrace/shaders/pathtrace.wgsl");
+    for (name, expected) in [
+        ("SAMPLER_PCG", 0u32),
+        ("SAMPLER_HALTON", 1u32),
+        ("SAMPLER_SOBOL", 2u32),
+    ] {
+        let needle = format!("const {name}: u32 = {expected}u;");
+        assert!(
+            src.contains(&needle),
+            "expected `{needle}` in pathtrace.wgsl",
+        );
+    }
+}

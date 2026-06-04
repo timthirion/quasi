@@ -49,7 +49,10 @@ pub struct Uniforms {
     pub light_index: u32,
     pub viewport_width: u32,
     pub viewport_height: u32,
-    pub _pad: [u32; 3],
+    /// Discriminant of [`crate::pathtrace::sampler::SamplerKind`]. The WGSL
+    /// side reads it directly to dispatch between PCG / Halton / Sobol.
+    pub sampler_kind: u32,
+    pub _pad: [u32; 2],
     pub quads: [GpuQuad; MAX_QUADS],
     pub materials: [GpuMaterial; MAX_QUADS],
 }

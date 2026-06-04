@@ -1,16 +1,34 @@
 //! Path-traced renderer.
 //!
-//! M1 megakernel pipeline: a Cornell Box path tracer (NEE + MIS) over an
-//! analytic scene of quads. Three passes per frame — path-trace one sample
-//! into an HDR texture, accumulate into a ping-pong running average, then
-//! tonemap the average to the surface.
+//! Cornell Box megakernel path tracer (NEE + MIS). Each frame runs three
+//! passes:
 //!
-//! This module owns the path-tracer's `State`, scene, and WGSL shaders.
+//! 1. **path-trace** — fragment shader samples one new path per pixel and
+//!    writes four AOV color attachments (radiance / albedo / normal /
+//!    depth) into a set of sample textures.
+//! 2. **accumulate** — ping-pong: blend the four sample textures into the
+//!    previous accumulator with `weight = 1 / (frame + 1)`, writing the
+//!    new accumulator into the four target views.
+//! 3. **present** — tone-map the radiance AOV to the surface (Reinhard +
+//!    gamma).
+//!
+//! Sampler choice (PCG / Halton / Sobol) is selected at runtime via
+//! [`State::set_sampler`] — the WGSL shader dispatches on a single
+//! `sampler_kind` uniform field. CPU sampler implementations + tests
+//! live in [`sampler`].
+//!
 //! The [`gpu`](crate::gpu) module supplies the wgpu instance factory and
 //! the `OrbitCamera`. The rasterized pipeline ([`raster`](crate::raster))
 //! shares nothing with this code below the `gpu` seam.
 
+pub mod sampler;
 pub mod scene;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod offscreen;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod output;
 
 #[cfg(target_arch = "wasm32")]
 pub mod web;
@@ -18,23 +36,40 @@ pub mod web;
 use bytemuck::{Pod, Zeroable};
 
 use crate::gpu::OrbitCamera;
+use crate::pathtrace::sampler::SamplerKind;
 
-const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// HDR storage for AOV accumulation. Filterable, broadly supported, and
+/// enough precision for the Cornell Box convergence story.
+pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// AOV slot indices. Order matches the WGSL `PathTraceOut` /
+/// `AccumOut` `@location(...)` attributes and the `Targets` arrays.
+pub const AOV_RADIANCE: usize = 0;
+pub const AOV_ALBEDO: usize = 1;
+pub const AOV_NORMAL: usize = 2;
+pub const AOV_DEPTH: usize = 3;
+pub const NUM_AOVS: usize = 4;
 
 /// Small uniform for the accumulate pass. 16 bytes — must match WGSL `AccumU`.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct AccumUniform {
-    frame_count: u32,
-    _pad: [u32; 3],
+pub(crate) struct AccumUniform {
+    pub frame_count: u32,
+    pub _pad: [u32; 3],
 }
 
 /// Per-resolution render targets and their bind groups.
-struct Targets {
-    sample_view: wgpu::TextureView,
-    accum_views: [wgpu::TextureView; 2],
-    accumulate_bg: [wgpu::BindGroup; 2],
-    present_bg: [wgpu::BindGroup; 2],
+///
+/// `sample_views` are the path-trace outputs; `accum_views[ping]` holds
+/// the running average. `accumulate_bg[ping]` reads from
+/// `accum_views[ping]` (the previous accumulator) and is bound when
+/// writing into `accum_views[1 - ping]`. The optional `present_bg` only
+/// exists for the windowed renderer; the offscreen renderer skips it.
+pub(crate) struct Targets {
+    pub sample_views: [wgpu::TextureView; NUM_AOVS],
+    pub accum_views: [[wgpu::TextureView; NUM_AOVS]; 2],
+    pub accumulate_bg: [wgpu::BindGroup; 2],
+    pub present_bg: [wgpu::BindGroup; 2],
 }
 
 /// The path-tracer renderer: owns the surface, pipelines, and scene state.
@@ -63,7 +98,15 @@ pub struct State {
     read_idx: usize,
 }
 
-fn create_hdr_texture(device: &wgpu::Device, w: u32, h: u32, label: &str) -> wgpu::TextureView {
+/// Creates one HDR render-attachment texture and returns its default
+/// view. `extra_usage` lets callers add `COPY_SRC` for AOV readback.
+pub(crate) fn create_hdr_texture(
+    device: &wgpu::Device,
+    w: u32,
+    h: u32,
+    label: &str,
+    extra_usage: wgpu::TextureUsages,
+) -> (wgpu::Texture, wgpu::TextureView) {
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
         size: wgpu::Extent3d {
@@ -75,10 +118,32 @@ fn create_hdr_texture(device: &wgpu::Device, w: u32, h: u32, label: &str) -> wgp
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: HDR_FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | extra_usage,
         view_formats: &[],
     });
-    tex.create_view(&wgpu::TextureViewDescriptor::default())
+    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    (tex, view)
+}
+
+fn make_aov_views(
+    device: &wgpu::Device,
+    w: u32,
+    h: u32,
+    prefix: &str,
+) -> [wgpu::TextureView; NUM_AOVS] {
+    let names = ["radiance", "albedo", "normal", "depth"];
+    std::array::from_fn(|i| {
+        let (_tex, view) = create_hdr_texture(
+            device,
+            w,
+            h,
+            &format!("{prefix}-{}", names[i]),
+            wgpu::TextureUsages::empty(),
+        );
+        view
+    })
 }
 
 fn build_targets(
@@ -89,39 +154,44 @@ fn build_targets(
     present_bgl: &wgpu::BindGroupLayout,
     accum_uniform_buf: &wgpu::Buffer,
 ) -> Targets {
-    let sample_view = create_hdr_texture(device, w, h, "sample");
+    let sample_views = make_aov_views(device, w, h, "sample");
     let accum_views = [
-        create_hdr_texture(device, w, h, "accum0"),
-        create_hdr_texture(device, w, h, "accum1"),
+        make_aov_views(device, w, h, "accum0"),
+        make_aov_views(device, w, h, "accum1"),
     ];
 
     let make_accumulate_bg = |prev: usize| {
+        let mut entries: Vec<wgpu::BindGroupEntry> = Vec::with_capacity(1 + NUM_AOVS * 2);
+        entries.push(wgpu::BindGroupEntry {
+            binding: 0,
+            resource: accum_uniform_buf.as_entire_binding(),
+        });
+        for (i, view) in sample_views.iter().enumerate() {
+            entries.push(wgpu::BindGroupEntry {
+                binding: 1 + i as u32,
+                resource: wgpu::BindingResource::TextureView(view),
+            });
+        }
+        for (i, view) in accum_views[prev].iter().enumerate() {
+            entries.push(wgpu::BindGroupEntry {
+                binding: 1 + (NUM_AOVS + i) as u32,
+                resource: wgpu::BindingResource::TextureView(view),
+            });
+        }
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("accumulate-bg"),
             layout: accumulate_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: accum_uniform_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&sample_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&accum_views[prev]),
-                },
-            ],
+            entries: &entries,
         })
     };
+
     let make_present_bg = |idx: usize| {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("present-bg"),
             layout: present_bgl,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
-                resource: wgpu::BindingResource::TextureView(&accum_views[idx]),
+                resource: wgpu::BindingResource::TextureView(&accum_views[idx][AOV_RADIANCE]),
             }],
         })
     };
@@ -129,9 +199,92 @@ fn build_targets(
     Targets {
         accumulate_bg: [make_accumulate_bg(0), make_accumulate_bg(1)],
         present_bg: [make_present_bg(0), make_present_bg(1)],
-        sample_view,
+        sample_views,
         accum_views,
     }
+}
+
+pub(crate) fn build_accumulate_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let tex = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    };
+    let mut entries: Vec<wgpu::BindGroupLayoutEntry> = Vec::with_capacity(1 + 2 * NUM_AOVS);
+    entries.push(wgpu::BindGroupLayoutEntry {
+        binding: 0,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    });
+    for i in 0..(2 * NUM_AOVS) as u32 {
+        entries.push(tex(1 + i));
+    }
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("accumulate-bgl"),
+        entries: &entries,
+    })
+}
+
+pub(crate) fn make_pipeline(
+    device: &wgpu::Device,
+    label: &str,
+    src: &str,
+    bgl: &wgpu::BindGroupLayout,
+    formats: &[wgpu::TextureFormat],
+) -> wgpu::RenderPipeline {
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(src.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(label),
+        bind_group_layouts: &[Some(bgl)],
+        immediate_size: 0,
+    });
+    // `blend: None` (not BlendState::REPLACE) so the same helper works
+    // for Rgba32Float, which wgpu rejects as non-blendable even when the
+    // semantic is "no blend".
+    let targets: Vec<Option<wgpu::ColorTargetState>> = formats
+        .iter()
+        .map(|f| {
+            Some(wgpu::ColorTargetState {
+                format: *f,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })
+        })
+        .collect();
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("fs_main"),
+            targets: &targets,
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
 }
 
 impl State {
@@ -201,95 +354,43 @@ impl State {
                 count: None,
             }],
         });
-
-        let tex_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                view_dimension: wgpu::TextureViewDimension::D2,
-                multisampled: false,
-            },
-            count: None,
-        };
-        let accumulate_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("accumulate-bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                tex_entry(1),
-                tex_entry(2),
-            ],
-        });
+        let accumulate_bgl = build_accumulate_bgl(&device);
         let present_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("present-bgl"),
-            entries: &[tex_entry(0)],
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
         });
 
         // --- Pipelines ---
-        let make_pipeline =
-            |label: &str, src: &str, bgl: &wgpu::BindGroupLayout, format: wgpu::TextureFormat| {
-                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some(label),
-                    source: wgpu::ShaderSource::Wgsl(src.into()),
-                });
-                let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some(label),
-                    bind_group_layouts: &[Some(bgl)],
-                    immediate_size: 0,
-                });
-                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some(label),
-                    layout: Some(&layout),
-                    vertex: wgpu::VertexState {
-                        module: &module,
-                        entry_point: Some("vs_main"),
-                        buffers: &[],
-                        compilation_options: Default::default(),
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: &module,
-                        entry_point: Some("fs_main"),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format,
-                            blend: Some(wgpu::BlendState::REPLACE),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                        compilation_options: Default::default(),
-                    }),
-                    primitive: wgpu::PrimitiveState::default(),
-                    depth_stencil: None,
-                    multisample: wgpu::MultisampleState::default(),
-                    multiview_mask: None,
-                    cache: None,
-                })
-            };
-
+        let aov_formats = [HDR_FORMAT; NUM_AOVS];
         let pathtrace_pipeline = make_pipeline(
+            &device,
             "pathtrace",
             include_str!("pathtrace/shaders/pathtrace.wgsl"),
             &pathtrace_bgl,
-            HDR_FORMAT,
+            &aov_formats,
         );
         let accumulate_pipeline = make_pipeline(
+            &device,
             "accumulate",
             include_str!("pathtrace/shaders/accumulate.wgsl"),
             &accumulate_bgl,
-            HDR_FORMAT,
+            &aov_formats,
         );
         let present_pipeline = make_pipeline(
+            &device,
             "present",
             include_str!("pathtrace/shaders/present.wgsl"),
             &present_bgl,
-            config.format,
+            &[config.format],
         );
 
         // --- Buffers + scene ---
@@ -300,6 +401,7 @@ impl State {
         uniforms.materials[..n].copy_from_slice(&cornell.materials[..n]);
         uniforms.quad_count = n as u32;
         uniforms.light_index = cornell.light_index;
+        uniforms.sampler_kind = SamplerKind::default().as_u32();
 
         let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("uniforms"),
@@ -371,6 +473,16 @@ impl State {
         }
     }
 
+    /// Selects the sampler used by the integrator. Restarts accumulation
+    /// since the noise statistics change.
+    pub fn set_sampler(&mut self, kind: SamplerKind) {
+        if self.uniforms.sampler_kind != kind.as_u32() {
+            self.uniforms.sampler_kind = kind.as_u32();
+            self.frame_count = 0;
+            self.read_idx = 0;
+        }
+    }
+
     pub fn render(&mut self) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
@@ -426,17 +538,30 @@ impl State {
                 label: Some("frame-encoder"),
             });
 
-        fullscreen_pass(&mut encoder, &self.targets.sample_view, |rp| {
-            rp.set_pipeline(&self.pathtrace_pipeline);
-            rp.set_bind_group(0, &self.pathtrace_bg, &[]);
-            rp.draw(0..3, 0..1);
-        });
-        fullscreen_pass(&mut encoder, &self.targets.accum_views[dst], |rp| {
-            rp.set_pipeline(&self.accumulate_pipeline);
-            rp.set_bind_group(0, &self.targets.accumulate_bg[src], &[]);
-            rp.draw(0..3, 0..1);
-        });
-        fullscreen_pass(&mut encoder, &surface_view, |rp| {
+        // 1. Path-trace pass: 4 MRT outputs into sample_views[0..4].
+        mrt_pass(
+            &mut encoder,
+            "pathtrace",
+            &self.targets.sample_views,
+            |rp| {
+                rp.set_pipeline(&self.pathtrace_pipeline);
+                rp.set_bind_group(0, &self.pathtrace_bg, &[]);
+                rp.draw(0..3, 0..1);
+            },
+        );
+        // 2. Accumulate pass: 4 MRT outputs into accum_views[dst].
+        mrt_pass(
+            &mut encoder,
+            "accumulate",
+            &self.targets.accum_views[dst],
+            |rp| {
+                rp.set_pipeline(&self.accumulate_pipeline);
+                rp.set_bind_group(0, &self.targets.accumulate_bg[src], &[]);
+                rp.draw(0..3, 0..1);
+            },
+        );
+        // 3. Present (radiance only) to the surface.
+        single_attachment_pass(&mut encoder, "present", &surface_view, |rp| {
             rp.set_pipeline(&self.present_pipeline);
             rp.set_bind_group(0, &self.targets.present_bg[dst], &[]);
             rp.draw(0..3, 0..1);
@@ -450,14 +575,15 @@ impl State {
     }
 }
 
-/// Runs a single fullscreen render pass that clears then invokes `draw`.
-fn fullscreen_pass<F: FnOnce(&mut wgpu::RenderPass)>(
+/// One render pass into a single color attachment.
+pub(crate) fn single_attachment_pass<F: FnOnce(&mut wgpu::RenderPass)>(
     encoder: &mut wgpu::CommandEncoder,
+    label: &str,
     target: &wgpu::TextureView,
     draw: F,
 ) {
     let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-        label: Some("pass"),
+        label: Some(label),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
             view: target,
             depth_slice: None,
@@ -475,6 +601,35 @@ fn fullscreen_pass<F: FnOnce(&mut wgpu::RenderPass)>(
     draw(&mut rp);
 }
 
+/// One render pass into the four AOV color attachments.
+pub(crate) fn mrt_pass<F: FnOnce(&mut wgpu::RenderPass)>(
+    encoder: &mut wgpu::CommandEncoder,
+    label: &str,
+    targets: &[wgpu::TextureView; NUM_AOVS],
+    draw: F,
+) {
+    let atts: [Option<wgpu::RenderPassColorAttachment>; NUM_AOVS] = std::array::from_fn(|i| {
+        Some(wgpu::RenderPassColorAttachment {
+            view: &targets[i],
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                store: wgpu::StoreOp::Store,
+            },
+        })
+    });
+    let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some(label),
+        color_attachments: &atts,
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    draw(&mut rp);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,5 +637,16 @@ mod tests {
     #[test]
     fn accum_uniform_is_16_bytes() {
         assert_eq!(std::mem::size_of::<AccumUniform>(), 16);
+    }
+
+    #[test]
+    fn aov_indices_are_distinct_and_packed() {
+        // The order matters: shader `@location(N)` must match the array
+        // index used in mrt_pass and the present bind group.
+        assert_eq!(AOV_RADIANCE, 0);
+        assert_eq!(AOV_ALBEDO, 1);
+        assert_eq!(AOV_NORMAL, 2);
+        assert_eq!(AOV_DEPTH, 3);
+        assert_eq!(NUM_AOVS, 4);
     }
 }

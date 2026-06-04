@@ -52,6 +52,23 @@ WebGPU/WGSL once and let `wgpu` choose the native backend.
 (For contrast: a separate native implementation of Quasi is free to be
 backend-agnostic and write Metal/Vulkan/etc. directly. This repo is not.)
 
+## Use the language
+
+A secondary goal: exercise the breadth of Rust. When a design has multiple
+reasonable shapes and one of them puts `async`, parallelism (`rayon`, channels),
+traits, type-state, or lifetimes to genuine use, prefer that shape. This is a
+long-term project and a learning surface as well as a research vehicle; using
+the language well is part of the point.
+
+Concretely: design CPU-side systems around async / parallel APIs where they're
+a natural fit — async asset and scene loaders, parallel acceleration-structure
+builds, worker pools for the convergence / verification harness, channel-driven
+pipelines — but **don't fake it**. A fundamentally sequential or GPU-bound
+stage stays sequential. Architectural fit first; language breadth second.
+
+This is CPU-side guidance. GPU work stays on the single WebGPU surface per the
+section above.
+
 ## Build & Run
 
 ```bash
