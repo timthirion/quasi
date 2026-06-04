@@ -16,6 +16,7 @@ const CORNELL_QUADS: &[u8] = include_bytes!("../data/gltf/cornell_quads.gltf");
 const CORNELL_TRIS: &[u8] = include_bytes!("../data/gltf/cornell_tris.gltf");
 const CORNELL_SPHERE: &[u8] = include_bytes!("../data/gltf/cornell_sphere.gltf");
 const CORNELL_BUNNY: &[u8] = include_bytes!("../data/gltf/cornell_bunny.gltf");
+const CORNELL_METAL_BUNNY: &[u8] = include_bytes!("../data/gltf/cornell_metal_bunny.gltf");
 const CORNELL_TEXTURED_FLOOR: &[u8] =
     include_bytes!("../data/gltf/cornell_textured_floor.gltf");
 
@@ -71,6 +72,32 @@ fn cornell_bunny_has_expected_topology() {
     assert_eq!(scene.emissive_triangles.len(), 2);
     // BVH must exist for the renderer.
     assert!(scene.bvh.nodes.len() > 1);
+}
+
+#[test]
+fn cornell_metal_bunny_topology_matches_clay_bunny_but_material_is_metallic() {
+    let clay = load_glb_bytes(CORNELL_BUNNY).expect("load cornell_bunny.gltf");
+    let metal = load_glb_bytes(CORNELL_METAL_BUNNY).expect("load cornell_metal_bunny.gltf");
+
+    // Same geometry as the clay bunny — only the bunny material differs.
+    assert_eq!(metal.triangle_count(), clay.triangle_count());
+    assert_eq!(metal.materials.len(), clay.materials.len());
+    assert_eq!(metal.emissive_triangles.len(), clay.emissive_triangles.len());
+
+    // The new scene must carry at least one fully metallic (metallic=1)
+    // material — anything less and the WGSL `metallic > 0.5` dispatch
+    // would never route into the GGX branch.
+    let any_metal = metal
+        .materials
+        .iter()
+        .any(|m| m.metallic >= 0.5 && m.emission.iter().all(|&e| e < 0.1));
+    assert!(any_metal, "expected a metallic (non-emissive) material");
+
+    // ...and the clay bunny scene has *no* metallic materials, by
+    // contrast. Pins that the regression won't be hidden by an old
+    // metallic value sneaking into the all-Lambertian scenes.
+    let any_metal_in_clay = clay.materials.iter().any(|m| m.metallic >= 0.5);
+    assert!(!any_metal_in_clay, "cornell_bunny should be pure Lambertian");
 }
 
 #[test]

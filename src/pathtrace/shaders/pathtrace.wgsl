@@ -615,6 +615,179 @@ fn cosine_sample_hemisphere(normal: vec3<f32>, s: ptr<function, SamplerState>) -
     return normalize(uu * cos(phi) * sin_theta + vv * sin(phi) * sin_theta + nrm * cos_theta);
 }
 
+// ----- GGX microfacet BRDF (PT-ggx) -----
+//
+// The full conductor walk: Trowbridge-Reitz GGX D, Smith separable
+// masking-shadowing G, Schlick Fresnel. Roughness 0 collapses to a
+// perfect mirror (the δ-spike); we clamp `alpha` from below so the
+// sample/pdf path stays finite. The CPU side
+// (`pathtrace::ggx`) mirrors these formulas — the tests pin
+// agreement.
+
+const GGX_MIN_ALPHA: f32 = 0.0064;
+
+fn ggx_alpha(roughness: f32) -> f32 {
+    let r = max(roughness, sqrt(GGX_MIN_ALPHA));
+    return r * r;
+}
+
+fn ggx_d(n_dot_h: f32, alpha: f32) -> f32 {
+    let a2 = alpha * alpha;
+    let denom = n_dot_h * n_dot_h * (a2 - 1.0) + 1.0;
+    return a2 / (PI * denom * denom);
+}
+
+fn smith_g1(n_dot_x: f32, alpha: f32) -> f32 {
+    let a2 = alpha * alpha;
+    let denom = n_dot_x + sqrt(a2 + (1.0 - a2) * n_dot_x * n_dot_x);
+    return 2.0 * n_dot_x / max(denom, 1e-8);
+}
+
+fn smith_g(n_dot_v: f32, n_dot_l: f32, alpha: f32) -> f32 {
+    return smith_g1(n_dot_v, alpha) * smith_g1(n_dot_l, alpha);
+}
+
+fn schlick_fresnel(v_dot_h: f32, f0: vec3<f32>) -> vec3<f32> {
+    let s = pow(1.0 - v_dot_h, 5.0);
+    return f0 + (vec3<f32>(1.0) - f0) * s;
+}
+
+// Importance-sample a GGX half-vector in world space. Returns the
+// world-space half vector — the caller reflects `wo` about it to get
+// the outgoing direction.
+fn sample_ggx_half(normal: vec3<f32>, alpha: f32, s: ptr<function, SamplerState>) -> vec3<f32> {
+    let r = next_2d(s);
+    let a2 = alpha * alpha;
+    let cos_theta_2 = (1.0 - r.x) / (r.x * (a2 - 1.0) + 1.0);
+    let cos_theta = sqrt(max(cos_theta_2, 0.0));
+    let sin_theta = sqrt(max(1.0 - cos_theta_2, 0.0));
+    let phi = 2.0 * PI * r.y;
+
+    let nrm = normalize(normal);
+    var a: vec3<f32>;
+    if (abs(nrm.x) > 0.9) {
+        a = vec3<f32>(0.0, 1.0, 0.0);
+    } else {
+        a = vec3<f32>(1.0, 0.0, 0.0);
+    }
+    let vv = normalize(cross(nrm, a));
+    let uu = cross(nrm, vv);
+    return normalize(uu * cos(phi) * sin_theta + vv * sin(phi) * sin_theta + nrm * cos_theta);
+}
+
+// Solid-angle pdf for a GGX importance-sampled reflection direction.
+// pdf_h = D(h) * (n · h); pdf_l = pdf_h / (4 (v · h)) — the Jacobian
+// of the half-vector → outgoing-direction reflection.
+fn ggx_pdf(n_dot_h: f32, v_dot_h: f32, alpha: f32) -> f32 {
+    return ggx_d(n_dot_h, alpha) * n_dot_h / (4.0 * max(v_dot_h, 1e-6));
+}
+
+// ----- Unified BSDF dispatch -----
+//
+// `metallic > 0.5` picks GGX; else Lambertian. Both branches return
+// the same `weight = f * cos(θ_l) / pdf_l` so the integrator code
+// downstream is uniform. For Lambertian this collapses to `albedo`
+// because (albedo/π) * cos / (cos/π) = albedo — bit-identical with
+// the M3 path, by construction.
+
+struct BsdfSample {
+    wi: vec3<f32>,
+    weight: vec3<f32>,
+    pdf: f32,
+    valid: bool,
+};
+
+fn sample_bsdf(
+    mat: Material,
+    albedo: vec3<f32>,
+    normal: vec3<f32>,
+    wo: vec3<f32>,
+    s: ptr<function, SamplerState>,
+) -> BsdfSample {
+    var out: BsdfSample;
+    out.valid = false;
+    out.wi = vec3<f32>(0.0);
+    out.weight = vec3<f32>(0.0);
+    out.pdf = 0.0;
+
+    if (mat.metallic > 0.5) {
+        let alpha = ggx_alpha(mat.roughness);
+        let h = sample_ggx_half(normal, alpha, s);
+        let wi = reflect(-wo, h);
+        let n_dot_l = dot(normal, wi);
+        let n_dot_v = dot(normal, wo);
+        let n_dot_h = dot(normal, h);
+        let v_dot_h = dot(wo, h);
+        if (n_dot_l <= 0.0 || n_dot_v <= 0.0 || n_dot_h <= 0.0 || v_dot_h <= 0.0) {
+            return out;
+        }
+        let f = schlick_fresnel(v_dot_h, albedo);
+        let g = smith_g(n_dot_v, n_dot_l, alpha);
+        out.wi = wi;
+        // f * cos(l) / pdf_l, with f = D*G*F / (4 n·v n·l) and
+        //                     pdf_l = D * n·h / (4 v·h)
+        //   → F * G * v·h / (n·v * n·h)
+        out.weight = f * g * v_dot_h / (n_dot_v * n_dot_h);
+        out.pdf = ggx_pdf(n_dot_h, v_dot_h, alpha);
+        out.valid = true;
+    } else {
+        let wi = cosine_sample_hemisphere(normal, s);
+        let cos_wi = max(dot(normal, wi), 0.0);
+        out.wi = wi;
+        out.weight = albedo;
+        out.pdf = cos_wi / PI;
+        out.valid = cos_wi > 0.0;
+    }
+    return out;
+}
+
+fn eval_bsdf(
+    mat: Material,
+    albedo: vec3<f32>,
+    normal: vec3<f32>,
+    wo: vec3<f32>,
+    wi: vec3<f32>,
+) -> vec3<f32> {
+    if (mat.metallic > 0.5) {
+        let n_dot_l = dot(normal, wi);
+        let n_dot_v = dot(normal, wo);
+        if (n_dot_l <= 0.0 || n_dot_v <= 0.0) {
+            return vec3<f32>(0.0);
+        }
+        let h = normalize(wo + wi);
+        let n_dot_h = dot(normal, h);
+        let v_dot_h = dot(wo, h);
+        if (n_dot_h <= 0.0 || v_dot_h <= 0.0) {
+            return vec3<f32>(0.0);
+        }
+        let alpha = ggx_alpha(mat.roughness);
+        let d = ggx_d(n_dot_h, alpha);
+        let g = smith_g(n_dot_v, n_dot_l, alpha);
+        let f = schlick_fresnel(v_dot_h, albedo);
+        return d * g * f / (4.0 * n_dot_v * n_dot_l);
+    }
+    return albedo / PI;
+}
+
+fn bsdf_pdf(mat: Material, normal: vec3<f32>, wo: vec3<f32>, wi: vec3<f32>) -> f32 {
+    if (mat.metallic > 0.5) {
+        let n_dot_l = dot(normal, wi);
+        let n_dot_v = dot(normal, wo);
+        if (n_dot_l <= 0.0 || n_dot_v <= 0.0) {
+            return 0.0;
+        }
+        let h = normalize(wo + wi);
+        let n_dot_h = max(dot(normal, h), 0.0);
+        let v_dot_h = max(dot(wo, h), 0.0);
+        if (n_dot_h <= 0.0 || v_dot_h <= 0.0) {
+            return 0.0;
+        }
+        let alpha = ggx_alpha(mat.roughness);
+        return ggx_pdf(n_dot_h, v_dot_h, alpha);
+    }
+    return max(dot(normal, wi), 0.0) / PI;
+}
+
 // ----- Camera -----
 
 fn get_camera_ray(uv_in: vec2<f32>, s: ptr<function, SamplerState>) -> Ray {
@@ -708,6 +881,8 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
             break;
         }
 
+        let wo_dir = -ray.dir;
+
         // NEE — only in MIS+NEE mode.
         if (mis_nee_mode) {
             let ls = sample_light(hit.point, s);
@@ -716,9 +891,9 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
                 if (cos_surf > 0.0) {
                     let shadow_o = hit.point + hit.normal * 0.001;
                     if (!occluded(shadow_o, ls.wi, ls.dist)) {
-                        let f = albedo / PI;
-                        let bsdf_pdf = cos_surf / PI;
-                        let wlight = power_heuristic(ls.pdf_w, bsdf_pdf);
+                        let f = eval_bsdf(m, albedo, hit.normal, wo_dir, ls.wi);
+                        let bsdf_p = bsdf_pdf(m, hit.normal, wo_dir, ls.wi);
+                        let wlight = power_heuristic(ls.pdf_w, bsdf_p);
                         result.radiance = result.radiance
                             + throughput * f * cos_surf * ls.le * wlight / ls.pdf_w;
                     }
@@ -726,13 +901,20 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
             }
         }
 
-        // BSDF sampling (cosine-weighted Lambertian).
-        let wi = cosine_sample_hemisphere(hit.normal, s);
-        let cos_wi = max(dot(hit.normal, wi), 0.0);
-        prev_bsdf_pdf = cos_wi / PI;
+        // BSDF sampling — dispatches GGX (metal) or Lambertian on
+        // `material.metallic`. Mirror-like roughness collapses into a
+        // δ-spike that NEE shadow rays cannot evaluate, so the
+        // BSDF-then-emission path carries the visibility.
+        let bs = sample_bsdf(m, albedo, hit.normal, wo_dir, s);
+        if (!bs.valid || bs.pdf <= 0.0) {
+            break;
+        }
+        prev_bsdf_pdf = bs.pdf;
         prev_point = hit.point;
-        specular_bounce = false;
-        throughput = throughput * albedo;
+        // Sharp GGX (low roughness) reads as "specular" for the next
+        // emission hit — fold full emission in there, not MIS-weighted.
+        specular_bounce = m.metallic > 0.5 && m.roughness < 0.2;
+        throughput = throughput * bs.weight;
 
         if (bounce > 2) {
             let pr = max(0.05, max(throughput.x, max(throughput.y, throughput.z)));
@@ -743,7 +925,7 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
         }
 
         ray.origin = hit.point + hit.normal * 0.001;
-        ray.dir = wi;
+        ray.dir = bs.wi;
     }
     return result;
 }

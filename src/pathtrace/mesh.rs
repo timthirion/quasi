@@ -94,12 +94,17 @@ pub struct Material {
 
 impl Default for Material {
     fn default() -> Self {
-        // Mirrors the glTF 2.0 default material (white Lambertian).
+        // White Lambertian. **Diverges from glTF 2.0's default
+        // material** (which has `metallicFactor = 1.0`) — that spec
+        // default would silently push any primitive without an
+        // assigned material onto the GGX branch in `pathtrace.wgsl`.
+        // Our generators always assign materials explicitly, so the
+        // safer placeholder is "neutral matte."
         Material {
             albedo: [1.0, 1.0, 1.0],
             roughness: 1.0,
             emission: [0.0, 0.0, 0.0],
-            metallic: 1.0,
+            metallic: 0.0,
             base_color_texture_idx: NO_TEXTURE,
             _pad: [0; 3],
         }

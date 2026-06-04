@@ -119,7 +119,36 @@ fn main() {
         room_quads.len() * 2 + bunny_indices.len() / 3,
     );
 
-    // 4) Cornell with a textured floor — the PT-textures publishable
+    // 4) Cornell with a metallic bunny — the PT-ggx publishable
+    //    scene. Same geometry as cornell_bunny, but the bunny material
+    //    is brushed steel (metallic = 1, roughness = 0.3, F0 from the
+    //    Schlick conductor albedo).
+    let metal_bunny_mat = GpuMaterial {
+        // F0 for steel ≈ (0.56, 0.57, 0.58) in linear; we go a touch
+        // warmer to make the colour bleed from the red wall pop.
+        albedo: [0.60, 0.58, 0.55],
+        roughness: 0.3,
+        emission: [0.0, 0.0, 0.0],
+        metallic: 1.0,
+    };
+    let bytes = build_gltf_with_extra_mesh(
+        &room_quads,
+        &room_materials,
+        &bunny_positions,
+        &bunny_normals,
+        &bunny_indices,
+        metal_bunny_mat,
+    );
+    let path = out_dir.join("cornell_metal_bunny.gltf");
+    fs::write(&path, &bytes).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    println!(
+        "wrote {} ({} bytes, room + brushed-steel bunny → {} triangles)",
+        path.display(),
+        bytes.len(),
+        room_quads.len() * 2 + bunny_indices.len() / 3,
+    );
+
+    // 5) Cornell with a textured floor — the PT-textures publishable
     //    scene. Same geometry as cornell_quads, but the floor's
     //    material samples the embedded uv_checker_color.png.
     let bytes = build_cornell_textured_floor();

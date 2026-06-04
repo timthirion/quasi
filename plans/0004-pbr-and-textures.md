@@ -2,7 +2,7 @@
 
 - **Status:** active
 - **Last updated:** 2026-06-04
-- **Last touched on:** PT-textures landed
+- **Last touched on:** PT-ggx landed
 
 ## Goal
 
@@ -171,26 +171,43 @@ texture-multiplied `albedo` local. Only the AOV output had been
 switched over. Fix was three characters per line, in
 `pathtrace.wgsl` `path_trace`.
 
-### PT-ggx
+### PT-ggx ✅
 Microfacet metal BRDF. Turns the bunny into brushed steel.
 
-- [ ] Material's `metallic` + `roughness` fields hook up; the WGSL
+- [x] Material's `metallic` + `roughness` fields hook up; the WGSL
       branches on `metallic > 0.5` to dispatch GGX vs Lambertian
       (proper "metallic = lerp" comes later if needed).
-- [ ] GGX importance sampling: half-vector sampled from the
+- [x] GGX importance sampling: half-vector sampled from the
       Trowbridge-Reitz GGX distribution; `f` evaluated with Smith
       separable masking-shadowing.
-- [ ] Conductor Fresnel via Schlick approximation; F0 read from the
+- [x] Conductor Fresnel via Schlick approximation; F0 read from the
       material's `albedo` (PBR convention).
-- [ ] NEE + MIS compatible: the BSDF pdf goes into the same
+- [x] NEE + MIS compatible: the BSDF pdf goes into the same
       power-heuristic weight that the existing Lambertian path uses.
-- [ ] New test scene: `cornell_metal_bunny.gltf` — the bunny with
-      `metallic = 1, roughness = 0.3`. Reference render.
+      Sharp GGX (`roughness < 0.2`) is treated as "specular" for the
+      next-bounce emission weight so the highlight from the light
+      doesn't get clipped by MIS.
+- [x] New test scene: `cornell_metal_bunny.gltf` — the bunny with
+      `metallic = 1, roughness = 0.3`. Reference render at 512² /
+      1024 spp is `data/output/cornell_metal_bunny_reference.png`.
 - [ ] Convergence sweep updated to cover the new BSDF.
-- [ ] Tests: GGX importance-sampling pdf matches the analytic
-      formula (CPU-side numerical check); BSDF evaluates to the
-      Lambertian answer when `roughness = 1, metallic = 0`
-      (regression bridge to the existing rendering).
+      (Skipped for now — current CSV/converge story is rough; will
+      revisit when the convergence harness gets a refresh.)
+- [x] Tests: `tests/ggx.rs` checks `D` normalises to 1 over the
+      hemisphere by both quadrature and importance-sample Monte
+      Carlo (catches sample/pdf mismatch); Schlick endpoints +
+      monotonicity; analytic Smith G1 at `α = 1`; `alpha` clamp
+      remains finite at roughness = 0. Naga validates the shader.
+      The all-Lambertian Cornell scenes continue to load + render
+      identically (`metallic > 0.5` branch never fires for them).
+
+**Caveat worth flagging:** the loader's `Material::default()` now
+diverges from the glTF 2.0 default material (which has
+`metallicFactor = 1.0`). The spec default would silently push any
+primitive-without-material onto the GGX branch — our generators
+always assign materials, so the safer placeholder is matte white.
+If we ever ingest a glTF with material-less primitives, this is a
+deliberate, documented mismatch with the spec.
 
 ### PT-dielectrics
 Glass + clear plastics. Snell + Fresnel, transmission allowed.
