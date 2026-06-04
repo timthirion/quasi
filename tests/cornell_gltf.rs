@@ -15,6 +15,7 @@ use quasi::pathtrace::mesh::load_glb_bytes;
 const CORNELL_QUADS: &[u8] = include_bytes!("../data/gltf/cornell_quads.gltf");
 const CORNELL_TRIS: &[u8] = include_bytes!("../data/gltf/cornell_tris.gltf");
 const CORNELL_SPHERE: &[u8] = include_bytes!("../data/gltf/cornell_sphere.gltf");
+const CORNELL_BUNNY: &[u8] = include_bytes!("../data/gltf/cornell_bunny.gltf");
 
 #[test]
 fn cornell_quads_has_expected_topology() {
@@ -54,6 +55,20 @@ fn cornell_sphere_has_expected_topology() {
         scene.bvh.nodes.len() > 1,
         "20k-triangle scene should build a multi-node BVH",
     );
+}
+
+#[test]
+fn cornell_bunny_has_expected_topology() {
+    let scene = load_glb_bytes(CORNELL_BUNNY).expect("load cornell_bunny.gltf");
+    // 6 room quads × 2 + Stanford bunny (4968 triangles in the morsel
+    // OBJ; quads are fan-triangulated so any non-tri faces would bump
+    // the count). The OBJ ships pure triangles, so 4968 is exact.
+    assert_eq!(scene.triangle_count(), 6 * 2 + 4968);
+    // 1 default + 4 room (white/red/green/light) + 1 bunny material.
+    assert_eq!(scene.materials.len(), 6);
+    assert_eq!(scene.emissive_triangles.len(), 2);
+    // BVH must exist for the renderer.
+    assert!(scene.bvh.nodes.len() > 1);
 }
 
 #[test]

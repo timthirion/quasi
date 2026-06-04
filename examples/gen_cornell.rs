@@ -45,7 +45,8 @@ fn main() {
         );
     }
 
-    // 2) Cornell room + level-5 icosphere — the T4 publishable scene.
+    // 2) Cornell room + level-5 icosphere — procedural test scene
+    //    that doesn't require any external asset.
     //    Room only (5 walls + 1 light = first 6 quads of cornell_box());
     //    the two internal boxes are removed so the sphere is the hero.
     let room_quads: Vec<GpuQuad> = quads.iter().take(6).copied().collect();
@@ -57,7 +58,7 @@ fn main() {
         metallic: 0.0,
     };
     let (sphere_positions, sphere_normals, sphere_indices) = icosphere(5, [0.0, 0.5, 0.0], 0.5);
-    let bytes = build_gltf_with_sphere(
+    let bytes = build_gltf_with_extra_mesh(
         &room_quads,
         &room_materials,
         &sphere_positions,
@@ -72,6 +73,50 @@ fn main() {
         path.display(),
         bytes.len(),
         room_quads.len() * 2 + sphere_indices.len() / 3,
+    );
+
+    // 3) Cornell room + Stanford bunny — the **canonical** publishable
+    //    scene. OBJ embedded at compile time from data/obj/.
+    let bunny_obj = include_str!("../data/obj/stanford-bunny.obj");
+    let (bunny_raw_positions, bunny_indices) = parse_obj(bunny_obj);
+    // Bunny extent ~0.16 × 0.19 × 0.12, min_y = 0. Scale 5× → ~0.8 ×
+    // 0.94 × 0.6 standing on the floor; horizontal offset centres it.
+    let bunny_scale = 5.0_f32;
+    let bunny_offset = [0.0825_f32, 0.0, 0.0075];
+    let bunny_positions: Vec<[f32; 3]> = bunny_raw_positions
+        .iter()
+        .map(|p| {
+            [
+                p[0] * bunny_scale + bunny_offset[0],
+                p[1] * bunny_scale + bunny_offset[1],
+                p[2] * bunny_scale + bunny_offset[2],
+            ]
+        })
+        .collect();
+    let bunny_normals = compute_smooth_normals(&bunny_positions, &bunny_indices);
+    let bunny_mat = GpuMaterial {
+        // Warm clay — distinguishes the bunny from the white walls
+        // without sliding off the "Lambertian reference scene" footing.
+        albedo: [0.8, 0.65, 0.5],
+        roughness: 1.0,
+        emission: [0.0, 0.0, 0.0],
+        metallic: 0.0,
+    };
+    let bytes = build_gltf_with_extra_mesh(
+        &room_quads,
+        &room_materials,
+        &bunny_positions,
+        &bunny_normals,
+        &bunny_indices,
+        bunny_mat,
+    );
+    let path = out_dir.join("cornell_bunny.gltf");
+    fs::write(&path, &bytes).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    println!(
+        "wrote {} ({} bytes, room + Stanford bunny → {} triangles)",
+        path.display(),
+        bytes.len(),
+        room_quads.len() * 2 + bunny_indices.len() / 3,
     );
 }
 
@@ -308,6 +353,87 @@ fn midpoint_index(
 }
 
 // ---------------------------------------------------------------------------
+// OBJ parsing + smooth vertex normals
+// ---------------------------------------------------------------------------
+
+/// Bare-bones OBJ parser — just positions and triangle faces, enough
+/// to ingest the Stanford bunny. Ignores UVs and per-vertex normals
+/// (we recompute smooth normals from positions below).
+fn parse_obj(src: &str) -> (Vec<[f32; 3]>, Vec<u32>) {
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    for line in src.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("v ") {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.len() >= 3 {
+                positions.push([
+                    parts[0].parse().expect("OBJ position component"),
+                    parts[1].parse().expect("OBJ position component"),
+                    parts[2].parse().expect("OBJ position component"),
+                ]);
+            }
+        } else if let Some(rest) = line.strip_prefix("f ") {
+            // Faces can be `a b c` or `a/b c/d e/f` or `a/b/c d/e/f g/h/i`.
+            // We only need the vertex index (first / -separated field).
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            let mut tri_idx: Vec<u32> = Vec::with_capacity(parts.len());
+            for p in &parts {
+                let v: i32 = p
+                    .split('/')
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .expect("OBJ face index");
+                // OBJ is 1-indexed; convert to 0-indexed.
+                let idx = if v > 0 {
+                    v as u32 - 1
+                } else {
+                    // Negative = relative to current vertex list.
+                    (positions.len() as i32 + v) as u32
+                };
+                tri_idx.push(idx);
+            }
+            // Triangulate (fan) any face with >3 verts.
+            for i in 1..(tri_idx.len() - 1) {
+                indices.push(tri_idx[0]);
+                indices.push(tri_idx[i]);
+                indices.push(tri_idx[i + 1]);
+            }
+        }
+    }
+    (positions, indices)
+}
+
+/// Computes per-vertex smooth normals by accumulating face normals
+/// (unnormalised — area-weighted) over all triangles touching each
+/// vertex, then normalising. Standard smooth-shading approach.
+fn compute_smooth_normals(positions: &[[f32; 3]], indices: &[u32]) -> Vec<[f32; 3]> {
+    let mut normals: Vec<[f32; 3]> = vec![[0.0_f32; 3]; positions.len()];
+    for chunk in indices.chunks_exact(3) {
+        let v0 = positions[chunk[0] as usize];
+        let v1 = positions[chunk[1] as usize];
+        let v2 = positions[chunk[2] as usize];
+        let e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
+        let e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
+        let n = cross(e1, e2);
+        for &i in chunk {
+            let i = i as usize;
+            normals[i][0] += n[0];
+            normals[i][1] += n[1];
+            normals[i][2] += n[2];
+        }
+    }
+    for n in &mut normals {
+        let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-12);
+        n[0] /= l;
+        n[1] /= l;
+        n[2] /= l;
+    }
+    normals
+}
+
+// ---------------------------------------------------------------------------
 // glTF JSON + base64 binary emission
 // ---------------------------------------------------------------------------
 
@@ -333,10 +459,10 @@ fn bounds(positions: &[[f32; 3]]) -> ([f32; 3], [f32; 3]) {
     (lo, hi)
 }
 
-/// Same as [`build_gltf`] but also appends a single triangle mesh
-/// (positions + normals + indices, one shared material). Used to ship
-/// the icosphere alongside the room.
-fn build_gltf_with_sphere(
+/// Same as [`build_gltf`] but also appends a single extra triangle
+/// mesh (positions + normals + indices, one shared material). Used to
+/// ship the icosphere or Stanford bunny alongside the room.
+fn build_gltf_with_extra_mesh(
     quads: &[GpuQuad],
     materials: &[GpuMaterial],
     sphere_positions: &[[f32; 3]],
