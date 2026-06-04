@@ -14,6 +14,7 @@
 use bytemuck::Zeroable;
 
 use crate::gpu;
+use crate::pathtrace::integrator::IntegratorKind;
 use crate::pathtrace::sampler::SamplerKind;
 use crate::pathtrace::scene;
 use crate::pathtrace::{
@@ -70,6 +71,7 @@ pub struct RenderConfig {
     pub height: u32,
     pub samples: u32,
     pub sampler: SamplerKind,
+    pub integrator: IntegratorKind,
     pub camera_pos: [f32; 3],
     pub camera_dir: [f32; 3],
     pub camera_up: [f32; 3],
@@ -85,6 +87,7 @@ impl Default for RenderConfig {
             height: 512,
             samples: 256,
             sampler: SamplerKind::default(),
+            integrator: IntegratorKind::default(),
             camera_pos: [0.0, 1.0, 3.5],
             camera_dir: [0.0, 0.0, -1.0],
             camera_up: [0.0, 1.0, 0.0],
@@ -204,6 +207,7 @@ async fn render_offscreen_async(cfg: RenderConfig) -> Aovs {
     uniforms.viewport_width = cfg.width;
     uniforms.viewport_height = cfg.height;
     uniforms.sampler_kind = cfg.sampler.as_u32();
+    uniforms.integrator_kind = cfg.integrator.as_u32();
 
     let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("offscreen-uniforms"),

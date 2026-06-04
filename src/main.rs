@@ -3,17 +3,25 @@
 //! Usage:
 //!
 //! ```text
-//! cargo run                     # path tracer window (default)
-//! cargo run -- raster           # rasterizer window
-//! cargo run -- render [opts]    # offscreen render -> frame.png + frame.exr
+//! cargo run                       # path tracer window (default)
+//! cargo run -- raster             # rasterizer window
+//! cargo run -- render [opts]      # offscreen render -> base.png + base.exr
+//! cargo run -- converge [opts]    # convergence sweep -> runs.csv
 //! ```
 //!
 //! `render` options: `--out <base>` `--width N` `--height N` `--spp N`
-//! `--sampler pcg|halton|sobol`.
+//! `--sampler pcg|halton|sobol` `--integrator misnee|bsdf`.
+//!
+//! `converge` options: `--out <csv>` `--width N` `--height N`
+//! `--max-spp N` `--reference-spp N`.
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
 
+#[cfg(not(target_arch = "wasm32"))]
+use quasi::pathtrace::converge::{self, ConvergeConfig};
+#[cfg(not(target_arch = "wasm32"))]
+use quasi::pathtrace::integrator::IntegratorKind;
 #[cfg(not(target_arch = "wasm32"))]
 use quasi::pathtrace::offscreen::{render_offscreen, RenderConfig};
 #[cfg(not(target_arch = "wasm32"))]
@@ -30,15 +38,23 @@ fn main() {
             let rest: Vec<String> = args.collect();
             run_render(&rest);
         }
+        Some("converge") => {
+            let rest: Vec<String> = args.collect();
+            run_converge(&rest);
+        }
         Some("raster") | Some("--raster") => quasi::run_raster(),
         Some("pathtrace") | Some("--pathtrace") | None => quasi::run(),
         Some(other) => {
             eprintln!("unknown command: {other}");
-            eprintln!("usage: cargo run -- [pathtrace | raster | render [opts]]");
+            eprintln!("usage: cargo run -- [pathtrace | raster | render [opts] | converge [opts]]");
             std::process::exit(2);
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// `render` subcommand
+// ---------------------------------------------------------------------------
 
 #[cfg(not(target_arch = "wasm32"))]
 struct RenderArgs {
@@ -47,6 +63,7 @@ struct RenderArgs {
     height: u32,
     samples: u32,
     sampler: SamplerKind,
+    integrator: IntegratorKind,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -58,6 +75,7 @@ impl Default for RenderArgs {
             height: 512,
             samples: 256,
             sampler: SamplerKind::default(),
+            integrator: IntegratorKind::default(),
         }
     }
 }
@@ -98,14 +116,21 @@ fn parse_render_args(args: &[String]) -> Result<RenderArgs, String> {
                     .ok_or_else(|| "--sampler needs a name".to_string())?;
                 r.sampler = v.parse()?;
             }
+            "--integrator" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| "--integrator needs a name".to_string())?;
+                r.integrator = v.parse()?;
+            }
             "--help" | "-?" => {
                 println!(
                     "render options:\n\
-                     \t--out <base>       output basename (default: frame)\n\
-                     \t--width N          image width  (default: 512)\n\
-                     \t--height N         image height (default: 512)\n\
-                     \t--spp N            samples per pixel (default: 256)\n\
-                     \t--sampler NAME     pcg | halton | sobol (default: pcg)"
+                     \t--out <base>        output basename (default: frame)\n\
+                     \t--width N           image width  (default: 512)\n\
+                     \t--height N          image height (default: 512)\n\
+                     \t--spp N             samples per pixel (default: 256)\n\
+                     \t--sampler NAME      pcg | halton | sobol (default: pcg)\n\
+                     \t--integrator NAME   misnee | bsdf (default: misnee)"
                 );
                 std::process::exit(0);
             }
@@ -126,14 +151,16 @@ fn run_render(args: &[String]) {
         height: cli.height,
         samples: cli.samples,
         sampler: cli.sampler,
+        integrator: cli.integrator,
         ..RenderConfig::default()
     };
     log::info!(
-        "rendering {}x{} @ {} spp ({:?})",
+        "rendering {}x{} @ {} spp ({:?} / {:?})",
         cfg.width,
         cfg.height,
         cfg.samples,
-        cfg.sampler
+        cfg.sampler,
+        cfg.integrator,
     );
     let start = std::time::Instant::now();
     let aovs = render_offscreen(cfg);
@@ -155,6 +182,98 @@ fn run_render(args: &[String]) {
     );
     println!("wrote {}", paths.png.display());
     println!("wrote {}", paths.exr.display());
+}
+
+// ---------------------------------------------------------------------------
+// `converge` subcommand
+// ---------------------------------------------------------------------------
+
+#[cfg(not(target_arch = "wasm32"))]
+struct ConvergeArgs {
+    out: PathBuf,
+    cfg: ConvergeConfig,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Default for ConvergeArgs {
+    fn default() -> Self {
+        Self {
+            out: PathBuf::from("convergence.csv"),
+            cfg: ConvergeConfig::default(),
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_converge_args(args: &[String]) -> Result<ConvergeArgs, String> {
+    let mut r = ConvergeArgs::default();
+    let mut iter = args.iter();
+    while let Some(a) = iter.next() {
+        match a.as_str() {
+            "--out" | "-o" => {
+                r.out = PathBuf::from(
+                    iter.next()
+                        .ok_or_else(|| "--out needs a path".to_string())?,
+                );
+            }
+            "--width" | "-w" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| "--width needs a number".to_string())?;
+                r.cfg.width = v.parse().map_err(|e| format!("--width: {e}"))?;
+            }
+            "--height" | "-h" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| "--height needs a number".to_string())?;
+                r.cfg.height = v.parse().map_err(|e| format!("--height: {e}"))?;
+            }
+            "--max-spp" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| "--max-spp needs a number".to_string())?;
+                r.cfg.max_spp = v.parse().map_err(|e| format!("--max-spp: {e}"))?;
+            }
+            "--reference-spp" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| "--reference-spp needs a number".to_string())?;
+                r.cfg.reference_spp = v.parse().map_err(|e| format!("--reference-spp: {e}"))?;
+            }
+            "--help" | "-?" => {
+                println!(
+                    "converge options:\n\
+                     \t--out <csv>            CSV output path (default: convergence.csv)\n\
+                     \t--width N              image width  (default: 256)\n\
+                     \t--height N             image height (default: 256)\n\
+                     \t--max-spp N            largest spp in the sweep (default: 1024)\n\
+                     \t--reference-spp N      spp for the ground-truth reference (default: 4096)"
+                );
+                std::process::exit(0);
+            }
+            other => return Err(format!("unknown converge option: {other}")),
+        }
+    }
+    Ok(r)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn run_converge(args: &[String]) {
+    let cli = parse_converge_args(args).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    });
+    let start = std::time::Instant::now();
+    let rows = converge::run(cli.cfg, &cli.out).unwrap_or_else(|e| {
+        eprintln!("converge error: {e}");
+        std::process::exit(1);
+    });
+    log::info!(
+        "convergence sweep took {:.2}s ({} rows)",
+        start.elapsed().as_secs_f64(),
+        rows.len(),
+    );
+    println!("wrote {} rows to {}", rows.len(), cli.out.display());
 }
 
 #[cfg(target_arch = "wasm32")]

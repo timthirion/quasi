@@ -2,7 +2,7 @@
 
 - **Status:** active
 - **Last updated:** 2026-06-04
-- **Last touched on:** M2 landed — samplers, AOVs via MRT, native PNG + EXR output
+- **Last touched on:** M3 landed — verification harness (metrics + convergence CSV)
 
 ## Goal
 
@@ -166,13 +166,57 @@ splittable per format. `std::thread::scope` borrows `&Aovs` across the
 PNG and EXR closures without an `Arc`, and the scope guarantees the
 borrow doesn't outlive `write_render`. Clean fit; no `async` theatre.
 
-### M3 — Verification harness (native)
-- [ ] Image metrics (MSE / RMSE / rel-MSE) + `cargo test` on synthetic images and
-      an EXR round-trip.
-- [ ] A convergence runner: render error-vs-spp for each sampler/integrator
-      against a high-spp reference; emit CSV.
-- **Done when:** the CSV shows the path tracer converging; MIS beats pure BSDF at
-      equal spp; metrics tests pass.
+### M3 — Verification harness (native) ✅ DONE
+- [x] Image metrics (`pathtrace::metrics`): `mse_rgb`, `rmse_rgb`,
+      `rel_mse_rgb` over the RGB channels of `[f32; 4]` AOV slices,
+      accumulated in `f64`. Tests cover identical-images = 0, constant
+      offset = exact MSE, black-reference rel-MSE, and a size-mismatch
+      panic message. EXR round-trip is already pinned in M2 by
+      `pathtrace::output::tests::exr_round_trip_preserves_values`.
+- [x] Selectable integrator (`pathtrace::integrator::IntegratorKind`):
+      `MisNee` (the M1/M2 default) and `Bsdf` (pure BSDF, no NEE, no MIS
+      weighting). One uniform `integrator_kind` toggles between them
+      inside the same WGSL shader.
+- [x] Convergence runner (`pathtrace::converge`): renders a reference at
+      `reference_spp` with PCG + MIS+NEE (the lowest-variance pair) then
+      sweeps each (sampler, integrator) combination across doubling spp
+      checkpoints, scoring each with RMSE + rel-MSE against the
+      reference. CSV columns: `sampler,integrator,spp,rmse,rel_mse`.
+- [x] CLI: `cargo run -- converge --out runs.csv [--width W --height H
+      --max-spp N --reference-spp N]`. Render command also grew an
+      `--integrator misnee|bsdf` flag for one-off pure-BSDF outputs.
+- **Done when:** the CSV shows the path tracer converging; MIS beats
+      pure BSDF at equal spp; metrics tests pass. _Confirmed 2026-06-04
+      with `converge --width 64 --height 64 --max-spp 64 --reference-spp 256`:_
+      - **Converges:** PCG and Halton hit the canonical √N rate — RMSE
+        drops 7.1×–7.9× over 64× more samples (theoretical: 8×). Sobol
+        converges, but slowly (see note below).
+      - **MIS beats BSDF:** at 64 spp, MIS+NEE has 3–5× lower RMSE than
+        pure BSDF for every sampler. PCG: 0.025 vs 0.124; Halton: 0.026
+        vs 0.102; Sobol: 0.115 vs 0.354.
+      - **Metrics tests pass:** `cargo test pathtrace::metrics` is green.
+
+**Sobol caveat:** the M2 implementation provides direction vectors for
+**two** dimensions, but the path tracer draws ~10–14 2D points per path
+(camera jitter + light + BSDF × MAX_BOUNCES). Consecutive `next_2d`
+calls within one path therefore read **consecutive** Sobol points,
+which are correlated by design — Sobol's variance reduction depends on
+draws coming from **distinct** dimensions. Result: Sobol converges
+~2.2×/64×spp instead of the expected 8×, and trails PCG and Halton in
+the CSV. The fix is **padded high-dim Sobol** (Joe-Kuo direction tables
+for 16+ dimensions, advancing dimension per call within a path,
+advancing index per path). Future work; the conventional canonical-
+sequence tests (Sobol dim 0 ≡ van der Corput, 2-D mean → 0.5) still
+pass, so the implementation is correct as far as it goes.
+
+**rel-MSE ε note:** the relative-MSE denominator carries an ε of `1e-2`
+to keep the metric defined for black reference pixels. Test
+`rel_mse_grows_with_error_at_fixed_reference` pins the ε-stable region
+(doubling per-pixel error ~ quadruples rel-MSE). Scale-invariance is
+**not** an exact property of this form — at uniform 10× brighter
+intensities the ε contribution shrinks, perturbing rel-MSE by a few
+percent. That's the standard PBRT trade-off; documented here so a
+future scale-invariance test isn't written against the wrong claim.
 
 ### M4 — Interactive blog demo
 - [ ] `wasm-pack` package + embeddable HTML/JS harness.

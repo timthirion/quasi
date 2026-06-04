@@ -23,6 +23,9 @@ const SAMPLER_PCG: u32 = 0u;
 const SAMPLER_HALTON: u32 = 1u;
 const SAMPLER_SOBOL: u32 = 2u;
 
+const INTEGRATOR_MIS_NEE: u32 = 0u;
+const INTEGRATOR_BSDF: u32 = 1u;
+
 // 2^32 as f32. Used for u32 -> [0,1) float conversion (matches CPU).
 const U32_NORM: f32 = 4294967296.0;
 
@@ -59,8 +62,8 @@ struct Uniforms {
     viewport_width: u32,
     viewport_height: u32,
     sampler_kind: u32,
+    integrator_kind: u32,
     _pad0: u32,
-    _pad1: u32,
     quads: array<Quad, 32>,
     materials: array<Material, 32>,
 };
@@ -441,6 +444,7 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
     var specular_bounce = true;
     var prev_bsdf_pdf = 0.0;
     var prev_point = ray.origin;
+    let mis_nee_mode = U.integrator_kind == INTEGRATOR_MIS_NEE;
 
     for (var bounce = 0; bounce < MAX_BOUNCES; bounce = bounce + 1) {
         let hit = trace_scene(ray);
@@ -466,7 +470,12 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
 
         let emit = max(m.emission.x, max(m.emission.y, m.emission.z));
         if (emit > 0.1) {
-            if (specular_bounce) {
+            // Light contribution from a BSDF-sampled hit on an emitter.
+            // Pure BSDF: every emission is full-weight (no NEE, no MIS).
+            // MIS+NEE: weight against the NEE pdf via power heuristic
+            // (the camera-direct first hit is a "specular bounce" with
+            // no preceding NEE, so it still gets full weight).
+            if (!mis_nee_mode || specular_bounce) {
                 result.radiance = result.radiance + throughput * m.emission;
             } else {
                 let lp = light_pdf_solid_angle(prev_point, hit.point, hit.normal);
@@ -479,18 +488,20 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
             break;
         }
 
-        // Next-event estimation.
-        let ls = sample_light(hit.point, s);
-        if (ls.valid) {
-            let cos_surf = dot(hit.normal, ls.wi);
-            if (cos_surf > 0.0) {
-                let shadow_o = hit.point + hit.normal * 0.001;
-                if (!occluded(shadow_o, ls.wi, ls.dist)) {
-                    let f = m.albedo / PI;
-                    let bsdf_pdf = cos_surf / PI;
-                    let wlight = power_heuristic(ls.pdf_w, bsdf_pdf);
-                    result.radiance = result.radiance
-                        + throughput * f * cos_surf * ls.le * wlight / ls.pdf_w;
+        // Next-event estimation — MIS+NEE only.
+        if (mis_nee_mode) {
+            let ls = sample_light(hit.point, s);
+            if (ls.valid) {
+                let cos_surf = dot(hit.normal, ls.wi);
+                if (cos_surf > 0.0) {
+                    let shadow_o = hit.point + hit.normal * 0.001;
+                    if (!occluded(shadow_o, ls.wi, ls.dist)) {
+                        let f = m.albedo / PI;
+                        let bsdf_pdf = cos_surf / PI;
+                        let wlight = power_heuristic(ls.pdf_w, bsdf_pdf);
+                        result.radiance = result.radiance
+                            + throughput * f * cos_surf * ls.le * wlight / ls.pdf_w;
+                    }
                 }
             }
         }

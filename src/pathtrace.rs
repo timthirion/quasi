@@ -21,8 +21,15 @@
 //! the `OrbitCamera`. The rasterized pipeline ([`raster`](crate::raster))
 //! shares nothing with this code below the `gpu` seam.
 
+pub mod integrator;
 pub mod sampler;
 pub mod scene;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod converge;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod metrics;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod offscreen;
@@ -36,6 +43,7 @@ pub mod web;
 use bytemuck::{Pod, Zeroable};
 
 use crate::gpu::OrbitCamera;
+use crate::pathtrace::integrator::IntegratorKind;
 use crate::pathtrace::sampler::SamplerKind;
 
 /// HDR storage for AOV accumulation. Filterable, broadly supported, and
@@ -402,6 +410,7 @@ impl State {
         uniforms.quad_count = n as u32;
         uniforms.light_index = cornell.light_index;
         uniforms.sampler_kind = SamplerKind::default().as_u32();
+        uniforms.integrator_kind = IntegratorKind::default().as_u32();
 
         let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("uniforms"),
@@ -478,6 +487,17 @@ impl State {
     pub fn set_sampler(&mut self, kind: SamplerKind) {
         if self.uniforms.sampler_kind != kind.as_u32() {
             self.uniforms.sampler_kind = kind.as_u32();
+            self.frame_count = 0;
+            self.read_idx = 0;
+        }
+    }
+
+    /// Selects the integrator (MIS+NEE vs pure BSDF). Restarts accumulation
+    /// since the two integrators converge to the same mean from different
+    /// noise distributions.
+    pub fn set_integrator(&mut self, kind: IntegratorKind) {
+        if self.uniforms.integrator_kind != kind.as_u32() {
+            self.uniforms.integrator_kind = kind.as_u32();
             self.frame_count = 0;
             self.read_idx = 0;
         }

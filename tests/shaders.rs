@@ -62,3 +62,15 @@ fn pathtrace_sampler_constants_match_cpu_side() {
         );
     }
 }
+
+#[test]
+fn pathtrace_integrator_constants_match_cpu_side() {
+    let src = include_str!("../src/pathtrace/shaders/pathtrace.wgsl");
+    for (name, expected) in [("INTEGRATOR_MIS_NEE", 0u32), ("INTEGRATOR_BSDF", 1u32)] {
+        let needle = format!("const {name}: u32 = {expected}u;");
+        assert!(
+            src.contains(&needle),
+            "expected `{needle}` in pathtrace.wgsl",
+        );
+    }
+}

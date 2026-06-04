@@ -43,6 +43,15 @@ impl SamplerKind {
     pub fn as_u32(self) -> u32 {
         self as u32
     }
+
+    /// Short label used in CSV output and CLI args.
+    pub fn label(self) -> &'static str {
+        match self {
+            SamplerKind::Pcg => "pcg",
+            SamplerKind::Halton => "halton",
+            SamplerKind::Sobol => "sobol",
+        }
+    }
 }
 
 impl FromStr for SamplerKind {
