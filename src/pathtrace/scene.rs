@@ -49,6 +49,9 @@ pub struct GpuMaterial {
     /// Kept out of the in-scene `cornell_box()` palette (all matte
     /// walls), but written by the example glTF emitter when set.
     pub ior: f32,
+    /// Beer-Lambert absorption coefficient. `(0, 0, 0)` = clear.
+    /// Cornell walls leave this zero; coloured-glass scenes set it.
+    pub absorption: [f32; 3],
 }
 
 /// Camera + scalars uniform — the only data the WGSL shader still reads
@@ -116,6 +119,7 @@ fn mat(albedo: V3, emission: V3) -> GpuMaterial {
         emission,
         metallic: 0.0,
         ior: 0.0,
+        absorption: [0.0, 0.0, 0.0],
     }
 }
 
@@ -229,11 +233,11 @@ mod tests {
     fn gpu_struct_layout_matches_wgsl() {
         assert_eq!(size_of::<GpuCamera>(), 48);
         assert_eq!(size_of::<GpuQuad>(), 48);
-        // 32-byte stride pre-PT-dielectrics; PT-dielectrics appends
-        // `ior: f32` for the WGSL → CPU round-trip, bumping to 36.
-        // (The runtime `Material` in `mesh.rs` lives separately and
-        // stays std430-padded at 48 bytes.)
-        assert_eq!(size_of::<GpuMaterial>(), 36);
+        // 32 bytes pre-PT-dielectrics; PT-dielectrics added `ior` (→ 36);
+        // PT-beer-lambert added `absorption: [f32; 3]` (→ 48). The
+        // runtime `Material` in `mesh.rs` lives separately and stays
+        // std430-padded at 64 bytes.
+        assert_eq!(size_of::<GpuMaterial>(), 48);
         // camera (48) + 8 × u32 = 80. T1 dropped the per-quad arrays;
         // triangle data lives in storage buffers now. T2 added
         // `use_bvh` in what used to be the trailing pad slot.

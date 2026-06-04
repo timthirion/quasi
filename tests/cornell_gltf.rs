@@ -18,6 +18,7 @@ const CORNELL_SPHERE: &[u8] = include_bytes!("../data/gltf/cornell_sphere.gltf")
 const CORNELL_BUNNY: &[u8] = include_bytes!("../data/gltf/cornell_bunny.gltf");
 const CORNELL_METAL_BUNNY: &[u8] = include_bytes!("../data/gltf/cornell_metal_bunny.gltf");
 const CORNELL_GLASS_SPHERE: &[u8] = include_bytes!("../data/gltf/cornell_glass_sphere.gltf");
+const CORNELL_GLASS_BUNNY: &[u8] = include_bytes!("../data/gltf/cornell_glass_bunny.gltf");
 const CORNELL_TEXTURED_FLOOR: &[u8] =
     include_bytes!("../data/gltf/cornell_textured_floor.gltf");
 
@@ -128,6 +129,37 @@ fn cornell_glass_sphere_topology_matches_lambertian_sphere_but_carries_ior() {
     // scenes that omit it.
     let any_dielectric = lambertian.materials.iter().any(|m| m.ior > 0.0);
     assert!(!any_dielectric, "cornell_sphere should carry no dielectrics");
+}
+
+#[test]
+fn cornell_glass_bunny_has_a_dielectric_with_non_zero_absorption() {
+    let scene = load_glb_bytes(CORNELL_GLASS_BUNNY).expect("load cornell_glass_bunny.gltf");
+    // Same bunny geometry as the clay scene — just a different
+    // material. Find the dielectric with absorption and pin its
+    // extras round-trip.
+    let dielectrics: Vec<_> = scene
+        .materials
+        .iter()
+        .filter(|m| m.ior > 0.0 && m.absorption.iter().any(|&c| c > 0.0))
+        .collect();
+    assert_eq!(
+        dielectrics.len(),
+        1,
+        "expected exactly one absorbing-dielectric material",
+    );
+    let m = dielectrics[0];
+    assert!((m.ior - 1.5).abs() < 1e-3, "ior should be 1.5; got {}", m.ior);
+    // Sanity: green-tinted glass means the green channel attenuates
+    // less than the red and blue channels.
+    assert!(
+        m.absorption[1] < m.absorption[0] && m.absorption[1] < m.absorption[2],
+        "green channel should absorb least (this is *green* glass); got {:?}",
+        m.absorption,
+    );
+    // And the clay bunny carries no absorption, by contrast.
+    let clay = load_glb_bytes(CORNELL_BUNNY).expect("load cornell_bunny.gltf");
+    let any_absorbing = clay.materials.iter().any(|m| m.absorption.iter().any(|&c| c > 0.0));
+    assert!(!any_absorbing, "cornell_bunny should be pure Lambertian");
 }
 
 #[test]

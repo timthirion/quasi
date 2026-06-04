@@ -34,6 +34,12 @@ const STACK_DEPTH: u32 = 32u;
 // use `Material::albedo` as a constant." Matches `pathtrace::mesh::NO_TEXTURE`.
 const NO_TEXTURE: u32 = 0xffffffffu;
 
+// PT-beer-lambert: sentinel meaning "the ray is currently in vacuum
+// / air — no participating-media attenuation." `path_trace` updates
+// `current_medium` whenever the BSDF transmits through a dielectric
+// interface.
+const NO_MEDIUM: u32 = 0xffffffffu;
+
 const U32_NORM: f32 = 4294967296.0;
 
 struct Camera {
@@ -65,6 +71,11 @@ struct Material {
     ior: f32,
     _pad0: u32,
     _pad1: u32,
+    // PT-beer-lambert: per-channel Beer-Lambert absorption coefficient
+    // applied to throughput per unit of distance travelled *inside*
+    // this material. `(0, 0, 0)` = no participating-media tinting.
+    absorption: vec3<f32>,
+    _pad2: f32,
 };
 
 struct Uniforms {
@@ -959,12 +970,22 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
     var specular_bounce = true;
     var prev_bsdf_pdf = 0.0;
     var prev_point = ray.origin;
+    var current_medium: u32 = NO_MEDIUM;
     let mis_nee_mode = U.integrator_kind == INTEGRATOR_MIS_NEE;
 
     for (var bounce = 0; bounce < MAX_BOUNCES; bounce = bounce + 1) {
         let hit = trace_scene(ray);
         if (!hit.hit) {
             break;
+        }
+        // PT-beer-lambert: attenuate throughput across the segment
+        // we just traversed (origin → hit) when the ray was inside a
+        // participating medium. `current_medium` is the material
+        // index whose `absorption` field gives σ_a; the closed-form
+        // Beer-Lambert solution is exp(-σ_a · t) per channel.
+        if (current_medium != NO_MEDIUM) {
+            let sigma_a = materials[current_medium].absorption;
+            throughput = throughput * exp(-sigma_a * hit.t);
         }
         let m = materials[hit.mat];
 
@@ -1054,9 +1075,23 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
         // transmission, wi is on the *opposite* side, so flip the
         // offset to land inside the medium instead of grazing the
         // surface from outside.
-        let offset_n = select(hit.normal, -hit.normal, dot(hit.normal, bs.wi) < 0.0);
+        let transmitted = dot(hit.normal, bs.wi) < 0.0;
+        let offset_n = select(hit.normal, -hit.normal, transmitted);
         ray.origin = hit.point + offset_n * 0.001;
         ray.dir = bs.wi;
+
+        // PT-beer-lambert: a dielectric transmit swaps which medium
+        // the ray is travelling through. Entering (front_face = 1)
+        // puts the ray inside this material's medium; exiting drops
+        // us back to vacuum. Reflect branches leave `current_medium`
+        // alone — the ray stays on the side it came from.
+        if (m.ior > 0.0 && transmitted) {
+            if (hit.front_face == 1u) {
+                current_medium = hit.mat;
+            } else {
+                current_medium = NO_MEDIUM;
+            }
+        }
     }
     return result;
 }

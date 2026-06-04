@@ -77,13 +77,20 @@ pub const NO_TEXTURE: u32 = u32::MAX;
 ///   - `metallic > 0.5`        → GGX conductor
 ///   - else                    → Lambertian
 ///
+/// `absorption` (PT-beer-lambert) is the per-channel Beer-Lambert
+/// coefficient applied to throughput per unit of distance travelled
+/// *inside* this material. Sentinel `(0, 0, 0)` means "no
+/// participating-media tinting" — a dielectric with zero absorption
+/// renders as clear glass.
+///
 /// std430 layout (4-byte scalars need no extra padding):
 ///   albedo:                    vec3 + scalar → 16 bytes
 ///   emission:                  vec3 + scalar → 16 bytes
 ///   base_color_texture_idx:    u32 +
 ///   ior:                       f32 +
 ///   _pad:                      2 × u32       → 16 bytes
-///   total: 48 bytes.
+///   absorption:                vec3 + f32 pad → 16 bytes
+///   total: 64 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable, PartialEq)]
 pub struct Material {
@@ -100,6 +107,11 @@ pub struct Material {
     /// default for glass; `1.33` for water.
     pub ior: f32,
     pub _pad: [u32; 2],
+    /// Per-channel Beer-Lambert absorption coefficient. Used by
+    /// `path_trace` to attenuate throughput across each segment
+    /// travelled *inside* a medium volume.
+    pub absorption: [f32; 3],
+    pub _pad_absorption: f32,
 }
 
 impl Default for Material {
@@ -118,6 +130,8 @@ impl Default for Material {
             base_color_texture_idx: NO_TEXTURE,
             ior: 0.0,
             _pad: [0; 2],
+            absorption: [0.0, 0.0, 0.0],
+            _pad_absorption: 0.0,
         }
     }
 }
@@ -417,20 +431,21 @@ fn extract_material(material: &gltf::Material, texture_remap: &[u32]) -> Materia
     // `KHR_materials_ior` for this, but loading extensions through the
     // gltf crate requires per-extension features. We round-trip ior
     // through `extras` instead — same effect, zero feature gates.
-    let ior = material
+    let extras: MaterialExtras = material
         .extras()
         .as_ref()
-        .and_then(|raw| serde_json::from_str::<MaterialExtras>(raw.get()).ok())
-        .map(|e| e.ior)
-        .unwrap_or(0.0);
+        .and_then(|raw| serde_json::from_str(raw.get()).ok())
+        .unwrap_or_default();
     Material {
         albedo: [base[0], base[1], base[2]],
         roughness: pbr.roughness_factor(),
         emission: emissive,
         metallic: pbr.metallic_factor(),
         base_color_texture_idx,
-        ior,
+        ior: extras.ior,
         _pad: [0; 2],
+        absorption: extras.absorption,
+        _pad_absorption: 0.0,
     }
 }
 
@@ -438,6 +453,8 @@ fn extract_material(material: &gltf::Material, texture_remap: &[u32]) -> Materia
 struct MaterialExtras {
     #[serde(default)]
     ior: f32,
+    #[serde(default)]
+    absorption: [f32; 3],
 }
 
 fn walk_node(
@@ -555,17 +572,20 @@ mod tests {
     }
 
     #[test]
-    fn material_is_48_bytes_with_texture_index_at_32_and_ior_at_36() {
+    fn material_is_64_bytes_with_absorption_at_48() {
         // PT-textures grew the Material from 32 bytes (albedo + roughness +
         // emission + metallic) to 48 bytes (+ base_color_texture_idx + pad).
         // PT-dielectrics packs `ior` into the first slot of that pad,
-        // keeping the total stride at 48 bytes.
-        assert_eq!(std::mem::size_of::<Material>(), 48);
+        // keeping the total stride at 48 bytes. PT-beer-lambert appends
+        // `absorption: vec3` (needs a 16-byte aligned slot, so the
+        // struct bumps to 64 bytes).
+        assert_eq!(std::mem::size_of::<Material>(), 64);
         assert_eq!(
             std::mem::offset_of!(Material, base_color_texture_idx),
             32,
         );
         assert_eq!(std::mem::offset_of!(Material, ior), 36);
+        assert_eq!(std::mem::offset_of!(Material, absorption), 48);
     }
 
     // ---- Material ----

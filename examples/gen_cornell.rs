@@ -57,6 +57,7 @@ fn main() {
         emission: [0.0, 0.0, 0.0],
         metallic: 0.0,
         ior: 0.0,
+        absorption: [0.0, 0.0, 0.0],
     };
     let (sphere_positions, sphere_normals, sphere_indices) = icosphere(5, [0.0, 0.5, 0.0], 0.5);
     let bytes = build_gltf_with_extra_mesh(
@@ -103,6 +104,7 @@ fn main() {
         emission: [0.0, 0.0, 0.0],
         metallic: 0.0,
         ior: 0.0,
+        absorption: [0.0, 0.0, 0.0],
     };
     let bytes = build_gltf_with_extra_mesh(
         &room_quads,
@@ -133,6 +135,7 @@ fn main() {
         emission: [0.0, 0.0, 0.0],
         metallic: 1.0,
         ior: 0.0,
+        absorption: [0.0, 0.0, 0.0],
     };
     let bytes = build_gltf_with_extra_mesh(
         &room_quads,
@@ -146,6 +149,40 @@ fn main() {
     fs::write(&path, &bytes).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
     println!(
         "wrote {} ({} bytes, room + brushed-steel bunny → {} triangles)",
+        path.display(),
+        bytes.len(),
+        room_quads.len() * 2 + bunny_indices.len() / 3,
+    );
+
+    // 5a) Cornell with a green-glass Stanford bunny — the
+    //     PT-beer-lambert publishable scene. Same geometry as
+    //     cornell_bunny, but the bunny material is a green-tinted
+    //     dielectric (ior=1.5, absorption tuned to look unmistakably
+    //     "green glass" without going opaque at the bunny's thickest
+    //     parts ≈ 0.5 unit).
+    let glass_bunny_mat = GpuMaterial {
+        albedo: [1.0, 1.0, 1.0],
+        roughness: 0.0,
+        emission: [0.0, 0.0, 0.0],
+        metallic: 0.0,
+        ior: 1.5,
+        // Bunny scale ≈ 0.6-0.8 unit thick at the body. exp(-1.2 ·
+        // 0.6) ≈ 0.49 → ~half the red light gets absorbed across the
+        // body; tiny green absorption leaves the colour green-leaning.
+        absorption: [1.2, 0.1, 1.5],
+    };
+    let bytes = build_gltf_with_extra_mesh(
+        &room_quads,
+        &room_materials,
+        &bunny_positions,
+        &bunny_normals,
+        &bunny_indices,
+        glass_bunny_mat,
+    );
+    let path = out_dir.join("cornell_glass_bunny.gltf");
+    fs::write(&path, &bytes).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    println!(
+        "wrote {} ({} bytes, room + green-glass bunny → {} triangles)",
         path.display(),
         bytes.len(),
         room_quads.len() * 2 + bunny_indices.len() / 3,
@@ -165,6 +202,7 @@ fn main() {
         emission: [0.0, 0.0, 0.0],
         metallic: 0.0,
         ior: 1.5,
+        absorption: [0.0, 0.0, 0.0],
     };
     let bytes = build_gltf_with_extra_mesh(
         &room_quads,
@@ -600,6 +638,7 @@ fn build_cornell_textured_floor() -> Vec<u8> {
         emission: [0.0; 3],
         metallic: 0.0,
         ior: 0.0,
+        absorption: [0.0, 0.0, 0.0],
     });
     // Quad 0 is the floor (per `cornell_box`); rebind it to the new
     // textured material.
@@ -740,15 +779,23 @@ fn emit_gltf(
                 Some(idx) => format!(r#","baseColorTexture":{{"index":{idx}}}"#),
                 None => String::new(),
             };
-            // PT-dielectrics: ior round-trips through `extras` (the
-            // `KHR_materials_ior` extension would be more "standard"
-            // but requires per-extension gltf-crate features that
-            // aren't on by default). Only emitted when non-zero so
-            // existing scenes' on-disk JSON stays byte-stable.
-            let extras = if m.ior > 0.0 {
-                format!(r#","extras":{{"ior":{ior}}}"#, ior = m.ior)
-            } else {
-                String::new()
+            // PT-dielectrics + PT-beer-lambert: non-standard material
+            // fields ride in `extras` rather than per-extension
+            // feature gates on the gltf crate. Only emitted when at
+            // least one is non-default so existing scenes' on-disk
+            // JSON stays byte-stable.
+            let extras = match (m.ior > 0.0, m.absorption.iter().any(|&c| c > 0.0)) {
+                (false, false) => String::new(),
+                (true, false) => format!(r#","extras":{{"ior":{ior}}}"#, ior = m.ior),
+                (false, true) => format!(
+                    r#","extras":{{"absorption":[{r},{g},{b}]}}"#,
+                    r = m.absorption[0], g = m.absorption[1], b = m.absorption[2],
+                ),
+                (true, true) => format!(
+                    r#","extras":{{"ior":{ior},"absorption":[{r},{g},{b}]}}"#,
+                    ior = m.ior,
+                    r = m.absorption[0], g = m.absorption[1], b = m.absorption[2],
+                ),
             };
             format!(
                 r#"{{"name":"{name}","pbrMetallicRoughness":{{"baseColorFactor":[{ar},{ag},{ab},1.0],"metallicFactor":{met},"roughnessFactor":{rough}{tex}}},"emissiveFactor":[{er},{eg},{eb}]{extras}}}"#,
