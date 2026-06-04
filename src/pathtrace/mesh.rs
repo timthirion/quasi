@@ -45,10 +45,16 @@ use bytemuck::{Pod, Zeroable};
 use crate::pathtrace::bvh::Bvh;
 
 /// Single mesh vertex, packed to match the WGSL storage-buffer layout
-/// the T1 shader will read. The two `_pad*` slots make the size 32
-/// bytes (8 floats), which is what `vec3 + vec3` rounds up to under
-/// std140 — matching CPU↔GPU sizes pins the class of bug the M1 uniform
-/// layout note warned about.
+/// the path-tracer shader reads. Pad slots keep CPU↔GPU sizes
+/// obviously identical (per the M1 uniform-layout lesson).
+///
+/// std430 layout:
+///   position: vec3 — offset 0,  size 12, align 16
+///   normal:   vec3 — offset 16, size 12, align 16
+///   uv:       vec2 — offset 32, size 8,  align 8
+///   total:    48 bytes (struct alignment 16 rounds 40 up to 48).
+///
+/// The `_pad*` fields make the Rust shape match byte-for-byte.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable, PartialEq)]
 pub struct Vertex {
@@ -56,12 +62,23 @@ pub struct Vertex {
     pub _pad0: f32,
     pub normal: [f32; 3],
     pub _pad1: f32,
+    pub uv: [f32; 2],
+    pub _pad2: [f32; 2],
 }
 
-/// PBR-aligned material. Lambertian (M1) only reads `albedo` and
-/// `emission`; `roughness` and `metallic` are stored for later BSDFs.
-/// Same 32-byte shape as `scene::GpuMaterial` so the WGSL `Material`
-/// struct from plan 0001 keeps working when T1 swaps the geometry path.
+/// Sentinel layer index meaning "no `baseColorTexture` for this
+/// material; use [`Material::albedo`] as a constant."
+pub const NO_TEXTURE: u32 = u32::MAX;
+
+/// PBR-aligned material. 48 bytes (Lambertian-only today reads
+/// `albedo`, `emission`, and `base_color_texture_idx`; `roughness` /
+/// `metallic` are still inert pending `PT-ggx`).
+///
+/// std430 layout (4-byte scalars need no extra padding):
+///   albedo:                    vec3 + scalar → 16 bytes
+///   emission:                  vec3 + scalar → 16 bytes
+///   base_color_texture_idx:    u32 + 3 × u32 pad → 16 bytes
+///   total: 48 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable, PartialEq)]
 pub struct Material {
@@ -69,6 +86,10 @@ pub struct Material {
     pub roughness: f32,
     pub emission: [f32; 3],
     pub metallic: f32,
+    /// Layer index in the path tracer's texture array, or
+    /// [`NO_TEXTURE`] for "use `albedo` as a constant."
+    pub base_color_texture_idx: u32,
+    pub _pad: [u32; 3],
 }
 
 impl Default for Material {
@@ -79,6 +100,8 @@ impl Default for Material {
             roughness: 1.0,
             emission: [0.0, 0.0, 0.0],
             metallic: 1.0,
+            base_color_texture_idx: NO_TEXTURE,
+            _pad: [0; 3],
         }
     }
 }
@@ -89,6 +112,17 @@ impl Material {
     pub fn is_emissive(&self) -> bool {
         self.emission[0] > 0.0 || self.emission[1] > 0.0 || self.emission[2] > 0.0
     }
+}
+
+/// CPU-side RGBA8 texture image. The path tracer uploads these as
+/// layers of a single `texture_2d_array<f32>` at scene-build time;
+/// non-uniform sizes are resized to the largest layer's dimensions.
+#[derive(Clone, Debug)]
+pub struct TextureImage {
+    pub width: u32,
+    pub height: u32,
+    /// Row-major RGBA8, `width * height * 4` bytes.
+    pub rgba: Vec<u8>,
 }
 
 /// A scene flattened from glTF into world-space triangles ready for
@@ -112,6 +146,10 @@ pub struct TriangleScene {
     /// traversal; the linear-scan path also remains, gated behind
     /// `Uniforms::use_bvh`.
     pub bvh: Bvh,
+    /// `baseColorTexture` images decoded from glTF. Materials
+    /// reference these by index via
+    /// [`Material::base_color_texture_idx`]. PT-textures milestone.
+    pub textures: Vec<TextureImage>,
 }
 
 impl TriangleScene {
@@ -263,12 +301,20 @@ pub fn load_glb<P: AsRef<std::path::Path>>(path: P) -> Result<TriangleScene, Mes
 /// data-URI buffers). Cross-target: callers on the web pass bytes from
 /// `fetch`.
 pub fn load_glb_bytes(bytes: &[u8]) -> Result<TriangleScene, MeshError> {
-    let (document, buffers, _images) = gltf::import_slice(bytes)?;
+    let (document, buffers, images) = gltf::import_slice(bytes)?;
 
     let mut scene = TriangleScene::default();
+    // Ingest texture images first so material extraction can resolve
+    // baseColorTexture indices. We only carry images that some material
+    // actually references — random images bundled into the glTF would
+    // otherwise inflate the GPU upload for nothing.
+    let texture_remap = ingest_referenced_images(&document, &images, &mut scene.textures);
+
     scene.materials.push(Material::default());
     for material in document.materials() {
-        scene.materials.push(extract_material(&material));
+        scene
+            .materials
+            .push(extract_material(&material, &texture_remap));
     }
 
     let active_scene = document
@@ -286,15 +332,78 @@ pub fn load_glb_bytes(bytes: &[u8]) -> Result<TriangleScene, MeshError> {
     Ok(scene)
 }
 
-fn extract_material(material: &gltf::Material) -> Material {
+/// Walks all materials and keeps only the images they reference via a
+/// `baseColorTexture`. Returns a remap from `image_index_in_glTF →
+/// layer_index_in_scene_textures` (or [`NO_TEXTURE`] for unreferenced
+/// images).
+fn ingest_referenced_images(
+    document: &gltf::Document,
+    images: &[gltf::image::Data],
+    out: &mut Vec<TextureImage>,
+) -> Vec<u32> {
+    let mut remap: Vec<u32> = vec![NO_TEXTURE; images.len()];
+    for material in document.materials() {
+        let Some(info) = material.pbr_metallic_roughness().base_color_texture() else {
+            continue;
+        };
+        let img_idx = info.texture().source().index();
+        if remap[img_idx] != NO_TEXTURE {
+            continue;
+        }
+        let data = &images[img_idx];
+        // Normalise to RGBA8: glTF can deliver R8/RG8/RGB8/RGBA8 plus
+        // 16-bit variants. We pad missing channels with 255 (opaque
+        // white) and drop hi-byte for 16-bit images. Lossless for
+        // RGBA8, lossy otherwise — log loud enough that a bug-report
+        // re-render notices.
+        let rgba = match data.format {
+            gltf::image::Format::R8G8B8A8 => data.pixels.clone(),
+            gltf::image::Format::R8G8B8 => {
+                let mut out = Vec::with_capacity(data.pixels.len() / 3 * 4);
+                for px in data.pixels.chunks_exact(3) {
+                    out.extend_from_slice(&[px[0], px[1], px[2], 255]);
+                }
+                out
+            }
+            other => {
+                log::warn!(
+                    "texture image #{img_idx}: unsupported glTF format {other:?}, skipping",
+                );
+                continue;
+            }
+        };
+        let layer = out.len() as u32;
+        out.push(TextureImage {
+            width: data.width,
+            height: data.height,
+            rgba,
+        });
+        remap[img_idx] = layer;
+    }
+    remap
+}
+
+fn extract_material(material: &gltf::Material, texture_remap: &[u32]) -> Material {
     let pbr = material.pbr_metallic_roughness();
     let base = pbr.base_color_factor();
     let emissive = material.emissive_factor();
+    // `pbr.base_color_texture()` returns the texture binding (with its
+    // image index) — when present, look up where that image landed in
+    // our deduplicated texture array via the remap table.
+    let base_color_texture_idx = pbr
+        .base_color_texture()
+        .and_then(|info| {
+            let src = info.texture().source().index();
+            texture_remap.get(src).copied()
+        })
+        .unwrap_or(NO_TEXTURE);
     Material {
         albedo: [base[0], base[1], base[2]],
         roughness: pbr.roughness_factor(),
         emission: emissive,
         metallic: pbr.metallic_factor(),
+        base_color_texture_idx,
+        _pad: [0; 3],
     }
 }
 
@@ -347,15 +456,27 @@ fn process_primitive(
     // the world-matrix cofactor, valid for arbitrary non-uniform scaling.
     let cols = upper_3x3_columns(world);
 
+    // Read UVs (TEXCOORD_0) if present; default to (0, 0) if the
+    // primitive doesn't carry them. glTF 2.0 stores UVs as `[f32; 2]`
+    // unless a UNORM / SNORM variant is used; we ask for the f32
+    // variant so the path is uniform.
+    let uvs: Vec<[f32; 2]> = match reader.read_tex_coords(0) {
+        Some(read) => read.into_f32().collect(),
+        None => vec![[0.0, 0.0]; positions.len()],
+    };
+
     let vertex_offset = scene.vertices.len() as u32;
     for i in 0..positions.len() {
         let p = transform_point(world, positions[i]);
         let n = transform_normal(&cols, normals[i]);
+        let uv = uvs.get(i).copied().unwrap_or([0.0, 0.0]);
         scene.vertices.push(Vertex {
             position: p,
             _pad0: 0.0,
             normal: n,
             _pad1: 0.0,
+            uv,
+            _pad2: [0.0, 0.0],
         });
     }
 
@@ -394,19 +515,20 @@ mod tests {
     // ---- Layout ----
 
     #[test]
-    fn vertex_is_32_bytes() {
-        assert_eq!(std::mem::size_of::<Vertex>(), 32);
+    fn vertex_is_48_bytes() {
+        // PT-textures: vec3 position (16) + vec3 normal (16) + vec2 uv (8)
+        // + 8 bytes of trailing pad so the struct stride matches std430.
+        assert_eq!(std::mem::size_of::<Vertex>(), 48);
     }
 
     #[test]
-    fn material_is_32_bytes_and_matches_gpu_material_layout() {
-        // The existing scene::GpuMaterial has the same shape; both sides
-        // upload as the same WGSL `Material` struct, so a mismatch here
-        // (e.g. a missing pad) only fails at runtime.
-        assert_eq!(std::mem::size_of::<Material>(), 32);
+    fn material_is_48_bytes_with_texture_index_at_32() {
+        // PT-textures grew the Material from 32 bytes (albedo + roughness +
+        // emission + metallic) to 48 bytes (+ base_color_texture_idx + pad).
+        assert_eq!(std::mem::size_of::<Material>(), 48);
         assert_eq!(
-            std::mem::size_of::<Material>(),
-            std::mem::size_of::<crate::pathtrace::scene::GpuMaterial>(),
+            std::mem::offset_of!(Material, base_color_texture_idx),
+            32,
         );
     }
 

@@ -30,6 +30,10 @@ const LEAF_FLAG: u32 = 0x80000000u;
 const LEAF_MASK: u32 = 0x7fffffffu;
 const STACK_DEPTH: u32 = 32u;
 
+// PT-textures: sentinel meaning "this material has no baseColorTexture;
+// use `Material::albedo` as a constant." Matches `pathtrace::mesh::NO_TEXTURE`.
+const NO_TEXTURE: u32 = 0xffffffffu;
+
 const U32_NORM: f32 = 4294967296.0;
 
 struct Camera {
@@ -46,6 +50,8 @@ struct Vertex {
     _pad0: f32,
     normal: vec3<f32>,
     _pad1: f32,
+    uv: vec2<f32>,
+    _pad2: vec2<f32>,
 };
 
 struct Material {
@@ -53,6 +59,10 @@ struct Material {
     roughness: f32,
     emission: vec3<f32>,
     metallic: f32,
+    base_color_texture_idx: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 };
 
 struct Uniforms {
@@ -82,6 +92,10 @@ struct BvhNode {
 @group(0) @binding(5) var<storage, read> emissive_triangles: array<u32>;
 @group(0) @binding(6) var<storage, read> bvh_nodes: array<BvhNode>;
 @group(0) @binding(7) var<storage, read> bvh_tri_indices: array<u32>;
+// PT-textures: scene base-color textures + a single shared linear-repeat
+// sampler. Layer indices come from `Material::base_color_texture_idx`.
+@group(0) @binding(8) var albedo_textures: texture_2d_array<f32>;
+@group(0) @binding(9) var albedo_sampler: sampler;
 
 struct VsOut {
     @builtin(position) position: vec4<f32>,
@@ -245,52 +259,96 @@ fn triangle_area(t: TriVerts) -> f32 {
     return 0.5 * length(cross(t.v1 - t.v0, t.v2 - t.v0));
 }
 
-// Möller-Trumbore intersection. Returns t (>0) on hit, or a negative
-// sentinel on miss. Double-sided (path tracer doesn't cull backfaces).
-fn intersect_triangle(ray: Ray, t: TriVerts, t_min: f32, t_max: f32) -> f32 {
+// Möller-Trumbore intersection. Returns `vec3<f32>(t, u, v)` on hit
+// (the `(u, v)` are the barycentric weights for the second and third
+// vertex), or `(-1.0, 0.0, 0.0)` on miss. Double-sided — the path
+// tracer doesn't cull backfaces.
+fn intersect_triangle(ray: Ray, t: TriVerts, t_min: f32, t_max: f32) -> vec3<f32> {
     let edge1 = t.v1 - t.v0;
     let edge2 = t.v2 - t.v0;
     let h = cross(ray.dir, edge2);
     let a = dot(edge1, h);
     if (abs(a) < 1e-8) {
-        return -1.0;
+        return vec3<f32>(-1.0, 0.0, 0.0);
     }
     let f = 1.0 / a;
     let s = ray.origin - t.v0;
     let u = f * dot(s, h);
     if (u < 0.0 || u > 1.0) {
-        return -1.0;
+        return vec3<f32>(-1.0, 0.0, 0.0);
     }
     let q = cross(s, edge1);
     let v = f * dot(ray.dir, q);
     if (v < 0.0 || u + v > 1.0) {
-        return -1.0;
+        return vec3<f32>(-1.0, 0.0, 0.0);
     }
     let t_hit = f * dot(edge2, q);
     if (t_hit < t_min || t_hit > t_max) {
-        return -1.0;
+        return vec3<f32>(-1.0, 0.0, 0.0);
     }
-    return t_hit;
+    return vec3<f32>(t_hit, u, v);
 }
 
 struct Hit {
     t: f32,
     point: vec3<f32>,
     normal: vec3<f32>,
+    uv: vec2<f32>,
     tri: u32,
     mat: u32,
     hit: bool,
 };
 
+/// Barycentric-interpolated UV at a triangle hit. The `(u, v)` come
+/// straight out of `intersect_triangle`.
+fn triangle_uv(tri: u32, u: f32, v: f32) -> vec2<f32> {
+    let i0 = tri_indices[tri * 3u + 0u];
+    let i1 = tri_indices[tri * 3u + 1u];
+    let i2 = tri_indices[tri * 3u + 2u];
+    let uv0 = vertices[i0].uv;
+    let uv1 = vertices[i1].uv;
+    let uv2 = vertices[i2].uv;
+    return uv0 * (1.0 - u - v) + uv1 * u + uv2 * v;
+}
+
+/// Returns the Lambertian albedo to use at the hit — material's
+/// constant `albedo` multiplied by the sampled `baseColorTexture`
+/// when one is bound. `textureSampleLevel` (explicit lod = 0) so the
+/// shader is portable to compute-style path tracers that don't have
+/// fragment derivatives.
+fn material_albedo(mat: Material, uv: vec2<f32>) -> vec3<f32> {
+    if (mat.base_color_texture_idx == NO_TEXTURE) {
+        return mat.albedo;
+    }
+    let tex = textureSampleLevel(
+        albedo_textures,
+        albedo_sampler,
+        uv,
+        i32(mat.base_color_texture_idx),
+        0.0,
+    );
+    return mat.albedo * tex.rgb;
+}
+
 // Record a triangle hit into the running closest. Factored so both
 // the linear-scan and the BVH traversal use the same flip-normal
-// convention.
-fn record_hit(closest: ptr<function, Hit>, ray: Ray, tri: u32, verts: TriVerts, t_hit: f32) {
+// convention. `bary_uv` is the (u, v) pair returned by
+// `intersect_triangle` — the barycentric weights for the second and
+// third vertex respectively.
+fn record_hit(
+    closest: ptr<function, Hit>,
+    ray: Ray,
+    tri: u32,
+    verts: TriVerts,
+    t_hit: f32,
+    bary_uv: vec2<f32>,
+) {
     (*closest).hit = true;
     (*closest).t = t_hit;
     (*closest).point = ray.origin + ray.dir * t_hit;
     (*closest).tri = tri;
     (*closest).mat = tri_materials[tri];
+    (*closest).uv = triangle_uv(tri, bary_uv.x, bary_uv.y);
     var n = normalize(cross(verts.v1 - verts.v0, verts.v2 - verts.v0));
     if (dot(n, ray.dir) > 0.0) {
         n = -n;
@@ -304,9 +362,9 @@ fn trace_scene_linear(ray: Ray) -> Hit {
     closest.t = 1e30;
     for (var tri = 0u; tri < U.triangle_count; tri = tri + 1u) {
         let verts = triangle_vertices(tri);
-        let t_hit = intersect_triangle(ray, verts, 0.001, closest.t);
-        if (t_hit > 0.0) {
-            record_hit(&closest, ray, tri, verts, t_hit);
+        let hit = intersect_triangle(ray, verts, 0.001, closest.t);
+        if (hit.x > 0.0) {
+            record_hit(&closest, ray, tri, verts, hit.x, vec2<f32>(hit.y, hit.z));
         }
     }
     return closest;
@@ -324,7 +382,7 @@ fn occluded_linear(origin: vec3<f32>, dir: vec3<f32>, dist: f32) -> bool {
             continue;
         }
         let verts = triangle_vertices(tri);
-        if (intersect_triangle(r, verts, 1e-3, t_max) > 0.0) {
+        if (intersect_triangle(r, verts, 1e-3, t_max).x > 0.0) {
             return true;
         }
     }
@@ -368,9 +426,9 @@ fn trace_scene_bvh(ray: Ray) -> Hit {
             for (var i = 0u; i < count; i = i + 1u) {
                 let tri = bvh_tri_indices[first + i];
                 let verts = triangle_vertices(tri);
-                let t_hit = intersect_triangle(ray, verts, 0.001, closest.t);
-                if (t_hit > 0.0) {
-                    record_hit(&closest, ray, tri, verts, t_hit);
+                let hit = intersect_triangle(ray, verts, 0.001, closest.t);
+                if (hit.x > 0.0) {
+                    record_hit(&closest, ray, tri, verts, hit.x, vec2<f32>(hit.y, hit.z));
                 }
             }
         } else if (sp <= i32(STACK_DEPTH) - 2) {
@@ -414,7 +472,7 @@ fn occluded_bvh(origin: vec3<f32>, dir: vec3<f32>, dist: f32) -> bool {
                     continue;
                 }
                 let verts = triangle_vertices(tri);
-                if (intersect_triangle(r, verts, 1e-3, t_max) > 0.0) {
+                if (intersect_triangle(r, verts, 1e-3, t_max).x > 0.0) {
                     return true;
                 }
             }
@@ -616,6 +674,11 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
         }
         let m = materials[hit.mat];
 
+        // PT-textures: sample the material's baseColorTexture (if any)
+        // at the hit's interpolated UV. Falls back to `m.albedo` when
+        // the material doesn't carry a texture.
+        let albedo = material_albedo(m, hit.uv);
+
         if (bounce == 0) {
             result.hit = true;
             result.depth = hit.t;
@@ -624,7 +687,7 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
             if (emit_lum > 0.0) {
                 result.albedo = m.emission / max(emit_lum, 1e-3);
             } else {
-                result.albedo = m.albedo;
+                result.albedo = albedo;
             }
         }
 
@@ -653,7 +716,7 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
                 if (cos_surf > 0.0) {
                     let shadow_o = hit.point + hit.normal * 0.001;
                     if (!occluded(shadow_o, ls.wi, ls.dist)) {
-                        let f = m.albedo / PI;
+                        let f = albedo / PI;
                         let bsdf_pdf = cos_surf / PI;
                         let wlight = power_heuristic(ls.pdf_w, bsdf_pdf);
                         result.radiance = result.radiance
@@ -669,7 +732,7 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
         prev_bsdf_pdf = cos_wi / PI;
         prev_point = hit.point;
         specular_bounce = false;
-        throughput = throughput * m.albedo;
+        throughput = throughput * albedo;
 
         if (bounce > 2) {
             let pr = max(0.05, max(throughput.x, max(throughput.y, throughput.z)));

@@ -131,6 +131,8 @@ pub struct State {
     _emissive_triangle_buf: wgpu::Buffer,
     _bvh_nodes_buf: wgpu::Buffer,
     _bvh_tri_indices_buf: wgpu::Buffer,
+    _textures: wgpu::Texture,
+    _sampler: wgpu::Sampler,
 
     targets: Targets,
 
@@ -248,8 +250,8 @@ fn build_targets(
 
 /// Layout for the path-trace pass: one uniform + seven read-only
 /// storage buffers (vertices, tri_indices, materials, tri_materials,
-/// emissive_triangles, bvh_nodes, bvh_tri_indices). Shared between
-/// the windowed renderer and the offscreen renderer.
+/// emissive_triangles, bvh_nodes, bvh_tri_indices) + one texture array
+/// + one sampler. Shared between the windowed and offscreen renderers.
 pub(crate) fn build_pathtrace_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     let storage = |binding: u32| wgpu::BindGroupLayoutEntry {
         binding,
@@ -281,13 +283,32 @@ pub(crate) fn build_pathtrace_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayou
             storage(5),
             storage(6),
             storage(7),
+            // PT-textures: base-color texture array + linear-repeat
+            // sampler. `Rgba8UnormSrgb` so an embedded gamma-encoded
+            // image (the typical baseColorTexture) decodes to linear.
+            wgpu::BindGroupLayoutEntry {
+                binding: 8,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 9,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
         ],
     })
 }
 
-/// Bundle of GPU buffers backing a [`TriangleScene`]. Held by both the
-/// windowed and offscreen renderers so their bind group references
-/// stay live.
+/// Bundle of GPU buffers + textures backing a [`TriangleScene`]. Held
+/// by both the windowed and offscreen renderers so their bind group
+/// references stay live.
 pub(crate) struct SceneBuffers {
     pub uniform: wgpu::Buffer,
     pub vertex: wgpu::Buffer,
@@ -297,6 +318,12 @@ pub(crate) struct SceneBuffers {
     pub emissive_triangle: wgpu::Buffer,
     pub bvh_nodes: wgpu::Buffer,
     pub bvh_tri_indices: wgpu::Buffer,
+    /// `texture_2d_array<f32>` carrying every glTF baseColorTexture.
+    /// Always has at least one layer — a 1×1 white pixel when the
+    /// scene has no textures — so the bind group is well-formed.
+    pub textures: wgpu::Texture,
+    pub textures_view: wgpu::TextureView,
+    pub sampler: wgpu::Sampler,
 }
 
 fn make_storage_buffer(
@@ -374,6 +401,7 @@ pub(crate) fn build_scene_buffers(
         bytemuck::cast_slice(&scene_data.bvh.triangle_indices),
         "bvh-tri-indices",
     );
+    let (textures, textures_view, sampler) = build_texture_array(device, queue, &scene_data.textures);
     SceneBuffers {
         uniform,
         vertex,
@@ -383,7 +411,124 @@ pub(crate) fn build_scene_buffers(
         emissive_triangle,
         bvh_nodes,
         bvh_tri_indices,
+        textures,
+        textures_view,
+        sampler,
     }
+}
+
+/// Builds the path-tracer's base-color texture array + sampler.
+/// Always emits at least one layer — when the scene carries no
+/// textures, layer 0 is a 1×1 white pixel so the binding stays valid.
+/// Mixed-size inputs are not supported in `PT-textures`; the loader
+/// asserts uniform dimensions for now.
+fn build_texture_array(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    textures: &[crate::pathtrace::mesh::TextureImage],
+) -> (wgpu::Texture, wgpu::TextureView, wgpu::Sampler) {
+    let (width, height, layer_count, source) = if textures.is_empty() {
+        (1u32, 1u32, 1u32, None)
+    } else {
+        let w = textures[0].width;
+        let h = textures[0].height;
+        for (i, t) in textures.iter().enumerate() {
+            assert!(
+                t.width == w && t.height == h,
+                "PT-textures: texture array layer {i} has size {}×{} but layer 0 is {w}×{h}; \
+                 mixed sizes need resizing support (not yet implemented)",
+                t.width,
+                t.height,
+            );
+        }
+        (w, h, textures.len() as u32, Some(textures))
+    };
+
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("pathtrace-textures"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: layer_count,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+
+    match source {
+        Some(layers) => {
+            for (layer_idx, img) in layers.iter().enumerate() {
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: 0,
+                            y: 0,
+                            z: layer_idx as u32,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &img.rgba,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(img.width * 4),
+                        rows_per_image: Some(img.height),
+                    },
+                    wgpu::Extent3d {
+                        width: img.width,
+                        height: img.height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+        }
+        None => {
+            // 1×1 opaque white default.
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &[255u8, 255, 255, 255],
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4),
+                    rows_per_image: Some(1),
+                },
+                wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+    }
+
+    let view = texture.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("pathtrace-textures-view"),
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
+    });
+
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("pathtrace-sampler"),
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        address_mode_w: wgpu::AddressMode::Repeat,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
+    });
+
+    (texture, view, sampler)
 }
 
 pub(crate) fn build_pathtrace_bg(
@@ -391,6 +536,7 @@ pub(crate) fn build_pathtrace_bg(
     bgl: &wgpu::BindGroupLayout,
     buffers: &SceneBuffers,
 ) -> wgpu::BindGroup {
+    let _ = &buffers.textures; // hold reference live across the bind group's Arc.
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("pathtrace-bg"),
         layout: bgl,
@@ -426,6 +572,14 @@ pub(crate) fn build_pathtrace_bg(
             wgpu::BindGroupEntry {
                 binding: 7,
                 resource: buffers.bvh_tri_indices.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: wgpu::BindingResource::TextureView(&buffers.textures_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: wgpu::BindingResource::Sampler(&buffers.sampler),
             },
         ],
     })
@@ -619,14 +773,20 @@ impl State {
         uniforms.use_bvh = 1;
 
         let scene_buffers = build_scene_buffers(&device, &queue, &triangle_scene);
-        let uniform_buf = scene_buffers.uniform;
-        let vertex_buf = scene_buffers.vertex;
-        let index_buf = scene_buffers.index;
-        let material_buf = scene_buffers.material;
-        let triangle_material_buf = scene_buffers.triangle_material;
-        let emissive_triangle_buf = scene_buffers.emissive_triangle;
-        let bvh_nodes_buf = scene_buffers.bvh_nodes;
-        let bvh_tri_indices_buf = scene_buffers.bvh_tri_indices;
+        let pathtrace_bg = build_pathtrace_bg(&device, &pathtrace_bgl, &scene_buffers);
+        let SceneBuffers {
+            uniform: uniform_buf,
+            vertex: vertex_buf,
+            index: index_buf,
+            material: material_buf,
+            triangle_material: triangle_material_buf,
+            emissive_triangle: emissive_triangle_buf,
+            bvh_nodes: bvh_nodes_buf,
+            bvh_tri_indices: bvh_tri_indices_buf,
+            textures: textures_tex,
+            textures_view: _,
+            sampler: sampler_obj,
+        } = scene_buffers;
 
         let accum_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("accum-uniform"),
@@ -634,21 +794,6 @@ impl State {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-
-        let pathtrace_bg = build_pathtrace_bg(
-            &device,
-            &pathtrace_bgl,
-            &SceneBuffers {
-                uniform: uniform_buf.clone(),
-                vertex: vertex_buf.clone(),
-                index: index_buf.clone(),
-                material: material_buf.clone(),
-                triangle_material: triangle_material_buf.clone(),
-                emissive_triangle: emissive_triangle_buf.clone(),
-                bvh_nodes: bvh_nodes_buf.clone(),
-                bvh_tri_indices: bvh_tri_indices_buf.clone(),
-            },
-        );
 
         let targets = build_targets(
             &device,
@@ -679,6 +824,8 @@ impl State {
             _emissive_triangle_buf: emissive_triangle_buf,
             _bvh_nodes_buf: bvh_nodes_buf,
             _bvh_tri_indices_buf: bvh_tri_indices_buf,
+            _textures: textures_tex,
+            _sampler: sampler_obj,
             targets,
             uniforms,
             camera: OrbitCamera::new(),

@@ -16,6 +16,8 @@ const CORNELL_QUADS: &[u8] = include_bytes!("../data/gltf/cornell_quads.gltf");
 const CORNELL_TRIS: &[u8] = include_bytes!("../data/gltf/cornell_tris.gltf");
 const CORNELL_SPHERE: &[u8] = include_bytes!("../data/gltf/cornell_sphere.gltf");
 const CORNELL_BUNNY: &[u8] = include_bytes!("../data/gltf/cornell_bunny.gltf");
+const CORNELL_TEXTURED_FLOOR: &[u8] =
+    include_bytes!("../data/gltf/cornell_textured_floor.gltf");
 
 #[test]
 fn cornell_quads_has_expected_topology() {
@@ -69,6 +71,69 @@ fn cornell_bunny_has_expected_topology() {
     assert_eq!(scene.emissive_triangles.len(), 2);
     // BVH must exist for the renderer.
     assert!(scene.bvh.nodes.len() > 1);
+}
+
+#[test]
+fn cornell_textured_floor_texture_contains_non_zero_pixels() {
+    let scene = load_glb_bytes(CORNELL_TEXTURED_FLOOR).expect("load");
+    let tex = &scene.textures[0];
+    let non_zero_alpha = tex.rgba.chunks_exact(4).filter(|p| p[3] != 0).count();
+    let non_white = tex
+        .rgba
+        .chunks_exact(4)
+        .filter(|p| !(p[0] == 255 && p[1] == 255 && p[2] == 255))
+        .count();
+    let total = tex.rgba.len() / 4;
+    eprintln!(
+        "texture: {total} pixels; {non_zero_alpha} non-zero alpha; {non_white} non-white",
+    );
+    eprintln!("first 16 bytes: {:?}", &tex.rgba[..16]);
+    assert!(non_zero_alpha > total / 2, "texture is mostly transparent");
+    assert!(non_white > total / 2, "texture is mostly white — PNG decode failed?");
+}
+
+#[test]
+fn cornell_textured_floor_carries_uvs_on_floor_vertices() {
+    let scene = load_glb_bytes(CORNELL_TEXTURED_FLOOR).expect("load");
+    // At least one vertex must have a non-zero UV. If every vertex
+    // has uv = (0, 0), the texture sample collapses to a single texel.
+    let with_uv = scene
+        .vertices
+        .iter()
+        .filter(|v| v.uv != [0.0, 0.0])
+        .count();
+    assert!(
+        with_uv > 0,
+        "every vertex's UV is (0, 0); the loader didn't see TEXCOORD_0"
+    );
+    let uvs: Vec<[f32; 2]> = scene.vertices.iter().map(|v| v.uv).collect();
+    eprintln!("sample UVs (first 8): {:?}", &uvs[..8.min(uvs.len())]);
+}
+
+#[test]
+fn cornell_textured_floor_has_the_embedded_uv_checker() {
+    use quasi::pathtrace::mesh::NO_TEXTURE;
+    let scene = load_glb_bytes(CORNELL_TEXTURED_FLOOR).expect("load");
+    // Same topology as cornell_quads (room + 2 boxes, subdiv 1).
+    assert_eq!(scene.triangle_count(), 32);
+    // 1 default + 4 base materials + 1 textured floor material.
+    assert_eq!(scene.materials.len(), 6);
+    // Exactly one material references the lone texture (layer 0).
+    let with_texture: Vec<_> = scene
+        .materials
+        .iter()
+        .filter(|m| m.base_color_texture_idx != NO_TEXTURE)
+        .collect();
+    assert_eq!(with_texture.len(), 1);
+    assert_eq!(with_texture[0].base_color_texture_idx, 0);
+    // One texture in the scene, 1024×1024 RGBA (the embedded
+    // uv_checker_color.png).
+    assert_eq!(scene.textures.len(), 1);
+    assert_eq!(scene.textures[0].width, 1024);
+    assert_eq!(scene.textures[0].height, 1024);
+    assert_eq!(scene.textures[0].rgba.len(), 1024 * 1024 * 4);
+    // The light quad's 2 emissive triangles still get picked up.
+    assert_eq!(scene.emissive_triangles.len(), 2);
 }
 
 #[test]

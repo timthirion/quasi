@@ -118,6 +118,18 @@ fn main() {
         bytes.len(),
         room_quads.len() * 2 + bunny_indices.len() / 3,
     );
+
+    // 4) Cornell with a textured floor — the PT-textures publishable
+    //    scene. Same geometry as cornell_quads, but the floor's
+    //    material samples the embedded uv_checker_color.png.
+    let bytes = build_cornell_textured_floor();
+    let path = out_dir.join("cornell_textured_floor.gltf");
+    fs::write(&path, &bytes).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    println!(
+        "wrote {} ({} bytes, room + UV-checker floor)",
+        path.display(),
+        bytes.len(),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -190,16 +202,21 @@ fn normalize(a: [f32; 3]) -> [f32; 3] {
 }
 
 /// One material's geometry contribution to the glTF, before serialization.
+/// `uvs` may be empty (the glTF won't carry a `TEXCOORD_0` attribute in
+/// that case) or the same length as `positions`.
 struct PrimitiveBatch {
     material_idx: usize,
     positions: Vec<[f32; 3]>,
     normals: Vec<[f32; 3]>,
+    uvs: Vec<[f32; 2]>,
     indices: Vec<u32>,
 }
 
 /// Subdivides each `quad` into `subdiv`×`subdiv` sub-quads (so
 /// `2·subdiv²` triangles per quad). Groups all triangles by material
-/// into a single primitive per material.
+/// into a single primitive per material. Per-vertex UVs are the
+/// subdivision coordinates `(s, t)` in `[0, 1]²` — a single tiling of
+/// any texture over the full quad face.
 fn triangulate(
     quads: &[GpuQuad],
     quad_material: &[usize],
@@ -211,6 +228,7 @@ fn triangulate(
             material_idx: mat_idx,
             positions: Vec::new(),
             normals: Vec::new(),
+            uvs: Vec::new(),
             indices: Vec::new(),
         })
         .collect();
@@ -228,6 +246,7 @@ fn triangulate(
                 let p = add(add(q.origin, scale(q.u, s)), scale(q.v, t));
                 batch.positions.push(p);
                 batch.normals.push(normal);
+                batch.uvs.push([s, t]);
             }
         }
 
@@ -461,7 +480,9 @@ fn bounds(positions: &[[f32; 3]]) -> ([f32; 3], [f32; 3]) {
 
 /// Same as [`build_gltf`] but also appends a single extra triangle
 /// mesh (positions + normals + indices, one shared material). Used to
-/// ship the icosphere or Stanford bunny alongside the room.
+/// ship the icosphere or Stanford bunny alongside the room. UVs for
+/// the extra mesh default to `(0, 0)` per-vertex — `PT-textures`
+/// doesn't texture either of them.
 fn build_gltf_with_extra_mesh(
     quads: &[GpuQuad],
     materials: &[GpuMaterial],
@@ -479,18 +500,65 @@ fn build_gltf_with_extra_mesh(
         material_idx: sphere_mat_idx,
         positions: sphere_positions.to_vec(),
         normals: sphere_normals.to_vec(),
+        uvs: vec![[0.0, 0.0]; sphere_positions.len()],
         indices: sphere_indices.to_vec(),
     });
-    emit_gltf(&palette, &batches)
+    let no_textures = vec![None; palette.len()];
+    emit_gltf(&palette, &no_textures, &batches, &[])
 }
 
 fn build_gltf(quads: &[GpuQuad], materials: &[GpuMaterial], subdiv: usize) -> Vec<u8> {
     let (palette, quad_material) = unique_materials(materials);
     let batches = triangulate(quads, &quad_material, palette.len(), subdiv);
-    emit_gltf(&palette, &batches)
+    let no_textures = vec![None; palette.len()];
+    emit_gltf(&palette, &no_textures, &batches, &[])
 }
 
-fn emit_gltf(palette: &[GpuMaterial], batches: &[PrimitiveBatch]) -> Vec<u8> {
+/// `data/gltf/cornell_textured_floor.gltf` — same Cornell as
+/// `cornell_quads`, but the floor's material is replaced by a textured
+/// Lambertian that samples `uv_checker_color.png` (PNG bytes embedded
+/// in the glTF as a base64 data URI). The publishable artifact for
+/// `PT-textures`.
+fn build_cornell_textured_floor() -> Vec<u8> {
+    let scene = cornell_box();
+    let quads = scene.quads.clone();
+    let materials = scene.materials.clone();
+
+    let (mut palette, mut quad_material) = unique_materials(&materials);
+
+    // Append a textured-floor material. Same albedo as the existing
+    // white material, but baseColorTexture is set so the WGSL shader
+    // multiplies in the sampled checker.
+    let floor_mat_idx = palette.len();
+    palette.push(GpuMaterial {
+        albedo: [1.0, 1.0, 1.0],
+        roughness: 1.0,
+        emission: [0.0; 3],
+        metallic: 0.0,
+    });
+    // Quad 0 is the floor (per `cornell_box`); rebind it to the new
+    // textured material.
+    quad_material[0] = floor_mat_idx;
+
+    let batches = triangulate(&quads, &quad_material, palette.len(), 1);
+
+    let mut material_textures: Vec<Option<u32>> = vec![None; palette.len()];
+    material_textures[floor_mat_idx] = Some(0);
+    let textures: &[&[u8]] = &[include_bytes!("../data/textures/uv_checker_color.png")];
+
+    emit_gltf(&palette, &material_textures, &batches, textures)
+}
+
+/// `material_textures[i] = Some(layer)` means material `i` uses
+/// `textures[layer]` as its `baseColorTexture`. `textures` is a slice
+/// of raw PNG byte slices; each gets embedded as a base64 data URI.
+fn emit_gltf(
+    palette: &[GpuMaterial],
+    material_textures: &[Option<u32>],
+    batches: &[PrimitiveBatch],
+    textures: &[&[u8]],
+) -> Vec<u8> {
+    assert_eq!(palette.len(), material_textures.len());
     // --- Binary buffer + accessors ---
     let mut bin: Vec<u8> = Vec::new();
     let mut accessors_json: Vec<String> = Vec::new();
@@ -539,6 +607,34 @@ fn emit_gltf(palette: &[GpuMaterial], batches: &[PrimitiveBatch]) -> Vec<u8> {
             cnt = batch.normals.len(),
         ));
 
+        // PT-textures: optional TEXCOORD_0 accessor. Skip entirely if
+        // the batch carries no UVs — the glTF spec allows missing
+        // texcoord sets, and a default attribute would just inflate
+        // the file for nothing.
+        let uv_acc: Option<usize> = if batch.uvs.len() == batch.positions.len() {
+            let uv_offset = bin.len();
+            for uv in &batch.uvs {
+                for &v in uv {
+                    bin.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            let uv_len = bin.len() - uv_offset;
+            let uv_bv = buffer_views_json.len();
+            buffer_views_json.push(format!(
+                r#"{{"buffer":0,"byteOffset":{uv_offset},"byteLength":{uv_len},"target":{tgt}}}"#,
+                tgt = TARGET_ARRAY_BUFFER,
+            ));
+            let acc_idx = accessors_json.len();
+            accessors_json.push(format!(
+                r#"{{"bufferView":{uv_bv},"componentType":{ct},"count":{cnt},"type":"VEC2"}}"#,
+                ct = COMPONENT_TYPE_F32,
+                cnt = batch.uvs.len(),
+            ));
+            Some(acc_idx)
+        } else {
+            None
+        };
+
         let idx_offset = bin.len();
         for &i in &batch.indices {
             bin.extend_from_slice(&i.to_le_bytes());
@@ -556,32 +652,79 @@ fn emit_gltf(palette: &[GpuMaterial], batches: &[PrimitiveBatch]) -> Vec<u8> {
             cnt = batch.indices.len(),
         ));
 
+        let attributes = match uv_acc {
+            Some(uv) => format!(
+                r#""POSITION":{pos_acc},"NORMAL":{nor_acc},"TEXCOORD_0":{uv}"#
+            ),
+            None => format!(r#""POSITION":{pos_acc},"NORMAL":{nor_acc}"#),
+        };
         primitives_json.push(format!(
-            r#"{{"attributes":{{"POSITION":{pos_acc},"NORMAL":{nor_acc}}},"indices":{idx_acc},"material":{mat_idx},"mode":{mode}}}"#,
+            r#"{{"attributes":{{{attributes}}},"indices":{idx_acc},"material":{mat_idx},"mode":{mode}}}"#,
             mat_idx = batch.material_idx,
             mode = PRIMITIVE_MODE_TRIANGLES,
         ));
     }
 
-    let total_bin_len = bin.len();
-    let b64 = base64_encode(&bin);
-
     // --- Materials JSON ---
     let materials_json: Vec<String> = palette
         .iter()
+        .zip(material_textures.iter())
         .enumerate()
-        .map(|(i, m)| {
+        .map(|(i, (m, tex_idx))| {
+            let base_color_texture = match tex_idx {
+                Some(idx) => format!(r#","baseColorTexture":{{"index":{idx}}}"#),
+                None => String::new(),
+            };
             format!(
-                r#"{{"name":"{name}","pbrMetallicRoughness":{{"baseColorFactor":[{ar},{ag},{ab},1.0],"metallicFactor":{met},"roughnessFactor":{rough}}},"emissiveFactor":[{er},{eg},{eb}]}}"#,
+                r#"{{"name":"{name}","pbrMetallicRoughness":{{"baseColorFactor":[{ar},{ag},{ab},1.0],"metallicFactor":{met},"roughnessFactor":{rough}{tex}}},"emissiveFactor":[{er},{eg},{eb}]}}"#,
                 name = material_label(m, i),
                 ar = m.albedo[0], ag = m.albedo[1], ab = m.albedo[2],
                 met = m.metallic, rough = m.roughness,
                 er = m.emission[0], eg = m.emission[1], eb = m.emission[2],
+                tex = base_color_texture,
             )
         })
         .collect();
 
+    // --- Textures + images JSON (optional) ---
+    //
+    // Image data goes into the binary buffer as a bufferView; the
+    // gltf crate's `import_slice` rejects glTF documents that
+    // reference *image* data via separate data URIs (it treats those
+    // as external resources), but it's happy to pull them out of the
+    // single self-contained binary buffer the rest of the geometry
+    // already uses.
+    let textures_section = if textures.is_empty() {
+        String::new()
+    } else {
+        let mut image_bvs: Vec<usize> = Vec::with_capacity(textures.len());
+        for png in textures {
+            let img_offset = bin.len();
+            bin.extend_from_slice(png);
+            let img_len = bin.len() - img_offset;
+            let bv = buffer_views_json.len();
+            buffer_views_json.push(format!(
+                r#"{{"buffer":0,"byteOffset":{img_offset},"byteLength":{img_len}}}"#,
+            ));
+            image_bvs.push(bv);
+        }
+        let images_json: Vec<String> = image_bvs
+            .iter()
+            .map(|bv| format!(r#"{{"bufferView":{bv},"mimeType":"image/png"}}"#))
+            .collect();
+        let textures_json: Vec<String> = (0..textures.len())
+            .map(|i| format!(r#"{{"source":{i}}}"#))
+            .collect();
+        format!(
+            r#","textures":[{tex}],"images":[{imgs}]"#,
+            tex = textures_json.join(","),
+            imgs = images_json.join(","),
+        )
+    };
+
     // --- Assemble root document ---
+    let total_bin_len = bin.len();
+    let b64 = base64_encode(&bin);
     let json = format!(
         r#"{{
 "asset":{{"version":"2.0","generator":"quasi/examples/gen_cornell.rs"}},
@@ -592,7 +735,7 @@ fn emit_gltf(palette: &[GpuMaterial], batches: &[PrimitiveBatch]) -> Vec<u8> {
 "materials":[{mats}],
 "accessors":[{accs}],
 "bufferViews":[{bvs}],
-"buffers":[{{"byteLength":{blen},"uri":"data:application/octet-stream;base64,{b64}"}}]
+"buffers":[{{"byteLength":{blen},"uri":"data:application/octet-stream;base64,{b64}"}}]{textures_section}
 }}
 "#,
         prims = primitives_json.join(","),

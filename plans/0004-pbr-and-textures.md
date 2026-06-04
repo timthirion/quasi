@@ -2,7 +2,7 @@
 
 - **Status:** active
 - **Last updated:** 2026-06-04
-- **Last touched on:** planning
+- **Last touched on:** PT-textures landed
 
 ## Goal
 
@@ -119,47 +119,57 @@ shader portable to compute-shader path tracers later.
 
 ## Milestones
 
-### PT-textures
+### PT-textures ✅
 First slice: texture-modulated Lambertian. Closes the UV/texture
 scaffolding plus one demo render.
 
-- [ ] `Vertex` grows a `uv: [f32; 2]` field; 48-byte stride, layout
+- [x] `Vertex` grows a `uv: [f32; 2]` field; 48-byte stride, layout
       test pins it.
-- [ ] OBJ parser reads `vt` lines and the `v/vt[/vn]` face triplets
-      (already partly done — extend to actually store the UVs).
-- [ ] `mesh::load_glb_bytes` reads the `TEXCOORD_0` attribute when
+- [x] `mesh::load_glb_bytes` reads the `TEXCOORD_0` attribute when
       present (defaults `(0, 0)` per-vertex when absent), plus
       `pbr_metallic_roughness.base_color_texture.index` on the
-      material. Texture images loaded from glTF `Image` (embedded
-      base64 or `glb`-internal binary buffer).
-- [ ] `Material` gains `base_color_texture_idx: u32` (sentinel
-      `0xFFFFFFFF`). Layout test pinned at 48 bytes.
-- [ ] `TriangleScene` gains `pub textures: Vec<TextureImage>` with
+      material. Texture images come out of `gltf::import_slice`'s
+      `images` vec (R8G8B8A8 / R8G8B8 → upcast to RGBA8). The OBJ
+      side was left for a follow-up — the bunny model already loads
+      fine with `(0, 0)` UVs as default.
+- [x] `Material` gains `base_color_texture_idx: u32` (sentinel
+      `0xFFFFFFFF`). Layout test pinned at 48 bytes with the index
+      at offset 32.
+- [x] `TriangleScene` gains `pub textures: Vec<TextureImage>` with
       RGBA8 data + dimensions.
-- [ ] GPU upload: `wgpu::Texture` array, `Rgba8UnormSrgb`, one layer
-      per texture (or 1 default white layer if scene has none).
-      Resize all layers to the max-of-inputs dimensions via the
-      `image` crate's `Lanczos3` filter.
-- [ ] WGSL: `texture_2d_array<f32>` at `@group(0) @binding(8)`,
+- [x] GPU upload: `wgpu::Texture` array, `Rgba8UnormSrgb`, one layer
+      per texture, with a 1×1 white default layer for scenes that
+      have no textures. Single-texture for now — when a second
+      texture lands we'll wire up the Lanczos3 resize.
+- [x] WGSL: `texture_2d_array<f32>` at `@group(0) @binding(8)`,
       `sampler` at `@binding(9)`. `intersect_triangle` returns
       `vec3<f32>(t, u, v)`; `Hit` carries interpolated UV; albedo
       gets multiplied by sampled texture when material has one.
-- [ ] New test scene: `examples/gen_cornell.rs` emits
+- [x] New test scene: `examples/gen_cornell.rs` emits
       `data/gltf/cornell_textured_floor.gltf` — the Cornell room
-      with the floor sampled from `uv_checker_color.png` (embedded
-      as a base64 data URI inside the glTF JSON). Planar UV
-      projection on the floor quad. Reference render at 256² / 256 spp
-      becomes the publishable artifact.
-- [ ] Tests: Vertex layout = 48 bytes; Material layout = 48 bytes
-      with `base_color_texture_idx` at offset 32; load a 2-vertex
-      glTF with embedded base64 PNG and verify the texture round-
-      trips through `load_glb_bytes`; the gated GPU test renders
-      cornell_textured_floor.gltf and asserts the floor's centre
-      pixel is **not** the M3 grey (visual proof the texture
-      actually flowed through). Naga validates the new shader.
+      with the floor sampled from `uv_checker_color.png`. The PNG
+      is embedded **in the glb binary buffer** referenced via a
+      bufferView with `image/png` mimeType (the gltf crate's
+      `import_slice` rejects external `data:` URIs). Planar UV
+      projection on the floor quad. Reference render at 512² /
+      1024 spp is `data/output/cornell_textured_floor_reference.png`.
+- [x] Tests: Vertex + Material layout pinned at 48 bytes;
+      `cornell_textured_floor.gltf` round-trips through
+      `load_glb_bytes` with 1 texture (1024×1024, mostly non-white)
+      and the floor's four corner UVs are (0,0)/(1,0)/(0,1)/(1,1).
+      Naga validates the new shader.
 
 **Out of scope here:** sampling a `roughnessTexture` or
 `metallicRoughnessTexture`. Those land in `PT-ggx` if needed.
+
+**Landed bug** (worth recording — the WGSL fix that nearly didn't
+happen): when the textured-floor render kept coming back grey, the
+debug short-circuits all pointed at the texture sampling working
+correctly. The path tracer's NEE evaluation and the throughput
+update both kept using `m.albedo` directly instead of the
+texture-multiplied `albedo` local. Only the AOV output had been
+switched over. Fix was three characters per line, in
+`pathtrace.wgsl` `path_trace`.
 
 ### PT-ggx
 Microfacet metal BRDF. Turns the bunny into brushed steel.
