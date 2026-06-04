@@ -241,13 +241,15 @@ fn main() {
         emission: [0.0, 0.0, 0.0],
         metallic: 0.0,
         ior: 0.0,
-        // Thin fog. Mean free path ≈ 1/(σ_a + σ_s) = 1/0.21 ≈ 4.8
-        // units. Room is ~2 units across, so most rays cross
-        // unscattered — the visible scattering rides on top of an
-        // otherwise crisp Cornell render and reads as a god-ray
-        // glow around the ceiling light.
-        absorption: [0.01, 0.01, 0.01],
-        scattering: [0.2, 0.2, 0.2],
+        // Moderate fog. Mean free path = 1 / (σ_a + σ_s) ≈ 1.8
+        // unit. Beer-Lambert across the 2-unit room gives ≈ 33%
+        // direct transmittance, so walls visibly dim but stay
+        // recognisable; the remaining ~67% of camera rays scatter
+        // inside the fog volume and pick up in-scattered light
+        // from the ceiling cone. Scattering ten times absorption
+        // keeps the room bright without a smoke-dense feel.
+        absorption: [0.05, 0.05, 0.05],
+        scattering: [0.5, 0.5, 0.5],
     };
     // Sized inside the Cornell room (interior is x∈[-1,1], y∈[0,2],
     // z∈[-1,1]). Pulled in by a hair to avoid coincident-surface
@@ -443,12 +445,19 @@ fn triangulate(
 /// Vertex count: `10 * 4^level + 2`. Triangle count: `20 * 4^level`.
 /// Level 5 = 10,242 vertices / 20,480 triangles — bunny territory
 /// without an external download.
-/// Closed axis-aligned box as 8 vertices + 36 indices. Outward-
-/// facing winding so the normals point away from the interior — the
-/// path tracer's `record_hit` uses geometric-normal-versus-ray to
-/// distinguish front/back faces, which is how PT-fog's medium-
-/// boundary detection picks up the "we're inside / we're outside"
-/// transition.
+/// Closed axis-aligned box as 8 vertices + 36 indices. Triangle
+/// winding is CCW-from-the-outside on every face so the geometric
+/// normal computed by `record_hit` (the cross product of two edges
+/// in vertex order) points OUTWARD. This is load-bearing for
+/// PT-fog: the path tracer's medium-boundary detection toggles
+/// `current_medium` based on `Hit::front_face`, which is derived
+/// from `dot(geom_n, ray.dir)`. If the geometric normals point
+/// inward, a camera ray entering the box reads as "exiting the
+/// medium" and the volume attenuation never fires.
+///
+/// Vertex index encoding (sign of each coordinate):
+///   0 = ---, 1 = +--, 2 = ++-, 3 = -+-,
+///   4 = --+, 5 = +-+, 6 = +++, 7 = -++
 fn aabb_box(min: [f32; 3], max: [f32; 3]) -> (Vec<[f32; 3]>, Vec<[f32; 3]>, Vec<u32>) {
     let p = [
         [min[0], min[1], min[2]], // 0: ---
@@ -460,20 +469,19 @@ fn aabb_box(min: [f32; 3], max: [f32; 3]) -> (Vec<[f32; 3]>, Vec<[f32; 3]>, Vec<
         [max[0], max[1], max[2]], // 6: +++
         [min[0], max[1], max[2]], // 7: -++
     ];
-    // Each face's two triangles. CCW from the outside.
     let tris: Vec<u32> = vec![
-        // -x face (left), normal = -x. Outward order: 0, 3, 7, 4.
-        0, 3, 7,  0, 7, 4,
-        // +x face (right), normal = +x. Outward order: 1, 5, 6, 2.
-        1, 5, 6,  1, 6, 2,
-        // -y face (bottom). Outward order: 0, 4, 5, 1.
-        0, 4, 5,  0, 5, 1,
-        // +y face (top). Outward order: 3, 2, 6, 7.
-        3, 2, 6,  3, 6, 7,
-        // -z face (back). Outward order: 0, 1, 2, 3.
-        0, 1, 2,  0, 2, 3,
-        // +z face (front). Outward order: 4, 7, 6, 5.
-        4, 7, 6,  4, 6, 5,
+        // -x face (normal -x). CCW viewed from -x.
+        0, 7, 3,  0, 4, 7,
+        // +x face (normal +x). CCW viewed from +x.
+        1, 2, 6,  1, 6, 5,
+        // -y face (normal -y, bottom). CCW viewed from -y.
+        0, 1, 5,  0, 5, 4,
+        // +y face (normal +y, top). CCW viewed from +y.
+        2, 3, 7,  2, 7, 6,
+        // -z face (normal -z, back). CCW viewed from -z.
+        0, 3, 2,  0, 2, 1,
+        // +z face (normal +z, front). CCW viewed from +z.
+        4, 5, 6,  4, 6, 7,
     ];
     let positions: Vec<[f32; 3]> = p.to_vec();
     // Flat normals don't matter for a medium-volume boundary (the
@@ -483,6 +491,56 @@ fn aabb_box(min: [f32; 3], max: [f32; 3]) -> (Vec<[f32; 3]>, Vec<[f32; 3]>, Vec<
     // BSDF dispatch never reads it for medium-volume materials.
     let normals: Vec<[f32; 3]> = positions.iter().map(|_| [0.0, 1.0, 0.0]).collect();
     (positions, normals, tris)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    }
+    fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+        [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+    }
+    fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+        a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+    }
+
+    #[test]
+    fn aabb_box_geometric_normals_point_outward() {
+        // Reproduction of the PT-fog gotcha: every face's geometric
+        // normal must point AWAY from the box centroid, otherwise
+        // path tracer reads boundary crossings backwards and
+        // Beer-Lambert silently never fires.
+        let min = [-2.0_f32, -3.0, -4.0];
+        let max = [5.0_f32, 1.0, 2.0];
+        let centroid = [
+            0.5 * (min[0] + max[0]),
+            0.5 * (min[1] + max[1]),
+            0.5 * (min[2] + max[2]),
+        ];
+        let (positions, _normals, tris) = aabb_box(min, max);
+        assert_eq!(tris.len() % 3, 0);
+        assert_eq!(tris.len() / 3, 12, "box must have 12 triangles (6 faces × 2)");
+        for tri in tris.chunks(3) {
+            let v0 = positions[tri[0] as usize];
+            let v1 = positions[tri[1] as usize];
+            let v2 = positions[tri[2] as usize];
+            let n = cross(sub(v1, v0), sub(v2, v0));
+            // From any triangle vertex to centroid → "inward" direction.
+            // Outward normal must have negative dot with that.
+            let inward = sub(centroid, v0);
+            assert!(
+                dot(n, inward) < 0.0,
+                "triangle {tri:?} has inward-pointing normal (geom_n={n:?}, inward={inward:?})",
+            );
+        }
+    }
 }
 
 fn icosphere(

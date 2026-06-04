@@ -180,14 +180,29 @@ god-rays Cornell room is the visual.
       shader. Existing scenes (Cornell quads, glass bunny, glass
       sphere, metal bunny, textured floor) all render unchanged.
 
-**Why the fog-top-equals-light-y bug bit us.** The first foggy
-scene had the fog box top at y=1.99 — exactly where the ceiling
-light tile sits. Coincident triangles cause `trace_scene` to
-return either the light or the fog top non-deterministically; the
-shadow ray from the ceiling could miss the light through the fog
-boundary, dropping NEE radiance and leaving the ceiling around the
-light reading as black. Moving the fog top to y=1.7 cleared up the
-god-rays immediately.
+**Two bugs landed-and-fixed during PT-fog**, both worth noting
+because the rendered images looked plausible right up until you
+compared them to what the math demanded:
+
+1. **Coincident fog-top and ceiling-light at y=1.99.** Shadow rays
+   from the ceiling intermittently missed the light because
+   `trace_scene` could return either the light tile or the fog box
+   top non-deterministically. Fixed by lowering the fog top to
+   y=1.7 — leaves a clean air gap around the light.
+
+2. **`aabb_box` had inverted winding on every face.** Each face was
+   emitted with CW-from-outside vertex order, so the geometric
+   normals all pointed *inward*. `record_hit`'s
+   `dot(geom_n, ray.dir)` then read every camera ray hitting the
+   front face of the fog box as "back face" and toggled
+   `current_medium` in the wrong direction. Net effect: Beer-
+   Lambert barely fired (only across the 0.01-unit gap between
+   the fog box's back face and the room's back wall), so walls
+   looked unattenuated and the fog read like a thin angular slice
+   near the light rather than a room-filling volume. Fixed the
+   winding to CCW-from-outside everywhere; locked it with
+   `aabb_box_geometric_normals_point_outward` in
+   `examples/gen_cornell.rs`'s test module.
 
 ## Open questions
 
