@@ -69,6 +69,9 @@ struct RenderArgs {
     /// `--scene path.gltf` to load a custom triangle scene; default
     /// uses the Cornell Box embedded in the binary.
     scene: Option<PathBuf>,
+    /// `--brute-force` switches the WGSL fragment shader to a linear
+    /// triangle scan; the default walks the BVH.
+    brute_force: bool,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -82,6 +85,7 @@ impl Default for RenderArgs {
             sampler: SamplerKind::default(),
             integrator: IntegratorKind::default(),
             scene: None,
+            brute_force: false,
         }
     }
 }
@@ -134,6 +138,9 @@ fn parse_render_args(args: &[String]) -> Result<RenderArgs, String> {
                     .ok_or_else(|| "--scene needs a path".to_string())?;
                 r.scene = Some(PathBuf::from(v));
             }
+            "--brute-force" => {
+                r.brute_force = true;
+            }
             "--help" | "-?" => {
                 println!(
                     "render options:\n\
@@ -143,7 +150,8 @@ fn parse_render_args(args: &[String]) -> Result<RenderArgs, String> {
                      \t--spp N             samples per pixel (default: 256)\n\
                      \t--sampler NAME      pcg | halton | sobol (default: pcg)\n\
                      \t--integrator NAME   misnee | bsdf (default: misnee)\n\
-                     \t--scene PATH        load a custom glTF scene (default: embedded Cornell)"
+                     \t--scene PATH        load a custom glTF scene (default: embedded Cornell)\n\
+                     \t--brute-force       skip the BVH and linear-scan triangles (verification)"
                 );
                 std::process::exit(0);
             }
@@ -165,6 +173,7 @@ fn run_render(args: &[String]) {
         samples: cli.samples,
         sampler: cli.sampler,
         integrator: cli.integrator,
+        use_bvh: !cli.brute_force,
         ..RenderConfig::default()
     };
     log::info!(

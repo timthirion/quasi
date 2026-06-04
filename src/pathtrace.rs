@@ -21,6 +21,7 @@
 //! the `OrbitCamera`. The rasterized pipeline ([`raster`](crate::raster))
 //! shares nothing with this code below the `gpu` seam.
 
+pub mod bvh;
 pub mod integrator;
 pub mod mesh;
 pub mod sampler;
@@ -128,6 +129,8 @@ pub struct State {
     _material_buf: wgpu::Buffer,
     _triangle_material_buf: wgpu::Buffer,
     _emissive_triangle_buf: wgpu::Buffer,
+    _bvh_nodes_buf: wgpu::Buffer,
+    _bvh_tri_indices_buf: wgpu::Buffer,
 
     targets: Targets,
 
@@ -243,10 +246,10 @@ fn build_targets(
     }
 }
 
-/// Layout for the path-trace pass: one uniform + five read-only
-/// storage buffers (vertices, indices, materials, triangle_materials,
-/// emissive_triangles). Shared between the windowed renderer and the
-/// offscreen renderer.
+/// Layout for the path-trace pass: one uniform + seven read-only
+/// storage buffers (vertices, tri_indices, materials, tri_materials,
+/// emissive_triangles, bvh_nodes, bvh_tri_indices). Shared between
+/// the windowed renderer and the offscreen renderer.
 pub(crate) fn build_pathtrace_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     let storage = |binding: u32| wgpu::BindGroupLayoutEntry {
         binding,
@@ -276,6 +279,8 @@ pub(crate) fn build_pathtrace_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayou
             storage(3),
             storage(4),
             storage(5),
+            storage(6),
+            storage(7),
         ],
     })
 }
@@ -290,6 +295,8 @@ pub(crate) struct SceneBuffers {
     pub material: wgpu::Buffer,
     pub triangle_material: wgpu::Buffer,
     pub emissive_triangle: wgpu::Buffer,
+    pub bvh_nodes: wgpu::Buffer,
+    pub bvh_tri_indices: wgpu::Buffer,
 }
 
 fn make_storage_buffer(
@@ -355,6 +362,18 @@ pub(crate) fn build_scene_buffers(
         bytemuck::cast_slice(&scene_data.emissive_triangles),
         "emissive-triangles",
     );
+    let bvh_nodes = make_storage_buffer(
+        device,
+        queue,
+        bytemuck::cast_slice(&scene_data.bvh.nodes),
+        "bvh-nodes",
+    );
+    let bvh_tri_indices = make_storage_buffer(
+        device,
+        queue,
+        bytemuck::cast_slice(&scene_data.bvh.triangle_indices),
+        "bvh-tri-indices",
+    );
     SceneBuffers {
         uniform,
         vertex,
@@ -362,6 +381,8 @@ pub(crate) fn build_scene_buffers(
         material,
         triangle_material,
         emissive_triangle,
+        bvh_nodes,
+        bvh_tri_indices,
     }
 }
 
@@ -397,6 +418,14 @@ pub(crate) fn build_pathtrace_bg(
             wgpu::BindGroupEntry {
                 binding: 5,
                 resource: buffers.emissive_triangle.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: buffers.bvh_nodes.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: buffers.bvh_tri_indices.as_entire_binding(),
             },
         ],
     })
@@ -587,6 +616,7 @@ impl State {
         uniforms.emissive_count = triangle_scene.emissive_triangles.len() as u32;
         uniforms.sampler_kind = SamplerKind::default().as_u32();
         uniforms.integrator_kind = IntegratorKind::default().as_u32();
+        uniforms.use_bvh = 1;
 
         let scene_buffers = build_scene_buffers(&device, &queue, &triangle_scene);
         let uniform_buf = scene_buffers.uniform;
@@ -595,6 +625,8 @@ impl State {
         let material_buf = scene_buffers.material;
         let triangle_material_buf = scene_buffers.triangle_material;
         let emissive_triangle_buf = scene_buffers.emissive_triangle;
+        let bvh_nodes_buf = scene_buffers.bvh_nodes;
+        let bvh_tri_indices_buf = scene_buffers.bvh_tri_indices;
 
         let accum_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("accum-uniform"),
@@ -613,6 +645,8 @@ impl State {
                 material: material_buf.clone(),
                 triangle_material: triangle_material_buf.clone(),
                 emissive_triangle: emissive_triangle_buf.clone(),
+                bvh_nodes: bvh_nodes_buf.clone(),
+                bvh_tri_indices: bvh_tri_indices_buf.clone(),
             },
         );
 
@@ -643,6 +677,8 @@ impl State {
             _material_buf: material_buf,
             _triangle_material_buf: triangle_material_buf,
             _emissive_triangle_buf: emissive_triangle_buf,
+            _bvh_nodes_buf: bvh_nodes_buf,
+            _bvh_tri_indices_buf: bvh_tri_indices_buf,
             targets,
             uniforms,
             camera: OrbitCamera::new(),
@@ -695,6 +731,21 @@ impl State {
     pub fn reset_accumulation(&mut self) {
         self.frame_count = 0;
         self.read_idx = 0;
+    }
+
+    /// Toggle between BVH traversal (the T2 default) and the linear
+    /// scan kept for verification. Accumulation resets because the two
+    /// traversals are bit-identical only at infinite spp; the
+    /// monte-carlo paths happen to be deterministic given identical
+    /// RNG state, but cumulative numerical-precision drift could
+    /// matter for tight regressions.
+    pub fn set_use_bvh(&mut self, use_bvh: bool) {
+        let flag = u32::from(use_bvh);
+        if self.uniforms.use_bvh != flag {
+            self.uniforms.use_bvh = flag;
+            self.frame_count = 0;
+            self.read_idx = 0;
+        }
     }
 
     pub fn render(&mut self) {

@@ -74,6 +74,11 @@ pub struct RenderConfig {
     pub samples: u32,
     pub sampler: SamplerKind,
     pub integrator: IntegratorKind,
+    /// True (default) → walk the BVH. False → linear scan over all
+    /// triangles. Both produce the same image; the linear scan is
+    /// retained as a verification fallback (see `--brute-force` on the
+    /// `render` CLI).
+    pub use_bvh: bool,
     pub camera_pos: [f32; 3],
     pub camera_dir: [f32; 3],
     pub camera_up: [f32; 3],
@@ -90,6 +95,7 @@ impl Default for RenderConfig {
             samples: 256,
             sampler: SamplerKind::default(),
             integrator: IntegratorKind::default(),
+            use_bvh: true,
             camera_pos: [0.0, 1.0, 3.5],
             camera_dir: [0.0, 0.0, -1.0],
             camera_up: [0.0, 1.0, 0.0],
@@ -194,6 +200,7 @@ async fn render_offscreen_async(cfg: RenderConfig, scene_data: &TriangleScene) -
     uniforms.viewport_height = cfg.height;
     uniforms.sampler_kind = cfg.sampler.as_u32();
     uniforms.integrator_kind = cfg.integrator.as_u32();
+    uniforms.use_bvh = u32::from(cfg.use_bvh);
 
     let scene_buffers = build_scene_buffers(&device, &queue, scene_data);
     let uniform_buf = scene_buffers.uniform.clone();

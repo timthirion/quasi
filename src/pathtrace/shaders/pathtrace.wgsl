@@ -23,6 +23,13 @@ const SAMPLER_SOBOL: u32 = 2u;
 const INTEGRATOR_MIS_NEE: u32 = 0u;
 const INTEGRATOR_BSDF: u32 = 1u;
 
+// BVH node leaf bit + traversal stack depth. The CPU side
+// (`pathtrace::bvh`) pins the same constants; an out-of-sync value
+// would silently corrupt traversal.
+const LEAF_FLAG: u32 = 0x80000000u;
+const LEAF_MASK: u32 = 0x7fffffffu;
+const STACK_DEPTH: u32 = 32u;
+
 const U32_NORM: f32 = 4294967296.0;
 
 struct Camera {
@@ -57,7 +64,14 @@ struct Uniforms {
     viewport_height: u32,
     sampler_kind: u32,
     integrator_kind: u32,
-    _pad0: u32,
+    use_bvh: u32,
+};
+
+struct BvhNode {
+    aabb_min: vec3<f32>,
+    left_or_first: u32,
+    aabb_max: vec3<f32>,
+    right_or_count: u32,
 };
 
 @group(0) @binding(0) var<uniform> U: Uniforms;
@@ -66,6 +80,8 @@ struct Uniforms {
 @group(0) @binding(3) var<storage, read> materials: array<Material>;
 @group(0) @binding(4) var<storage, read> tri_materials: array<u32>;
 @group(0) @binding(5) var<storage, read> emissive_triangles: array<u32>;
+@group(0) @binding(6) var<storage, read> bvh_nodes: array<BvhNode>;
+@group(0) @binding(7) var<storage, read> bvh_tri_indices: array<u32>;
 
 struct VsOut {
     @builtin(position) position: vec4<f32>,
@@ -266,7 +282,23 @@ struct Hit {
     hit: bool,
 };
 
-fn trace_scene(ray: Ray) -> Hit {
+// Record a triangle hit into the running closest. Factored so both
+// the linear-scan and the BVH traversal use the same flip-normal
+// convention.
+fn record_hit(closest: ptr<function, Hit>, ray: Ray, tri: u32, verts: TriVerts, t_hit: f32) {
+    (*closest).hit = true;
+    (*closest).t = t_hit;
+    (*closest).point = ray.origin + ray.dir * t_hit;
+    (*closest).tri = tri;
+    (*closest).mat = tri_materials[tri];
+    var n = normalize(cross(verts.v1 - verts.v0, verts.v2 - verts.v0));
+    if (dot(n, ray.dir) > 0.0) {
+        n = -n;
+    }
+    (*closest).normal = n;
+}
+
+fn trace_scene_linear(ray: Ray) -> Hit {
     var closest: Hit;
     closest.hit = false;
     closest.t = 1e30;
@@ -274,29 +306,18 @@ fn trace_scene(ray: Ray) -> Hit {
         let verts = triangle_vertices(tri);
         let t_hit = intersect_triangle(ray, verts, 0.001, closest.t);
         if (t_hit > 0.0) {
-            closest.hit = true;
-            closest.t = t_hit;
-            closest.point = ray.origin + ray.dir * t_hit;
-            closest.tri = tri;
-            closest.mat = tri_materials[tri];
-            // Geometric normal — flip to face the incoming ray.
-            var n = normalize(cross(verts.v1 - verts.v0, verts.v2 - verts.v0));
-            if (dot(n, ray.dir) > 0.0) {
-                n = -n;
-            }
-            closest.normal = n;
+            record_hit(&closest, ray, tri, verts, t_hit);
         }
     }
     return closest;
 }
 
-fn occluded(origin: vec3<f32>, dir: vec3<f32>, dist: f32) -> bool {
+fn occluded_linear(origin: vec3<f32>, dir: vec3<f32>, dist: f32) -> bool {
     let t_max = dist - 1e-3;
     var r: Ray;
     r.origin = origin;
     r.dir = dir;
     for (var tri = 0u; tri < U.triangle_count; tri = tri + 1u) {
-        // Skip emissive triangles — light is the target, not a blocker.
         let m_idx = tri_materials[tri];
         let em = materials[m_idx].emission;
         if (em.x + em.y + em.z > 0.1) {
@@ -308,6 +329,119 @@ fn occluded(origin: vec3<f32>, dir: vec3<f32>, dist: f32) -> bool {
         }
     }
     return false;
+}
+
+// ----- BVH traversal -----
+//
+// Slab-method AABB test using inverse direction. Handles infinities
+// (axis-aligned rays) naturally because IEEE 754 0 × ∞ = NaN propagates
+// out of the comparison and the test returns false safely.
+fn intersect_aabb(ray_origin: vec3<f32>, inv_dir: vec3<f32>, aabb_min: vec3<f32>, aabb_max: vec3<f32>, t_max: f32) -> bool {
+    let t0 = (aabb_min - ray_origin) * inv_dir;
+    let t1 = (aabb_max - ray_origin) * inv_dir;
+    let tmin = min(t0, t1);
+    let tmax = max(t0, t1);
+    let tenter = max(max(tmin.x, tmin.y), tmin.z);
+    let texit = min(min(tmax.x, tmax.y), tmax.z);
+    return tenter <= texit && texit >= 0.0 && tenter < t_max;
+}
+
+fn trace_scene_bvh(ray: Ray) -> Hit {
+    var closest: Hit;
+    closest.hit = false;
+    closest.t = 1e30;
+    let inv_dir = vec3<f32>(1.0) / ray.dir;
+
+    var stack: array<u32, 32>;
+    stack[0] = 0u;
+    var sp: i32 = 1;
+
+    while (sp > 0) {
+        sp = sp - 1;
+        let node = bvh_nodes[stack[sp]];
+        if (!intersect_aabb(ray.origin, inv_dir, node.aabb_min, node.aabb_max, closest.t)) {
+            continue;
+        }
+        if ((node.left_or_first & LEAF_FLAG) != 0u) {
+            let first = node.left_or_first & LEAF_MASK;
+            let count = node.right_or_count;
+            for (var i = 0u; i < count; i = i + 1u) {
+                let tri = bvh_tri_indices[first + i];
+                let verts = triangle_vertices(tri);
+                let t_hit = intersect_triangle(ray, verts, 0.001, closest.t);
+                if (t_hit > 0.0) {
+                    record_hit(&closest, ray, tri, verts, t_hit);
+                }
+            }
+        } else if (sp <= i32(STACK_DEPTH) - 2) {
+            // Push both children. Near-far ordering optimisation is
+            // left for a future plan — current Cornell scenes are
+            // small enough that the savings don't matter.
+            stack[sp] = node.right_or_count;
+            sp = sp + 1;
+            stack[sp] = node.left_or_first;
+            sp = sp + 1;
+        }
+    }
+    return closest;
+}
+
+fn occluded_bvh(origin: vec3<f32>, dir: vec3<f32>, dist: f32) -> bool {
+    let t_max = dist - 1e-3;
+    let inv_dir = vec3<f32>(1.0) / dir;
+    var r: Ray;
+    r.origin = origin;
+    r.dir = dir;
+
+    var stack: array<u32, 32>;
+    stack[0] = 0u;
+    var sp: i32 = 1;
+
+    while (sp > 0) {
+        sp = sp - 1;
+        let node = bvh_nodes[stack[sp]];
+        if (!intersect_aabb(origin, inv_dir, node.aabb_min, node.aabb_max, t_max)) {
+            continue;
+        }
+        if ((node.left_or_first & LEAF_FLAG) != 0u) {
+            let first = node.left_or_first & LEAF_MASK;
+            let count = node.right_or_count;
+            for (var i = 0u; i < count; i = i + 1u) {
+                let tri = bvh_tri_indices[first + i];
+                let m_idx = tri_materials[tri];
+                let em = materials[m_idx].emission;
+                if (em.x + em.y + em.z > 0.1) {
+                    continue;
+                }
+                let verts = triangle_vertices(tri);
+                if (intersect_triangle(r, verts, 1e-3, t_max) > 0.0) {
+                    return true;
+                }
+            }
+        } else if (sp <= i32(STACK_DEPTH) - 2) {
+            stack[sp] = node.right_or_count;
+            sp = sp + 1;
+            stack[sp] = node.left_or_first;
+            sp = sp + 1;
+        }
+    }
+    return false;
+}
+
+fn trace_scene(ray: Ray) -> Hit {
+    if (U.use_bvh == 1u) {
+        return trace_scene_bvh(ray);
+    } else {
+        return trace_scene_linear(ray);
+    }
+}
+
+fn occluded(origin: vec3<f32>, dir: vec3<f32>, dist: f32) -> bool {
+    if (U.use_bvh == 1u) {
+        return occluded_bvh(origin, dir, dist);
+    } else {
+        return occluded_linear(origin, dir, dist);
+    }
 }
 
 // ----- Light sampling + MIS -----

@@ -67,7 +67,9 @@ pub struct Uniforms {
     /// Discriminant of [`crate::pathtrace::integrator::IntegratorKind`].
     /// Switches the WGSL path tracer between MIS+NEE and pure BSDF.
     pub integrator_kind: u32,
-    pub _pad: u32,
+    /// 1 = walk the BVH (T2 default), 0 = linear scan (verification
+    /// path retained behind `render --brute-force`).
+    pub use_bvh: u32,
 }
 
 /// CPU description of the Cornell Box.
@@ -223,10 +225,12 @@ mod tests {
         assert_eq!(size_of::<GpuQuad>(), 48);
         assert_eq!(size_of::<GpuMaterial>(), 32);
         // camera (48) + 8 × u32 = 80. T1 dropped the per-quad arrays;
-        // triangle data lives in storage buffers now.
+        // triangle data lives in storage buffers now. T2 added
+        // `use_bvh` in what used to be the trailing pad slot.
         assert_eq!(size_of::<Uniforms>(), 80);
         assert_eq!(offset_of!(Uniforms, triangle_count), 48);
         assert_eq!(offset_of!(Uniforms, integrator_kind), 48 + 6 * 4);
+        assert_eq!(offset_of!(Uniforms, use_bvh), 48 + 7 * 4);
     }
 
     #[test]

@@ -42,6 +42,8 @@
 
 use bytemuck::{Pod, Zeroable};
 
+use crate::pathtrace::bvh::Bvh;
+
 /// Single mesh vertex, packed to match the WGSL storage-buffer layout
 /// the T1 shader will read. The two `_pad*` slots make the size 32
 /// bytes (8 floats), which is what `vec3 + vec3` rounds up to under
@@ -105,6 +107,11 @@ pub struct TriangleScene {
     /// Triangle indices (not vertex indices) whose material has
     /// non-zero emission. Populated by [`Self::recompute_emissive`].
     pub emissive_triangles: Vec<u32>,
+    /// SAH BVH over the triangles in `indices`. Built at glTF load
+    /// time. The WGSL fragment shader walks this via stack-based
+    /// traversal; the linear-scan path also remains, gated behind
+    /// `Uniforms::use_bvh`.
+    pub bvh: Bvh,
 }
 
 impl TriangleScene {
@@ -275,6 +282,7 @@ pub fn load_glb_bytes(bytes: &[u8]) -> Result<TriangleScene, MeshError> {
     }
 
     scene.recompute_emissive();
+    scene.bvh = Bvh::build(&scene.vertices, &scene.indices);
     Ok(scene)
 }
 

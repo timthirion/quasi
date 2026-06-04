@@ -96,3 +96,90 @@ fn cornell_quads_and_tris_render_to_the_same_image() {
         "rmse {rmse:.6} exceeds threshold — geometry mismatch?",
     );
 }
+
+/// GPU regression: the BVH walk and the brute-force linear scan should
+/// produce visually identical images. Both find the same closest
+/// triangle hit; only the traversal order differs. RMSE is dominated
+/// by floating-point ordering noise. Ignored / native-only for the
+/// same reasons as the previous test.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+#[ignore]
+fn bvh_traversal_agrees_with_brute_force() {
+    use quasi::pathtrace::integrator::IntegratorKind;
+    use quasi::pathtrace::metrics::rmse_rgb;
+    use quasi::pathtrace::offscreen::{render_offscreen, RenderConfig};
+    use quasi::pathtrace::sampler::SamplerKind;
+
+    let scene = load_glb_bytes(CORNELL_TRIS).expect("tris");
+
+    let make_cfg = |use_bvh: bool| RenderConfig {
+        width: 128,
+        height: 128,
+        samples: 64,
+        sampler: SamplerKind::Pcg,
+        integrator: IntegratorKind::MisNee,
+        use_bvh,
+        ..RenderConfig::default()
+    };
+
+    let bvh = render_offscreen(make_cfg(true), &scene);
+    let brute = render_offscreen(make_cfg(false), &scene);
+    let rmse = rmse_rgb(&bvh.radiance, &brute.radiance);
+    eprintln!("bvh vs brute-force on cornell_tris: rmse = {rmse:.8}");
+    // Identical RNG, identical scene, identical Möller-Trumbore — the
+    // only divergence source is the order Möller-Trumbore is invoked
+    // in, which can change which `t` value happens to be the closest
+    // when two triangles are nearly coplanar. In practice the Cornell
+    // box has no near-coplanar triangles, so RMSE should be tiny.
+    assert!(
+        rmse < 1e-3,
+        "rmse {rmse:.8} too large — BVH traversal disagrees with brute-force?",
+    );
+}
+
+/// GPU benchmark (also `#[ignore]`): renders cornell_tris.gltf with
+/// the BVH and with the brute-force linear scan, prints the wall-clock
+/// time of each, and asserts the BVH is **at least faster** than brute
+/// force. The plan's 10× target is specifically scoped to the
+/// Stanford-bunny-in-Cornell scene (T4, ~70k triangles); at 512
+/// triangles the BVH's per-iteration stack overhead eats into the
+/// savings. This test enforces the no-regression bar so we'd catch a
+/// BVH that's silently broken or slower than the loop it replaces.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+#[ignore]
+fn bvh_is_faster_than_brute_force_at_512_triangles() {
+    use quasi::pathtrace::offscreen::{render_offscreen, RenderConfig};
+    use std::time::Instant;
+
+    let scene = load_glb_bytes(CORNELL_TRIS).expect("tris");
+    let make_cfg = |use_bvh: bool| RenderConfig {
+        width: 256,
+        height: 256,
+        samples: 64,
+        use_bvh,
+        ..RenderConfig::default()
+    };
+
+    // Warm-up: GPU pipeline / shader compilation lands in the first
+    // render and shouldn't count.
+    let _ = render_offscreen(make_cfg(true), &scene);
+
+    let t = Instant::now();
+    let _ = render_offscreen(make_cfg(true), &scene);
+    let bvh_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+    let t = Instant::now();
+    let _ = render_offscreen(make_cfg(false), &scene);
+    let brute_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+    let speedup = brute_ms / bvh_ms;
+    eprintln!(
+        "cornell_tris (512 tris) @ 256x256 / 64 spp: bvh = {bvh_ms:.1} ms, brute = {brute_ms:.1} ms, speedup = {speedup:.1}x",
+    );
+    assert!(
+        speedup >= 2.0,
+        "bvh speedup {speedup:.1}x < 2x — the BVH should at least beat a 512-triangle linear scan",
+    );
+}

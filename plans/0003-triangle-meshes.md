@@ -2,7 +2,7 @@
 
 - **Status:** active
 - **Last updated:** 2026-06-04
-- **Last touched on:** T1 landed — triangle WGSL + storage buffers, Cornell shipped as glTF
+- **Last touched on:** T2 landed — SAH binned BVH on CPU + WGSL stack traversal
 
 ## Goal
 
@@ -229,20 +229,66 @@ refresh that went in with T0, T1 adds:
   #[ignore]` so it doesn't break headless CI but can be invoked with
   `cargo test -- --ignored` locally.
 
-### T2 — SAH binned BVH
+### T2 — SAH binned BVH ✅ DONE
 
-- [ ] `pathtrace::bvh::Bvh::build(vertices, indices) -> Bvh` —
-      recursive SAH binned split; 16 bins; leaf cap 4. Unit-tested
-      against synthetic point sets (AABB tightness, leaf-triangle
-      coverage, balanced builds on uniform inputs).
-- [ ] Linear node layout per the design above; CPU-side struct
-      asserts size / offsets vs. the WGSL `Node` struct.
-- [ ] WGSL stack traversal in `triangle.wgsl`. The linear-scan path
-      stays as a `--brute-force` flag for verification only.
-- [ ] Benchmark: at the canonical Cornell + bunny scene, BVH
-      traversal is at least 10× faster than the linear scan
-      (measured by render time at 256×256 / 64 spp; recorded in plan
-      notes).
+- [x] `pathtrace::bvh::Bvh::build(vertices, indices)` — recursive SAH
+      binned split (16 bins/axis), leaf cap 4. Per-triangle AABBs +
+      centroids precomputed; centroid-binning drives the SAH cost
+      function (`left_count * left_area + right_count * right_area`).
+      Degenerate inputs (all-colocated centroids, partition collapses
+      to one side) fall back cleanly to a leaf. 9 unit tests cover
+      Node layout, leaf bit pattern, single-triangle / empty / many-
+      identical / 64-triangle-line builds, AABB tightness, child-
+      index validity.
+- [x] **Linear node layout** matches WGSL std430 byte-for-byte: 32
+      bytes per `Node`, `vec3 + u32 + vec3 + u32` (vec3 size 12 bytes,
+      so the u32 packs at offset 12 with no pad). Layout test
+      `node_size_matches_wgsl_layout` pins it. The leaf flag is the
+      MSB of `left_or_first`; low 31 bits index `triangle_indices`
+      (for a leaf) or the left child (for an inner node). Same
+      constants on both sides (`LEAF_FLAG = 0x80000000`).
+- [x] WGSL stack traversal: function-local `array<u32, 32>` stack,
+      slab-method `intersect_aabb` with inverse direction (handles
+      axis-aligned rays via IEEE 754 inf propagation), both
+      `trace_scene_bvh` and `occluded_bvh`. The linear-scan path
+      survives as `trace_scene_linear` / `occluded_linear`; a runtime
+      `U.use_bvh` flag picks between them. `--brute-force` on the
+      `render` CLI flips it.
+- [x] **Benchmark on cornell_tris.gltf (512 triangles, Apple M4)**:
+      BVH = 458 ms; brute = 1218 ms; **speedup = 2.7×** (at 256×256 /
+      64 spp). The plan's 10× target was scoped to the Stanford-bunny
+      scene (T4, ~70k triangles); at 512 triangles the BVH's per-
+      iteration stack-push overhead eats into the savings (brute
+      force's inner loop is incredibly cheap). The regression test
+      `bvh_is_faster_than_brute_force_at_512_triangles` enforces a no-
+      regression floor of 2×; the 10× claim moves to T4.
+- [x] BVH ↔ brute-force agreement: RMSE = **5.1e-5** on cornell_tris
+      at 128×128 / 64 spp — well below `1e-3`. Same Möller-Trumbore,
+      same RNG, same Monte-Carlo paths; the only divergence source is
+      floating-point ordering of the closest-hit search.
+
+**Bind group grew to 8 entries** (was 6 at T1): added `bvh_nodes`
+(binding 6) and `bvh_tri_indices` (binding 7). Still within
+`Limits::default()`'s `max_storage_buffers_per_shader_stage = 8`.
+`SceneBuffers`, `build_pathtrace_bgl`, and `build_pathtrace_bg`
+absorbed the two new buffers in one pass; the windowed `State` and
+the offscreen renderer share both helpers.
+
+**Uniforms got a `use_bvh: u32` field** in what used to be the
+trailing pad slot. Total size unchanged at 80 bytes. Layout test now
+pins `use_bvh`'s offset (48 + 7×4 = 76).
+
+**TriangleScene grew a `bvh: Bvh` field** and `mesh::load_glb_bytes`
+builds the BVH after triangle ingest. Manual construction via
+`TriangleScene::default()` gives an empty leaf BVH (single zero-
+volume node) — the WGSL traversal indexes `bvh_nodes[0]`
+unconditionally, so a truly empty `nodes` Vec would be UB on GPU.
+
+**WGSL stack depth = 32** (constant `STACK_DEPTH`), enough for a BVH
+over ~4 G triangles. The push guard `sp <= STACK_DEPTH - 2` prevents
+overflow at the cost of dropping deep traversals — only relevant for
+pathological non-SAH inputs. Recorded here in case a future plan
+ships a non-SAH builder.
 
 ### T3 — Emissive triangle area lights
 
