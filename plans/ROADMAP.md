@@ -78,7 +78,13 @@ own audience (the Cornell Box / convergence widget at `0001`'s M4).
 
 ## Active plans
 
-- [`0001-foundation.md`](0001-foundation.md) — Bring the renderer up to a complete
-  interactive Cornell Box path tracer (Phases 0–3, staged as milestones). **active**
 - [`0002-realtime-rasterization.md`](0002-realtime-rasterization.md) — Dual-
   pipeline split + a real-time rasterized renderer (milestones R0–R4). **active**
+- [`0003-triangle-meshes.md`](0003-triangle-meshes.md) — glTF-loaded triangle
+  meshes + SAH binned BVH for the path tracer (milestones T0–T4). **proposed**
+
+## Done
+
+- [`0001-foundation.md`](0001-foundation.md) — Interactive Cornell Box path
+  tracer (M0–M4: pixels native+web, NEE+MIS over analytic quads, samplers +
+  AOVs + native output, verification harness, embeddable widget). **done 2026-06-04**
