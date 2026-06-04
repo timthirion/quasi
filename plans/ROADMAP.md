@@ -166,7 +166,10 @@ brute-force converges fast enough.
 
 ## Active plans
 
-_(none — Phase 4 sub-plans drafted as they start)_
+- [`0004-pbr-and-textures.md`](0004-pbr-and-textures.md) — PBR
+  materials + textures (`PT-textures`, `PT-ggx`, `PT-dielectrics`).
+  **active** — first plan to use the `PT-<topic>` semantic milestone
+  convention.
 
 ## Done
 
