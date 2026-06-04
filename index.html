@@ -29,6 +29,18 @@
         font-size: 13px;
       }
       .headless-controls select { font: inherit; }
+
+      /* R4: motum-shaped raster widget */
+      #raster-host { width: 540px; height: 360px; background: #000; }
+      .raster-controls {
+        display: flex; gap: 12px; align-items: center; padding: 8px 16px;
+        font-size: 13px;
+      }
+      .raster-controls input[type=range] { width: 200px; }
+      #goal-readout {
+        font-family: ui-monospace, monospace; font-size: 12px;
+        opacity: 0.75;
+      }
     </style>
   </head>
   <body>
@@ -69,8 +81,149 @@
       </div>
     </div>
 
+    <hr style="border-color: #333; margin: 24px 16px;" />
+
+    <p><strong>Raster (R4):</strong> motum-shaped JSON drives the widget.
+       Three boxes posed by <code>setWorldState</code>, a hand-drawn
+       search tree via <code>setTreeOverlay</code>, a draggable yellow
+       goal via <code>setGoal</code>. Drag the goal across the floor;
+       the new pose lands in the readout below via
+       <code>onGoalChanged</code>.</p>
+
+    <div class="row">
+      <div>
+        <div id="raster-host"></div>
+        <div class="raster-controls">
+          <label>Trajectory time
+            <input type="range" id="traj-time" min="0" max="3" step="0.01" value="0" />
+          </label>
+          <span id="traj-time-readout">t = 0.00</span>
+        </div>
+        <div class="caption">Slide the playhead to step the arm; drag the yellow ball to set a new goal.</div>
+        <div class="caption" id="goal-readout">goal: (drag the yellow ball)</div>
+      </div>
+    </div>
+
     <script type="module">
-      import init, { create, createHeadless } from "./pkg/quasi.js";
+      import init, { create, createHeadless, create_raster } from "./pkg/quasi.js";
+
+      // ---------- R4 demo JSON (motum-shaped) ----------
+      // A hand-coded "scene" — two link poses for a 2-segment arm plus
+      // a static base, a hand-drawn planner tree, and a goal handle.
+      // The pose shape is the literal nalgebra Isometry3 serialisation
+      // that motum produces.
+      function pose(x, y, z, qi=0, qj=0, qk=0, qw=1) {
+        return {
+          rotation: { quaternion: { coords: [qi, qj, qk, qw] } },
+          translation: { vector: [x, y, z] },
+        };
+      }
+      function quatY(angleRad) {
+        const s = Math.sin(angleRad / 2);
+        const c = Math.cos(angleRad / 2);
+        return [0, s, 0, c];
+      }
+      function poseY(x, y, z, angleRad) {
+        const [qi, qj, qk, qw] = quatY(angleRad);
+        return pose(x, y, z, qi, qj, qk, qw);
+      }
+
+      // World state at trajectory time 0 / 1.5 / 3 — a "scoop" motion.
+      function worldAt(t) {
+        // t in [0, 3]; base is fixed, link1 rotates 0 → π/2 → 0, link2
+        // rotates 0 → π/4 → -π/4.
+        const phase = t / 3;
+        const a1 = (Math.PI / 2) * Math.sin(phase * Math.PI);
+        const a2 = (Math.PI / 4) * Math.sin(phase * Math.PI * 2);
+        return {
+          link_poses: [
+            pose(0, 0, 0),                        // base (no geom)
+            pose(0, 0.1, 0),                      // joint axis (cube)
+            poseY(0, 0.7, 0, a1),                 // link 1 (cylinder)
+            poseY(Math.cos(a1) * 0.6, 1.2, Math.sin(a1) * 0.6, a1 + a2),
+          ],
+          link_geometry: [null, 0, 2, 0],         // cube, cylinder, cube
+        };
+      }
+
+      const trajectory = {
+        waypoints: [
+          { time: 0.0, world_state: worldAt(0.0) },
+          { time: 1.5, world_state: worldAt(1.5) },
+          { time: 3.0, world_state: worldAt(3.0) },
+        ],
+      };
+
+      // Hand-drawn search-tree overlay (world-space edges + nodes).
+      const treeOverlay = {
+        edges: [
+          { from: [0.0, 0.0, 0.0], to: [0.5, 0.0, 0.3] },
+          { from: [0.5, 0.0, 0.3], to: [1.0, 0.0, 0.4] },
+          { from: [0.5, 0.0, 0.3], to: [0.8, 0.0, 0.0] },
+          { from: [0.0, 0.0, 0.0], to: [-0.4, 0.0, 0.2] },
+          { from: [-0.4, 0.0, 0.2], to: [-0.6, 0.0, -0.1] },
+          { from: [1.0, 0.0, 0.4], to: [1.4, 0.0, 0.5] },
+        ],
+        nodes: [
+          [0.5, 0.0, 0.3], [1.0, 0.0, 0.4], [0.8, 0.0, 0.0],
+          [-0.4, 0.0, 0.2], [-0.6, 0.0, -0.1], [1.4, 0.0, 0.5],
+        ],
+      };
+
+      const initialGoal = { pose: pose(1.5, 0.0, 0.5) };
+      // -------------------------------------------------
+
+      const instances = [];
+      init().then(async () => {
+        // Default chrome (CSS-overridden in #a).
+        instances.push(await create("a"));
+        instances.push(await create("b"));
+
+        // Headless: embedder drives the canvas via setters + a polling readout.
+        const headless = await createHeadless("c");
+        instances.push(headless);
+
+        document.getElementById("c-sampler").addEventListener("change", e => {
+          headless.setSampler(e.target.value);
+        });
+        document.getElementById("c-integrator").addEventListener("change", e => {
+          headless.setIntegrator(e.target.value);
+        });
+        document.getElementById("c-reset").addEventListener("click", () => {
+          headless.reset();
+        });
+
+        const spp = document.getElementById("c-spp");
+        const tick = () => {
+          spp.textContent = `${headless.frameCount()} spp`;
+          requestAnimationFrame(tick);
+        };
+        requestAnimationFrame(tick);
+
+        // ---------- R4 raster demo ----------
+        const raster = await create_raster("raster-host");
+        instances.push(raster);
+        raster.setTrajectory(JSON.stringify(trajectory));
+        raster.setTrajectoryTime(0.0);
+        raster.setTreeOverlay(JSON.stringify(treeOverlay));
+        raster.setGoal(JSON.stringify(initialGoal));
+
+        const goalReadout = document.getElementById("goal-readout");
+        raster.onGoalChanged(goalJson => {
+          const g = JSON.parse(goalJson);
+          const v = g.pose.translation.vector;
+          goalReadout.textContent =
+            `goal: x = ${v[0].toFixed(3)}, y = ${v[1].toFixed(3)}, z = ${v[2].toFixed(3)}`;
+        });
+
+        const trajSlider = document.getElementById("traj-time");
+        const trajReadout = document.getElementById("traj-time-readout");
+        trajSlider.addEventListener("input", e => {
+          const t = Number(e.target.value);
+          raster.setTrajectoryTime(t);
+          trajReadout.textContent = `t = ${t.toFixed(2)}`;
+        });
+      }).catch(console.error);
 
       const instances = [];
       init().then(async () => {

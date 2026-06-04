@@ -9,7 +9,9 @@
 //! [`gpu`](crate::gpu) seam.
 
 pub mod mesh;
+pub mod picking;
 pub mod scene;
+pub mod wire;
 
 #[cfg(target_arch = "wasm32")]
 pub mod web;

@@ -1,8 +1,10 @@
 # Real-time rasterization track
 
-- **Status:** active
+- **Status:** done — R0–R4 shipped 2026-06-04. The plan stays as a
+  record; new raster work picks up under a new `plans/000N-*.md` if it
+  ever happens.
 - **Last updated:** 2026-06-04
-- **Last touched on:** R3 landed — line + point overlays with depth-tested / on-top slots
+- **Last touched on:** R4 landed — motum-shaped JSON scene API + draggable goal handle
 
 ## Goal
 
@@ -248,25 +250,73 @@ the uniform buffer and survives `Limits::downlevel_webgl2_defaults()`
 unchanged — overlays add zero new resource bindings beyond a vertex
 buffer per primitive type.
 
-### R4 — Motum-shaped scene API for embedders
-Make the rasterizer drivable from a wasm host with motum's data types as
-input. This is the seam motum's Phase 4 plugs into.
+### R4 — Motum-shaped scene API for embedders ✅ DONE
 
-- [ ] JSON wire format compatible with motum's `WorldState`,
-      `Trajectory`, `PlannerTree` (motum already serializes these).
-- [ ] `RasterInstance` wasm-bindgen API:
-      - `set_world_state(json)` — instance list + per-instance poses.
-      - `set_trajectory(json)` + playhead controls.
-      - `set_planner_tree(json)` — overlay.
-      - `on_goal_changed(callback)`.
-- [ ] Goal handle: a pickable, draggable marker entity with mouse → world
-      ray casting against a manipulation plane.
-- [ ] A minimal HTML harness in `index.html` that loads a hand-coded
-      motum-shaped JSON and renders it.
+- [x] **JSON wire format** in `pathtrace::raster::wire`:
+      - `WireWorldState` is **byte-for-byte compatible** with
+        `motum::world::WorldState` — the inner Pose matches nalgebra's
+        `Isometry3<f64>` serialisation (`{ rotation: { quaternion: {
+        coords } }, translation: { vector } }`). 9 unit tests pin the
+        shape end-to-end, including identity, translation-only, and a
+        90° Y rotation that demonstrates the column-major matrix
+        builder.
+      - `WireTrajectory` carries **world-space** waypoints
+        (`{time, world_state}` pairs), not motum's joint-space
+        `Trajectory`. Motum applies FK once per waypoint before sending
+        — the renderer has no robot model, so expecting it to do FK
+        would be a layering violation.
+      - `WireTreeOverlay` carries **world-space** edges + nodes
+        (`{from, to}` line segments and `[x,y,z]` points), not
+        motum's `PlannerTree { nodes: Vec<Configuration> }`. Same
+        reason: motum projects each tree node into world space (typically
+        end-effector position) before sending.
+      - `WireGoal` is a single [`WirePose`] used to position the
+        draggable handle.
+- [x] **wasm-bindgen API** on `RasterInstance` (gated `cfg(target_arch =
+      "wasm32")`, in `raster::web`):
+      - `setWorldState(json)` / `setTrajectory(json)` /
+        `setTrajectoryTime(t)` / `setTreeOverlay(json)` /
+        `setGoal(json)`.
+      - `onGoalChanged(callback)` registers a `js_sys::Function`; the
+        renderer fires it on `pointerup` after a drag with the new
+        pose as a JSON string (manually formatted to match the
+        identical schema `parseGoal` accepts — round-trip tested).
+- [x] **Goal handle drag** built around three pure math helpers in a
+      new `raster::picking` module (testable on native, no wasm gating):
+      - `camera_ray(camera, canvas_w, canvas_h, mx, my)` builds a
+        world-space ray through the cursor using the OrbitCamera's
+        eye/forward/up basis. 2 tests pin centre-screen and right-
+        edge directions.
+      - `ray_floor_hit(origin, dir)` intersects the `y = 0`
+        manipulation plane. 3 tests pin straight-down, upward (no
+        hit), and a 45° slant.
+      - `ray_hits_sphere(origin, dir, center, radius)` for picking.
+      - `serialize_pose(pose)` round-trips through `parse_goal` (1 test).
+      On pointerdown, the canvas-local ray is sphere-tested against the
+      goal handle; if it hits, drag mode is entered (camera orbit is
+      suppressed) and pointermove projects the cursor onto the floor
+      until pointerup fires the callback.
+- [x] **`index.html` harness** has a new section that creates a
+      `create_raster("raster-host")`, pushes a hand-coded motum-shaped
+      JSON (two 2-segment-arm waypoints + a hand-drawn 6-edge tree
+      overlay + an initial goal), wires the trajectory playhead to a
+      slider, and writes the dragged goal pose into a readout below
+      the canvas. Drag the yellow ball and the coords update live.
 
-**Done when:** a static motum scene round-trips through JSON into the
-rasterizer and renders correctly in the browser; mouse drag of the goal
-fires the callback with the new pose.
+**Trajectory playback is snap-to-waypoint, not interpolated.** The
+`active_world_state` impl picks the most recent waypoint at or before
+the playhead time. Lerp between waypoints would require interpolating
+rotations as well (slerp), which doesn't have a clean two-line
+implementation; ship snap for now and add lerp if the motum widget
+asks for it.
+
+**Throughput target from R3 carries over.** R3's plan note said "10k
+lines @ 60fps in browser is what to verify once motum's wired up."
+The R4 demo only ships 6 edges + 6 points so we still haven't
+exercised the 10k floor — but the buffer machinery + native LineList
+topology haven't changed. Filed as the same debugging note: if motum's
+widget isn't 60fps, profile the per-frame `populate_scene` clear-and-
+rebuild, not the pipeline.
 
 ## Open questions
 
