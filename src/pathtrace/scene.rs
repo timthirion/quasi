@@ -52,6 +52,10 @@ pub struct GpuMaterial {
     /// Beer-Lambert absorption coefficient. `(0, 0, 0)` = clear.
     /// Cornell walls leave this zero; coloured-glass scenes set it.
     pub absorption: [f32; 3],
+    /// Scattering coefficient. `(0, 0, 0)` = no scattering.
+    /// Fog / smoke scenes set this; closed-form Beer-Lambert glass
+    /// leaves it zero.
+    pub scattering: [f32; 3],
 }
 
 /// Camera + scalars uniform — the only data the WGSL shader still reads
@@ -120,6 +124,7 @@ fn mat(albedo: V3, emission: V3) -> GpuMaterial {
         metallic: 0.0,
         ior: 0.0,
         absorption: [0.0, 0.0, 0.0],
+        scattering: [0.0, 0.0, 0.0],
     }
 }
 
@@ -234,10 +239,10 @@ mod tests {
         assert_eq!(size_of::<GpuCamera>(), 48);
         assert_eq!(size_of::<GpuQuad>(), 48);
         // 32 bytes pre-PT-dielectrics; PT-dielectrics added `ior` (→ 36);
-        // PT-beer-lambert added `absorption: [f32; 3]` (→ 48). The
-        // runtime `Material` in `mesh.rs` lives separately and stays
-        // std430-padded at 64 bytes.
-        assert_eq!(size_of::<GpuMaterial>(), 48);
+        // PT-beer-lambert added `absorption` (→ 48); PT-fog added
+        // `scattering` (→ 60). The runtime `Material` in `mesh.rs`
+        // lives separately and stays std430-padded at 80 bytes.
+        assert_eq!(size_of::<GpuMaterial>(), 60);
         // camera (48) + 8 × u32 = 80. T1 dropped the per-quad arrays;
         // triangle data lives in storage buffers now. T2 added
         // `use_bvh` in what used to be the trailing pad slot.

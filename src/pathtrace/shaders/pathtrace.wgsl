@@ -76,6 +76,11 @@ struct Material {
     // this material. `(0, 0, 0)` = no participating-media tinting.
     absorption: vec3<f32>,
     _pad2: f32,
+    // PT-fog: per-channel scattering coefficient. Together with
+    // `absorption` defines the medium's extinction `σ_t = σ_a + σ_s`
+    // and scattering albedo `σ_s / σ_t`. Isotropic phase function.
+    scattering: vec3<f32>,
+    _pad3: f32,
 };
 
 struct Uniforms {
@@ -528,6 +533,85 @@ fn occluded(origin: vec3<f32>, dir: vec3<f32>, dist: f32) -> bool {
     }
 }
 
+// PT-fog: shadow-ray transmittance from a point through any
+// participating media to the target distance. Returns the per-
+// channel attenuation (`vec3<f32>(1)` if nothing in the way, lower
+// in any channel where the path crosses an absorbing or scattering
+// medium, `vec3<f32>(0)` if blocked by an opaque surface).
+//
+// The traversal pattern: trace the nearest hit; if it's the light
+// triangle the shadow ray was aimed at, we're done; if it's a
+// medium-volume boundary, accumulate transmittance for the segment
+// just travelled (in the *previous* medium), then advance past the
+// boundary and continue with `current_medium` flipped. An opaque
+// surface in between → return 0.
+//
+// Capped to a few boundary crossings — a single closed fog volume
+// only needs two (enter, exit) per shadow ray. Heterogeneous /
+// nested-media setups (a fog box with a glass sphere inside) would
+// need to lift this cap.
+const SHADOW_BOUNCE_CAP: i32 = 6;
+
+fn shadow_transmittance(
+    origin: vec3<f32>,
+    dir: vec3<f32>,
+    dist: f32,
+    start_medium: u32,
+) -> vec3<f32> {
+    var trans = vec3<f32>(1.0);
+    var medium = start_medium;
+    var origin_cur = origin;
+    var remaining = dist;
+    for (var iter = 0; iter < SHADOW_BOUNCE_CAP; iter = iter + 1) {
+        if (remaining <= 1e-3) {
+            return trans;
+        }
+        var r: Ray;
+        r.origin = origin_cur;
+        r.dir = dir;
+        let h = trace_scene(r);
+        if (!h.hit || h.t > remaining - 1e-3) {
+            // No occluder before the light — apply the final segment
+            // transmittance and we're done.
+            if (medium != NO_MEDIUM) {
+                let sigma_t = medium_extinction(materials[medium]);
+                trans = trans * exp(-sigma_t * remaining);
+            }
+            return trans;
+        }
+        let mat = materials[h.mat];
+        let em = mat.emission.x + mat.emission.y + mat.emission.z;
+        if (em > 0.1) {
+            // Aimed-at light triangle (or a coincidentally-aligned
+            // other emitter). NEE treats this as "reached the
+            // light" — apply the segment transmittance and stop.
+            if (medium != NO_MEDIUM) {
+                let sigma_t = medium_extinction(materials[medium]);
+                trans = trans * exp(-sigma_t * h.t);
+            }
+            return trans;
+        }
+        if (!is_medium_volume_material(mat)) {
+            return vec3<f32>(0.0); // opaque occluder
+        }
+        // Medium boundary — attenuate the segment we just traversed
+        // (in the previous medium), then flip across the boundary
+        // and keep walking.
+        if (medium != NO_MEDIUM) {
+            let sigma_t = medium_extinction(materials[medium]);
+            trans = trans * exp(-sigma_t * h.t);
+        }
+        if (h.front_face == 1u) {
+            medium = h.mat;
+        } else {
+            medium = NO_MEDIUM;
+        }
+        origin_cur = h.point + dir * 1e-3;
+        remaining = remaining - h.t - 1e-3;
+    }
+    return trans;
+}
+
 // ----- Light sampling + MIS -----
 
 fn power_heuristic(a: f32, b: f32) -> f32 {
@@ -706,6 +790,109 @@ fn sample_ggx_half(normal: vec3<f32>, alpha: f32, s: ptr<function, SamplerState>
 // of the half-vector → outgoing-direction reflection.
 fn ggx_pdf(n_dot_h: f32, v_dot_h: f32, alpha: f32) -> f32 {
     return ggx_d(n_dot_h, alpha) * n_dot_h / (4.0 * max(v_dot_h, 1e-6));
+}
+
+// ----- Participating media (PT-beer-lambert + PT-fog) -----
+//
+// Two helpers feed the volumetric loop in `path_trace`:
+//
+//   - `sample_volume_distance` — exponential inverse-CDF on the
+//     scalar extinction majorant. Returns a `VolumeSample` whose
+//     `weight` is the per-channel correction (the true vector
+//     transmittance over the chosen sampling pdf). The `scattered`
+//     flag tells the caller whether this segment ended in a
+//     volume-scattering event or carried all the way to the next
+//     surface hit.
+//
+//   - `shadow_transmittance` — replaces `occluded()` for NEE shadow
+//     rays cast from inside a medium. Walks the ray through (up to
+//     a fixed cap on) medium-volume boundaries, accumulating
+//     `exp(-σ_t · t)` per segment; bails out and returns 0 on the
+//     first opaque-surface hit.
+//
+// Pure-absorption dielectrics (PT-beer-lambert's glass bunny) still
+// take the closed-form deterministic Beer-Lambert step. Sampling
+// would converge to the same expectation but with substantially
+// higher variance — see comment in `path_trace`.
+
+struct VolumeSample {
+    /// 1 when the segment terminated in a volume-scattering event;
+    /// 0 when it reached the next surface hit unscattered.
+    scattered: u32,
+    /// Distance along the ray. For surface-hit endings this is the
+    /// caller-supplied `t_max`.
+    t: f32,
+    /// Per-channel weight to multiply into `throughput`. For a
+    /// volume scatter event this folds in `σ_s` and the inverse pdf;
+    /// for a surface-hit ending it's the transmittance over the
+    /// no-scatter probability.
+    weight: vec3<f32>,
+};
+
+fn medium_extinction(medium_mat: Material) -> vec3<f32> {
+    return medium_mat.absorption + medium_mat.scattering;
+}
+
+fn extinction_majorant(sigma_t: vec3<f32>) -> f32 {
+    return max(sigma_t.x, max(sigma_t.y, sigma_t.z));
+}
+
+fn sample_volume_distance(
+    medium: u32,
+    t_max: f32,
+    s: ptr<function, SamplerState>,
+) -> VolumeSample {
+    var out: VolumeSample;
+    out.scattered = 0u;
+    out.t = t_max;
+    out.weight = vec3<f32>(1.0);
+    if (medium == NO_MEDIUM) {
+        return out;
+    }
+    let m = materials[medium];
+    let sigma_t = medium_extinction(m);
+    let sigma_t_maj = extinction_majorant(sigma_t);
+    if (sigma_t_maj <= 0.0) {
+        return out;
+    }
+    let xi = next_1d(s);
+    let t_sample = -log(max(1.0 - xi, 1e-30)) / sigma_t_maj;
+    if (t_sample < t_max) {
+        let trans = exp(-sigma_t * t_sample);
+        let pdf = sigma_t_maj * exp(-sigma_t_maj * t_sample);
+        out.scattered = 1u;
+        out.t = t_sample;
+        out.weight = m.scattering * trans / pdf;
+        return out;
+    }
+    // No scatter — survived all the way to the surface. Per-channel
+    // transmittance over the (scalar) no-scatter probability.
+    let trans = exp(-sigma_t * t_max);
+    let pdf = exp(-sigma_t_maj * t_max);
+    out.weight = trans / pdf;
+    return out;
+}
+
+// Isotropic phase function direction (uniform on the sphere).
+// `pdf = 1 / (4π)`.
+fn uniform_sphere_sample(s: ptr<function, SamplerState>) -> vec3<f32> {
+    let r = next_2d(s);
+    let z = 1.0 - 2.0 * r.x;
+    let phi = 2.0 * PI * r.y;
+    let xy_radius = sqrt(max(0.0, 1.0 - z * z));
+    return vec3<f32>(xy_radius * cos(phi), xy_radius * sin(phi), z);
+}
+
+const PHASE_ISOTROPIC: f32 = 0.07957747154594767; // 1 / (4 * π)
+
+// A "medium volume" material has no dielectric BSDF (ior == 0) but
+// carries non-zero extinction (absorption or scattering). The ray
+// passes through without surface scattering — only the
+// `current_medium` toggle and the segment transmittance apply.
+fn is_medium_volume_material(m: Material) -> bool {
+    let has_ext = m.absorption.x + m.absorption.y + m.absorption.z
+                + m.scattering.x + m.scattering.y + m.scattering.z > 0.0;
+    return m.ior == 0.0 && has_ext;
 }
 
 // ----- Smooth dielectric (PT-dielectrics) -----
@@ -978,16 +1165,99 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
         if (!hit.hit) {
             break;
         }
-        // PT-beer-lambert: attenuate throughput across the segment
-        // we just traversed (origin → hit) when the ray was inside a
-        // participating medium. `current_medium` is the material
-        // index whose `absorption` field gives σ_a; the closed-form
-        // Beer-Lambert solution is exp(-σ_a · t) per channel.
+        // PT-beer-lambert + PT-fog: handle the segment we just
+        // traversed inside `current_medium`. Two regimes:
+        //
+        //   1. Pure absorption (σ_s = 0, e.g. the green-glass
+        //      bunny) — closed-form deterministic Beer-Lambert
+        //      step. Sampling a distance here would converge to
+        //      the same expectation but with massive variance
+        //      (scatter events are δ-spikes with zero σ_s weight,
+        //      so the path "dies" ~half the time).
+        //   2. With scattering (σ_s > 0, fog) — sample a distance
+        //      from the exponential CDF. If the sample falls
+        //      *inside* the segment, scatter event: NEE + phase-
+        //      function bounce + continue. If it overshoots, just
+        //      apply the unbiased weight and proceed to the
+        //      surface hit.
         if (current_medium != NO_MEDIUM) {
-            let sigma_a = materials[current_medium].absorption;
-            throughput = throughput * exp(-sigma_a * hit.t);
+            let medium_mat = materials[current_medium];
+            let sigma_s_sum = medium_mat.scattering.x
+                            + medium_mat.scattering.y
+                            + medium_mat.scattering.z;
+            if (sigma_s_sum <= 0.0) {
+                throughput = throughput * exp(-medium_mat.absorption * hit.t);
+            } else {
+                let vs = sample_volume_distance(current_medium, hit.t, s);
+                throughput = throughput * vs.weight;
+                if (vs.scattered == 1u) {
+                    // Volume scatter event inside the medium.
+                    let scatter_pos = ray.origin + ray.dir * vs.t;
+
+                    // NEE through media — isotropic phase function
+                    // makes f and pdf both equal `1/(4π)`, so the
+                    // MIS weight just gates the contribution; we
+                    // pre-compute it that way for symmetry with the
+                    // surface-NEE path.
+                    if (mis_nee_mode) {
+                        let ls = sample_light(scatter_pos, s);
+                        if (ls.valid) {
+                            let trans = shadow_transmittance(
+                                scatter_pos, ls.wi, ls.dist, current_medium);
+                            let trans_sum = trans.x + trans.y + trans.z;
+                            if (trans_sum > 0.0) {
+                                let f = vec3<f32>(PHASE_ISOTROPIC);
+                                let wlight = power_heuristic(ls.pdf_w, PHASE_ISOTROPIC);
+                                result.radiance = result.radiance
+                                    + throughput * f * trans * ls.le * wlight / ls.pdf_w;
+                            }
+                        }
+                    }
+
+                    // Phase-function bounce — isotropic, uniform on
+                    // the sphere. `f / pdf = 1` so `bs.weight` is 1.
+                    let wi = uniform_sphere_sample(s);
+                    prev_bsdf_pdf = PHASE_ISOTROPIC;
+                    prev_point = scatter_pos;
+                    specular_bounce = false;
+                    // `current_medium` is unchanged — the scatter
+                    // event stays inside the medium.
+
+                    if (bounce > 2) {
+                        let pr = max(0.05,
+                            max(throughput.x, max(throughput.y, throughput.z)));
+                        if (next_1d(s) > pr) {
+                            break;
+                        }
+                        throughput = throughput / pr;
+                    }
+                    ray.origin = scatter_pos;
+                    ray.dir = wi;
+                    continue;
+                }
+            }
         }
+
         let m = materials[hit.mat];
+
+        // Medium-volume boundary (e.g. the fog box) — the ray
+        // passes through without surface BSDF evaluation. We toggle
+        // `current_medium` and spawn the next segment from just
+        // past the boundary; the next iteration's volume step
+        // handles attenuation across the *new* medium.
+        if (is_medium_volume_material(m)) {
+            if (hit.front_face == 1u) {
+                current_medium = hit.mat;
+            } else {
+                current_medium = NO_MEDIUM;
+            }
+            ray.origin = hit.point + ray.dir * 1e-3;
+            // ray.dir unchanged; bounce counter does NOT advance
+            // along the BSDF-bounce axis — but the loop counter
+            // still ticks (so a runaway "stuck on a boundary" path
+            // can't spin forever).
+            continue;
+        }
 
         // PT-textures: sample the material's baseColorTexture (if any)
         // at the hit's interpolated UV. Falls back to `m.albedo` when
@@ -1025,19 +1295,26 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
 
         let wo_dir = -ray.dir;
 
-        // NEE — only in MIS+NEE mode.
+        // NEE — only in MIS+NEE mode. PT-fog routes through
+        // `shadow_transmittance`: the function returns full ones
+        // when no media intervene (so existing scenes stay
+        // identical) and accumulates `exp(-σ_t · t)` across any
+        // fog boundary crossings on the way to the light.
         if (mis_nee_mode) {
             let ls = sample_light(hit.point, s);
             if (ls.valid) {
                 let cos_surf = dot(hit.normal, ls.wi);
                 if (cos_surf > 0.0) {
                     let shadow_o = hit.point + hit.normal * 0.001;
-                    if (!occluded(shadow_o, ls.wi, ls.dist)) {
+                    let trans = shadow_transmittance(
+                        shadow_o, ls.wi, ls.dist, current_medium);
+                    let trans_sum = trans.x + trans.y + trans.z;
+                    if (trans_sum > 0.0) {
                         let f = eval_bsdf(m, albedo, hit.normal, wo_dir, ls.wi);
                         let bsdf_p = bsdf_pdf(m, hit.normal, wo_dir, ls.wi);
                         let wlight = power_heuristic(ls.pdf_w, bsdf_p);
                         result.radiance = result.radiance
-                            + throughput * f * cos_surf * ls.le * wlight / ls.pdf_w;
+                            + throughput * trans * f * cos_surf * ls.le * wlight / ls.pdf_w;
                     }
                 }
             }

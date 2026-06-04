@@ -19,6 +19,7 @@ const CORNELL_BUNNY: &[u8] = include_bytes!("../data/gltf/cornell_bunny.gltf");
 const CORNELL_METAL_BUNNY: &[u8] = include_bytes!("../data/gltf/cornell_metal_bunny.gltf");
 const CORNELL_GLASS_SPHERE: &[u8] = include_bytes!("../data/gltf/cornell_glass_sphere.gltf");
 const CORNELL_GLASS_BUNNY: &[u8] = include_bytes!("../data/gltf/cornell_glass_bunny.gltf");
+const CORNELL_FOGGY_ROOM: &[u8] = include_bytes!("../data/gltf/cornell_foggy_room.gltf");
 const CORNELL_TEXTURED_FLOOR: &[u8] =
     include_bytes!("../data/gltf/cornell_textured_floor.gltf");
 
@@ -160,6 +161,30 @@ fn cornell_glass_bunny_has_a_dielectric_with_non_zero_absorption() {
     let clay = load_glb_bytes(CORNELL_BUNNY).expect("load cornell_bunny.gltf");
     let any_absorbing = clay.materials.iter().any(|m| m.absorption.iter().any(|&c| c > 0.0));
     assert!(!any_absorbing, "cornell_bunny should be pure Lambertian");
+}
+
+#[test]
+fn cornell_foggy_room_has_a_pure_scattering_medium_volume() {
+    let scene = load_glb_bytes(CORNELL_FOGGY_ROOM).expect("load cornell_foggy_room.gltf");
+    let media: Vec<_> = scene
+        .materials
+        .iter()
+        .filter(|m| {
+            m.ior == 0.0
+                && m.emission.iter().all(|&e| e < 0.1)
+                && m.scattering.iter().any(|&c| c > 0.0)
+        })
+        .collect();
+    assert_eq!(media.len(), 1, "expected exactly one pure-scattering medium material");
+    let m = media[0];
+    // Scattering must dominate absorption — otherwise we'd see a
+    // dark Beer-Lambert effect instead of god-rays.
+    for c in 0..3 {
+        assert!(m.scattering[c] > m.absorption[c]);
+    }
+    // Fog volume mesh: 12 triangles (6 face × 2 tris) on top of the
+    // 12 room triangles (5 walls × 2 + light × 2 = 12). Total 24.
+    assert_eq!(scene.triangle_count(), 24);
 }
 
 #[test]

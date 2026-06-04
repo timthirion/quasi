@@ -21,3 +21,25 @@ pub fn attenuation(sigma_a: [f32; 3], t: f32) -> [f32; 3] {
         (-sigma_a[2] * t).exp(),
     ]
 }
+
+/// Sample a distance from an exponential medium with scalar
+/// extinction `sigma_t`. The pdf is `σ_t · exp(-σ_t · t)`, so
+/// `E[t] = 1 / σ_t` (the mean free path). Inverse-CDF of the
+/// exponential with `xi ∈ [0, 1)`.
+///
+/// Used in `pathtrace.wgsl`'s `sample_volume_distance` against a
+/// per-channel σ_t majorant (`max(σ_t.x, σ_t.y, σ_t.z)`); per-
+/// channel transmittance correction rides on the returned weight.
+pub fn sample_distance(sigma_t: f32, xi: f32) -> f32 {
+    let u = xi.clamp(0.0, 1.0 - 1e-7);
+    -(1.0 - u).ln() / sigma_t.max(1e-30)
+}
+
+/// Scalar extinction `σ_t = σ_a + σ_s`, per channel.
+pub fn extinction(sigma_a: [f32; 3], sigma_s: [f32; 3]) -> [f32; 3] {
+    [
+        sigma_a[0] + sigma_s[0],
+        sigma_a[1] + sigma_s[1],
+        sigma_a[2] + sigma_s[2],
+    ]
+}

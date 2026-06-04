@@ -58,6 +58,7 @@ fn main() {
         metallic: 0.0,
         ior: 0.0,
         absorption: [0.0, 0.0, 0.0],
+        scattering: [0.0, 0.0, 0.0],
     };
     let (sphere_positions, sphere_normals, sphere_indices) = icosphere(5, [0.0, 0.5, 0.0], 0.5);
     let bytes = build_gltf_with_extra_mesh(
@@ -105,6 +106,7 @@ fn main() {
         metallic: 0.0,
         ior: 0.0,
         absorption: [0.0, 0.0, 0.0],
+        scattering: [0.0, 0.0, 0.0],
     };
     let bytes = build_gltf_with_extra_mesh(
         &room_quads,
@@ -136,6 +138,7 @@ fn main() {
         metallic: 1.0,
         ior: 0.0,
         absorption: [0.0, 0.0, 0.0],
+        scattering: [0.0, 0.0, 0.0],
     };
     let bytes = build_gltf_with_extra_mesh(
         &room_quads,
@@ -170,6 +173,7 @@ fn main() {
         // 0.6) ≈ 0.49 → ~half the red light gets absorbed across the
         // body; tiny green absorption leaves the colour green-leaning.
         absorption: [1.2, 0.1, 1.5],
+        scattering: [0.0, 0.0, 0.0],
     };
     let bytes = build_gltf_with_extra_mesh(
         &room_quads,
@@ -203,6 +207,7 @@ fn main() {
         metallic: 0.0,
         ior: 1.5,
         absorption: [0.0, 0.0, 0.0],
+        scattering: [0.0, 0.0, 0.0],
     };
     let bytes = build_gltf_with_extra_mesh(
         &room_quads,
@@ -219,6 +224,57 @@ fn main() {
         path.display(),
         bytes.len(),
         room_quads.len() * 2 + sphere_indices.len() / 3,
+    );
+
+    // 5b) Cornell with a fog volume — the PT-fog publishable scene.
+    //     A 12-triangle axis-aligned box sized to fill most of the
+    //     room as the medium volume. ior = 0 so the BSDF dispatch
+    //     skips dielectric handling and the path tracer's medium-
+    //     boundary detection passes the ray through, only swapping
+    //     `current_medium`. Tuned for visible god-rays: small
+    //     absorption + moderate scattering so the path through the
+    //     volume is bright enough to see but shadowy enough that
+    //     the light cone reads as distinct rays.
+    let fog_mat = GpuMaterial {
+        albedo: [1.0, 1.0, 1.0],
+        roughness: 1.0,
+        emission: [0.0, 0.0, 0.0],
+        metallic: 0.0,
+        ior: 0.0,
+        // Thin fog. Mean free path ≈ 1/(σ_a + σ_s) = 1/0.21 ≈ 4.8
+        // units. Room is ~2 units across, so most rays cross
+        // unscattered — the visible scattering rides on top of an
+        // otherwise crisp Cornell render and reads as a god-ray
+        // glow around the ceiling light.
+        absorption: [0.01, 0.01, 0.01],
+        scattering: [0.2, 0.2, 0.2],
+    };
+    // Sized inside the Cornell room (interior is x∈[-1,1], y∈[0,2],
+    // z∈[-1,1]). Pulled in by a hair to avoid coincident-surface
+    // ambiguities with the floor / walls; the top is pulled WELL
+    // below the ceiling light at y=1.99 so the air gap around the
+    // light lets god-rays read cleanly (a coincident fog-top /
+    // light-tile is geometrically degenerate — shadow rays
+    // intermittently miss the light if they overlap exactly).
+    let (fog_positions, fog_normals, fog_indices) = aabb_box(
+        [-0.99, 0.01, -0.99],
+        [0.99, 1.7, 0.99],
+    );
+    let bytes = build_gltf_with_extra_mesh(
+        &room_quads,
+        &room_materials,
+        &fog_positions,
+        &fog_normals,
+        &fog_indices,
+        fog_mat,
+    );
+    let path = out_dir.join("cornell_foggy_room.gltf");
+    fs::write(&path, &bytes).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    println!(
+        "wrote {} ({} bytes, room + fog volume → {} triangles)",
+        path.display(),
+        bytes.len(),
+        room_quads.len() * 2 + fog_indices.len() / 3,
     );
 
     // 6) Cornell with a textured floor — the PT-textures publishable
@@ -387,6 +443,48 @@ fn triangulate(
 /// Vertex count: `10 * 4^level + 2`. Triangle count: `20 * 4^level`.
 /// Level 5 = 10,242 vertices / 20,480 triangles — bunny territory
 /// without an external download.
+/// Closed axis-aligned box as 8 vertices + 36 indices. Outward-
+/// facing winding so the normals point away from the interior — the
+/// path tracer's `record_hit` uses geometric-normal-versus-ray to
+/// distinguish front/back faces, which is how PT-fog's medium-
+/// boundary detection picks up the "we're inside / we're outside"
+/// transition.
+fn aabb_box(min: [f32; 3], max: [f32; 3]) -> (Vec<[f32; 3]>, Vec<[f32; 3]>, Vec<u32>) {
+    let p = [
+        [min[0], min[1], min[2]], // 0: ---
+        [max[0], min[1], min[2]], // 1: +--
+        [max[0], max[1], min[2]], // 2: ++-
+        [min[0], max[1], min[2]], // 3: -+-
+        [min[0], min[1], max[2]], // 4: --+
+        [max[0], min[1], max[2]], // 5: +-+
+        [max[0], max[1], max[2]], // 6: +++
+        [min[0], max[1], max[2]], // 7: -++
+    ];
+    // Each face's two triangles. CCW from the outside.
+    let tris: Vec<u32> = vec![
+        // -x face (left), normal = -x. Outward order: 0, 3, 7, 4.
+        0, 3, 7,  0, 7, 4,
+        // +x face (right), normal = +x. Outward order: 1, 5, 6, 2.
+        1, 5, 6,  1, 6, 2,
+        // -y face (bottom). Outward order: 0, 4, 5, 1.
+        0, 4, 5,  0, 5, 1,
+        // +y face (top). Outward order: 3, 2, 6, 7.
+        3, 2, 6,  3, 6, 7,
+        // -z face (back). Outward order: 0, 1, 2, 3.
+        0, 1, 2,  0, 2, 3,
+        // +z face (front). Outward order: 4, 7, 6, 5.
+        4, 7, 6,  4, 6, 5,
+    ];
+    let positions: Vec<[f32; 3]> = p.to_vec();
+    // Flat normals don't matter for a medium-volume boundary (the
+    // path tracer reads only the geometric normal in
+    // `is_medium_volume_material`), but emit_gltf still wants per-
+    // vertex normals. Use a constant up-normal as a placeholder; the
+    // BSDF dispatch never reads it for medium-volume materials.
+    let normals: Vec<[f32; 3]> = positions.iter().map(|_| [0.0, 1.0, 0.0]).collect();
+    (positions, normals, tris)
+}
+
 fn icosphere(
     level: usize,
     center: [f32; 3],
@@ -639,6 +737,7 @@ fn build_cornell_textured_floor() -> Vec<u8> {
         metallic: 0.0,
         ior: 0.0,
         absorption: [0.0, 0.0, 0.0],
+        scattering: [0.0, 0.0, 0.0],
     });
     // Quad 0 is the floor (per `cornell_box`); rebind it to the new
     // textured material.
@@ -779,23 +878,34 @@ fn emit_gltf(
                 Some(idx) => format!(r#","baseColorTexture":{{"index":{idx}}}"#),
                 None => String::new(),
             };
-            // PT-dielectrics + PT-beer-lambert: non-standard material
-            // fields ride in `extras` rather than per-extension
-            // feature gates on the gltf crate. Only emitted when at
-            // least one is non-default so existing scenes' on-disk
-            // JSON stays byte-stable.
-            let extras = match (m.ior > 0.0, m.absorption.iter().any(|&c| c > 0.0)) {
-                (false, false) => String::new(),
-                (true, false) => format!(r#","extras":{{"ior":{ior}}}"#, ior = m.ior),
-                (false, true) => format!(
-                    r#","extras":{{"absorption":[{r},{g},{b}]}}"#,
-                    r = m.absorption[0], g = m.absorption[1], b = m.absorption[2],
-                ),
-                (true, true) => format!(
-                    r#","extras":{{"ior":{ior},"absorption":[{r},{g},{b}]}}"#,
-                    ior = m.ior,
-                    r = m.absorption[0], g = m.absorption[1], b = m.absorption[2],
-                ),
+            // PT-dielectrics / PT-beer-lambert / PT-fog: non-standard
+            // material fields ride in `extras` rather than per-
+            // extension feature gates on the gltf crate. We collect
+            // the non-default pieces and stitch them together. The
+            // `match` style got noisy with three optional fields, so
+            // we drop down to a builder. When all three are zero the
+            // section stays empty and the on-disk JSON is byte-stable
+            // with what PT-dielectrics shipped.
+            let mut extras_parts: Vec<String> = Vec::new();
+            if m.ior > 0.0 {
+                extras_parts.push(format!(r#""ior":{}"#, m.ior));
+            }
+            if m.absorption.iter().any(|&c| c > 0.0) {
+                extras_parts.push(format!(
+                    r#""absorption":[{},{},{}]"#,
+                    m.absorption[0], m.absorption[1], m.absorption[2],
+                ));
+            }
+            if m.scattering.iter().any(|&c| c > 0.0) {
+                extras_parts.push(format!(
+                    r#""scattering":[{},{},{}]"#,
+                    m.scattering[0], m.scattering[1], m.scattering[2],
+                ));
+            }
+            let extras = if extras_parts.is_empty() {
+                String::new()
+            } else {
+                format!(r#","extras":{{{}}}"#, extras_parts.join(","))
             };
             format!(
                 r#"{{"name":"{name}","pbrMetallicRoughness":{{"baseColorFactor":[{ar},{ag},{ab},1.0],"metallicFactor":{met},"roughnessFactor":{rough}{tex}}},"emissiveFactor":[{er},{eg},{eb}]{extras}}}"#,

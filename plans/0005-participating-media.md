@@ -1,8 +1,8 @@
 # Participating media (path tracer)
 
-- **Status:** active
+- **Status:** done
 - **Last updated:** 2026-06-04
-- **Last touched on:** PT-beer-lambert landed
+- **Last touched on:** PT-fog landed — plan closed
 
 ## Goal
 
@@ -131,27 +131,63 @@ so the BSDF-then-emission walk carries the visibility — NEE never
 fires on a hit *inside* glass. PT-fog will need shadow attenuation
 across volumes.
 
-### PT-fog
+### PT-fog ✅
 Homogeneous medium volume with isotropic single scattering. The
 god-rays Cornell room is the visual.
 
-- [ ] Distance-sampling: `t_scatter = -ln(ξ) / σ_t` where
-      `σ_t = σ_a + σ_s`. If `t_scatter` falls short of the next
-      surface hit, scatter event; else just attenuate the segment.
-- [ ] Isotropic phase function (uniform sphere sample). Wire HG up
-      too if the headline render benefits from it (cap as a stretch
-      goal).
-- [ ] NEE through the medium: shadow ray attenuates by
-      `exp(-σ_t · t_shadow)`.
-- [ ] Mark the medium volume via a closed mesh whose material has
-      `absorption > 0` AND `scatter > 0` AND `ior == 0` (no
-      dielectric → not a surface, just a boundary).
-- [ ] New test scene: `cornell_foggy_room.gltf` — a thin axis-
-      aligned box covering the lower half of the Cornell room as
-      the fog volume.
-- [ ] Tests: NEE shadow-ray attenuation matches the analytic
-      formula; distance-sampling inverse-CDF matches expected
-      mean free path under Monte Carlo.
+- [x] `Material` gains `scattering: vec3<f32>` + f32 pad → 80-byte
+      stride. Layout test pins offset 64.
+- [x] Distance-sampling in `sample_volume_distance`: inverse-CDF of
+      `Exp(σ_t_majorant)` where the majorant is the *max* of the
+      vector extinction. Returns either a scattering event with
+      weight `σ_s · trans / pdf`, or a no-scatter pass-through
+      weight `trans / pdf` (per-channel correction for the scalar
+      sampling pdf).
+- [x] Pure-absorption media (PT-beer-lambert's glass bunny) keep
+      the closed-form deterministic Beer-Lambert step — sampling
+      would converge to the same expectation but with vastly
+      higher variance (scatter samples are zero-weight δ-spikes
+      that terminate the path).
+- [x] Isotropic phase function `uniform_sphere_sample` (uniform
+      on the unit sphere; pdf = 1 / (4π) constant). HG deferred —
+      the current scene's god-rays read cleanly without it.
+- [x] NEE through the medium via `shadow_transmittance`, capped
+      at `SHADOW_BOUNCE_CAP = 6` boundary crossings. Walks the
+      shadow ray through medium-volume boundaries while
+      accumulating `exp(-σ_t · t)` per segment; opaque hits return
+      0; emissive hits return the accumulated transmittance.
+      Applied to both surface NEE and volume-scatter NEE — when no
+      media intervene the function returns `vec3(1.0)` so existing
+      scenes stay byte-identical.
+- [x] Medium-volume boundary detection: a material with
+      `ior == 0` AND `(σ_a + σ_s) > 0` is treated as a volume
+      boundary. The path tracer passes the ray straight through,
+      toggling `current_medium` based on `Hit::front_face` —
+      surface BSDF is skipped.
+- [x] New test scene: `cornell_foggy_room.gltf` — a 12-triangle
+      axis-aligned box (added `aabb_box` helper to gen_cornell)
+      sized to fill the room from `y=0.01` to `y=1.7` so an air
+      gap remains around the ceiling light. Fog material:
+      `σ_a = 0.01`, `σ_s = 0.2` (thin enough to see through, dense
+      enough to scatter visibly). Reference render at
+      512² / 1024 spp is
+      `data/output/cornell_foggy_room_reference.png`. Shows clear
+      god-rays as a bright fan descending from the ceiling light
+      through the fog.
+- [x] Tests: `medium::sample_distance` round-trips through the
+      analytic identities (xi=0 → t=0; xi=0.5 → ln(2)/σ_t;
+      Monte-Carlo mean → 1/σ_t within 3%). Naga validates the
+      shader. Existing scenes (Cornell quads, glass bunny, glass
+      sphere, metal bunny, textured floor) all render unchanged.
+
+**Why the fog-top-equals-light-y bug bit us.** The first foggy
+scene had the fog box top at y=1.99 — exactly where the ceiling
+light tile sits. Coincident triangles cause `trace_scene` to
+return either the light or the fog top non-deterministically; the
+shadow ray from the ceiling could miss the light through the fog
+boundary, dropping NEE radiance and leaving the ceiling around the
+light reading as black. Moving the fog top to y=1.7 cleared up the
+god-rays immediately.
 
 ## Open questions
 

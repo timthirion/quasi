@@ -80,3 +80,59 @@ fn one_unit_slab_matches_classic_beer_lambert_reading() {
     let want = [(-0.5_f32).exp(), (-1.0_f32).exp(), (-2.0_f32).exp()];
     assert!(approx_eq3(a, want, 1e-6), "got {a:?}, want {want:?}");
 }
+
+#[test]
+fn sample_distance_at_xi_zero_returns_zero() {
+    let t = medium::sample_distance(1.5, 0.0);
+    assert!(t.abs() < 1e-6, "xi=0 should map to t=0; got {t}");
+}
+
+#[test]
+fn sample_distance_at_xi_half_matches_log_two_over_sigma_t() {
+    // Inverse-CDF of Exp(σ_t) at xi = 0.5 is `ln(2) / σ_t`.
+    for &sigma_t in &[0.25_f32, 1.0, 4.0] {
+        let t = medium::sample_distance(sigma_t, 0.5);
+        let want = std::f32::consts::LN_2 / sigma_t;
+        assert!(
+            (t - want).abs() < 1e-5,
+            "ξ=0.5, σ_t={sigma_t}: got {t}, want {want}",
+        );
+    }
+}
+
+#[test]
+fn sample_distance_monte_carlo_mean_matches_one_over_sigma_t() {
+    // E[t] under Exp(σ_t) is 1 / σ_t. Estimate over many samples.
+    let g = 1.32471795724474602596_f64;
+    let a1 = (1.0 / g) as f32;
+
+    for &sigma_t in &[0.4_f32, 1.5, 3.0] {
+        let n = 200_000_u32;
+        let mut acc = 0.0_f64;
+        for i in 0..n {
+            let xi = (0.5 + a1 * i as f32).fract();
+            let t = medium::sample_distance(sigma_t, xi);
+            acc += t as f64;
+        }
+        let mean = (acc / n as f64) as f32;
+        let want = 1.0_f32 / sigma_t;
+        let rel_err = ((mean - want) / want).abs();
+        // 3% tolerance: 1-D Kronecker sequence is reasonable but not
+        // perfect for exponential heavy-tail estimation; finer
+        // bounds would need a much larger N for the smaller σ_t
+        // values, which makes the test annoyingly slow.
+        assert!(
+            rel_err < 0.03,
+            "MC mean should match 1/σ_t (σ_t={sigma_t}): got {mean}, want {want}",
+        );
+    }
+}
+
+#[test]
+fn extinction_is_componentwise_sum() {
+    let sigma_a = [0.1_f32, 0.5, 1.2];
+    let sigma_s = [0.3_f32, 0.2, 0.6];
+    let want = [0.4_f32, 0.7, 1.8];
+    let got = medium::extinction(sigma_a, sigma_s);
+    assert!(approx_eq3(got, want, 1e-6), "got {got:?}, want {want:?}");
+}

@@ -77,11 +77,12 @@ pub const NO_TEXTURE: u32 = u32::MAX;
 ///   - `metallic > 0.5`        → GGX conductor
 ///   - else                    → Lambertian
 ///
-/// `absorption` (PT-beer-lambert) is the per-channel Beer-Lambert
-/// coefficient applied to throughput per unit of distance travelled
-/// *inside* this material. Sentinel `(0, 0, 0)` means "no
-/// participating-media tinting" — a dielectric with zero absorption
-/// renders as clear glass.
+/// `absorption` + `scattering` (PT-beer-lambert / PT-fog) are the
+/// per-channel volume coefficients applied to throughput when the ray
+/// travels *inside* this material. Sentinels `(0, 0, 0)` for both
+/// mean "no participating-media" (a dielectric with both zero renders
+/// as clear glass). The extinction coefficient is the sum of the two
+/// (`σ_t = σ_a + σ_s`); the scattering albedo is `σ_s / σ_t`.
 ///
 /// std430 layout (4-byte scalars need no extra padding):
 ///   albedo:                    vec3 + scalar → 16 bytes
@@ -90,7 +91,8 @@ pub const NO_TEXTURE: u32 = u32::MAX;
 ///   ior:                       f32 +
 ///   _pad:                      2 × u32       → 16 bytes
 ///   absorption:                vec3 + f32 pad → 16 bytes
-///   total: 64 bytes.
+///   scattering:                vec3 + f32 pad → 16 bytes
+///   total: 80 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable, PartialEq)]
 pub struct Material {
@@ -112,6 +114,11 @@ pub struct Material {
     /// travelled *inside* a medium volume.
     pub absorption: [f32; 3],
     pub _pad_absorption: f32,
+    /// Per-channel scattering coefficient. When non-zero, a path
+    /// inside the medium may *scatter* (change direction) before
+    /// hitting a surface. PT-fog uses an isotropic phase function.
+    pub scattering: [f32; 3],
+    pub _pad_scattering: f32,
 }
 
 impl Default for Material {
@@ -132,6 +139,8 @@ impl Default for Material {
             _pad: [0; 2],
             absorption: [0.0, 0.0, 0.0],
             _pad_absorption: 0.0,
+            scattering: [0.0, 0.0, 0.0],
+            _pad_scattering: 0.0,
         }
     }
 }
@@ -446,6 +455,8 @@ fn extract_material(material: &gltf::Material, texture_remap: &[u32]) -> Materia
         _pad: [0; 2],
         absorption: extras.absorption,
         _pad_absorption: 0.0,
+        scattering: extras.scattering,
+        _pad_scattering: 0.0,
     }
 }
 
@@ -455,6 +466,8 @@ struct MaterialExtras {
     ior: f32,
     #[serde(default)]
     absorption: [f32; 3],
+    #[serde(default)]
+    scattering: [f32; 3],
 }
 
 fn walk_node(
@@ -572,20 +585,19 @@ mod tests {
     }
 
     #[test]
-    fn material_is_64_bytes_with_absorption_at_48() {
-        // PT-textures grew the Material from 32 bytes (albedo + roughness +
-        // emission + metallic) to 48 bytes (+ base_color_texture_idx + pad).
-        // PT-dielectrics packs `ior` into the first slot of that pad,
-        // keeping the total stride at 48 bytes. PT-beer-lambert appends
-        // `absorption: vec3` (needs a 16-byte aligned slot, so the
-        // struct bumps to 64 bytes).
-        assert_eq!(std::mem::size_of::<Material>(), 64);
+    fn material_is_80_bytes_with_volume_fields_at_48_and_64() {
+        // PT-textures: 48 bytes (added base_color_texture_idx + pad).
+        // PT-dielectrics: still 48 (packed `ior` into the pad).
+        // PT-beer-lambert: 64 (appended absorption: vec3 + pad).
+        // PT-fog: 80 (appended scattering: vec3 + pad).
+        assert_eq!(std::mem::size_of::<Material>(), 80);
         assert_eq!(
             std::mem::offset_of!(Material, base_color_texture_idx),
             32,
         );
         assert_eq!(std::mem::offset_of!(Material, ior), 36);
         assert_eq!(std::mem::offset_of!(Material, absorption), 48);
+        assert_eq!(std::mem::offset_of!(Material, scattering), 64);
     }
 
     // ---- Material ----
