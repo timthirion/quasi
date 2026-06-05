@@ -25,6 +25,7 @@ pub mod bvh;
 pub mod cloud;
 pub mod dielectric;
 pub mod ggx;
+pub mod grid;
 pub mod integrator;
 pub mod medium;
 pub mod phase;
@@ -138,6 +139,8 @@ pub struct State {
     _bvh_tri_indices_buf: wgpu::Buffer,
     _textures: wgpu::Texture,
     _sampler: wgpu::Sampler,
+    _cloud_grid: wgpu::Texture,
+    _cloud_grid_sampler: wgpu::Sampler,
 
     targets: Targets,
 
@@ -307,6 +310,25 @@ pub(crate) fn build_pathtrace_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayou
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            // PT-vdb: 3-D density texture + clamp-to-edge linear sampler.
+            // `R8Unorm` so the trilinear sample lands in `[0, 1]` directly.
+            // Empty scenes get a 1×1×1 zero texture as fallback.
+            wgpu::BindGroupLayoutEntry {
+                binding: 10,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D3,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 11,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
         ],
     })
 }
@@ -329,6 +351,11 @@ pub(crate) struct SceneBuffers {
     pub textures: wgpu::Texture,
     pub textures_view: wgpu::TextureView,
     pub sampler: wgpu::Sampler,
+    /// PT-vdb: 3-D density texture for cloud volumes. Always present;
+    /// a 1×1×1 zero texture stands in when no cloud grid is loaded.
+    pub cloud_grid: wgpu::Texture,
+    pub cloud_grid_view: wgpu::TextureView,
+    pub cloud_grid_sampler: wgpu::Sampler,
 }
 
 fn make_storage_buffer(
@@ -407,6 +434,7 @@ pub(crate) fn build_scene_buffers(
         "bvh-tri-indices",
     );
     let (textures, textures_view, sampler) = build_texture_array(device, queue, &scene_data.textures);
+    let (cloud_grid, cloud_grid_view, cloud_grid_sampler) = build_cloud_grid_texture(device, queue);
     SceneBuffers {
         uniform,
         vertex,
@@ -419,7 +447,79 @@ pub(crate) fn build_scene_buffers(
         textures,
         textures_view,
         sampler,
+        cloud_grid,
+        cloud_grid_view,
+        cloud_grid_sampler,
     }
+}
+
+/// Embeds the procedural-cumulus `.qvg` so every scene boots with a
+/// usable density grid. The PT-vdb-ingest follow-up will swap this
+/// for an asset-loader path that takes the grid file from the scene
+/// description rather than the binary.
+const CUMULUS_QVG: &[u8] = include_bytes!("../data/grids/cumulus_64.qvg");
+
+fn build_cloud_grid_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> (wgpu::Texture, wgpu::TextureView, wgpu::Sampler) {
+    // Decode the embedded `.qvg`. On unexpected failure, fall back to
+    // a 1×1×1 zero grid so the bind group still validates.
+    let mut cursor = std::io::Cursor::new(CUMULUS_QVG);
+    let grid = crate::pathtrace::grid::Grid3D::load(&mut cursor).unwrap_or_else(|e| {
+        log::warn!("PT-vdb: cumulus_64.qvg failed to load ({e}); using empty grid");
+        crate::pathtrace::grid::Grid3D::new([1, 1, 1], [0.0; 3], [1.0; 3])
+    });
+    let [w, h, d] = grid.dims;
+    let size = wgpu::Extent3d {
+        width: w,
+        height: h,
+        depth_or_array_layers: d,
+    };
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("pathtrace-cloud-grid"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        // R8Unorm is filterable AND linear-encoded — density is a
+        // physical quantity, not gamma. R8UnormSrgb would silently
+        // gamma-decode the voxels and ruin transmittance.
+        dimension: wgpu::TextureDimension::D3,
+        format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &grid.voxels,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(w),
+            rows_per_image: Some(h),
+        },
+        size,
+    );
+    let view = tex.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("pathtrace-cloud-grid-view"),
+        dimension: Some(wgpu::TextureViewDimension::D3),
+        ..Default::default()
+    });
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("pathtrace-cloud-grid-sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
+    });
+    (tex, view, sampler)
 }
 
 /// Builds the path-tracer's base-color texture array + sampler.
@@ -585,6 +685,14 @@ pub(crate) fn build_pathtrace_bg(
             wgpu::BindGroupEntry {
                 binding: 9,
                 resource: wgpu::BindingResource::Sampler(&buffers.sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: wgpu::BindingResource::TextureView(&buffers.cloud_grid_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 11,
+                resource: wgpu::BindingResource::Sampler(&buffers.cloud_grid_sampler),
             },
         ],
     })
@@ -791,6 +899,9 @@ impl State {
             textures: textures_tex,
             textures_view: _,
             sampler: sampler_obj,
+            cloud_grid: cloud_grid_tex,
+            cloud_grid_view: _,
+            cloud_grid_sampler: cloud_grid_sampler_obj,
         } = scene_buffers;
 
         let accum_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -831,6 +942,8 @@ impl State {
             _bvh_tri_indices_buf: bvh_tri_indices_buf,
             _textures: textures_tex,
             _sampler: sampler_obj,
+            _cloud_grid: cloud_grid_tex,
+            _cloud_grid_sampler: cloud_grid_sampler_obj,
             targets,
             uniforms,
             camera: OrbitCamera::new(),

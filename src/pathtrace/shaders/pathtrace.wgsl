@@ -129,6 +129,10 @@ struct BvhNode {
 // sampler. Layer indices come from `Material::base_color_texture_idx`.
 @group(0) @binding(8) var albedo_textures: texture_2d_array<f32>;
 @group(0) @binding(9) var albedo_sampler: sampler;
+// PT-vdb: 3-D density grid + clamp-to-edge linear sampler. R8Unorm
+// so the trilinear sample is already in [0, 1].
+@group(0) @binding(10) var cloud_grid: texture_3d<f32>;
+@group(0) @binding(11) var cloud_grid_sampler: sampler;
 
 struct VsOut {
     @builtin(position) position: vec4<f32>,
@@ -949,19 +953,22 @@ fn cloud_fbm(pos: vec3<f32>) -> f32 {
 // edge falloff toward the noise-modulated interior. Bounded in
 // `[0, ~1.3]` (the noise term is in `[0, ~1]` after threshold +
 // gain, edge falloff in `[0, 1]`).
+// PT-vdb: world-space density via the baked `.qvg` grid texture.
+// The grid was baked in `[-radius, +radius]³` around the origin;
+// remap world-space into normalised `[0, 1]³` using the material's
+// `cloud_center` + `cloud_radius` AABB. Outside the cube → 0
+// (also enforced upstream by the sphere-clip in delta + ratio
+// tracking).
 fn cloud_density(pos: vec3<f32>, center: vec3<f32>, radius: f32) -> f32 {
-    let offset = pos - center;
-    let r = length(offset) / max(radius, 1e-6);
-    if (r >= 1.0) {
+    let half = vec3<f32>(radius);
+    let lo = center - half;
+    let hi = center + half;
+    let span = hi - lo;
+    let uvw = (pos - lo) / span;
+    if (any(uvw < vec3<f32>(0.0)) || any(uvw > vec3<f32>(1.0))) {
         return 0.0;
     }
-    // Edge falloff: smoothly ramps from 0 at the sphere surface to 1
-    // at half-radius and inwards. Keeps the cloud from having a
-    // hard-cut boundary.
-    let edge = smoothstep(1.0, 0.5, r);
-    let noise = cloud_fbm(pos * CLOUD_NOISE_FREQ);
-    let body = max(0.0, (noise - CLOUD_NOISE_THRESHOLD) * CLOUD_NOISE_GAIN);
-    return edge * body;
+    return textureSampleLevel(cloud_grid, cloud_grid_sampler, uvw, 0.0).r;
 }
 
 // Analytic ray-sphere intersection used to clip volume tracking to
