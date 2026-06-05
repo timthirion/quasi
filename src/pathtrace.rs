@@ -34,6 +34,9 @@ pub mod sampler;
 pub mod scene;
 
 #[cfg(not(target_arch = "wasm32"))]
+pub mod env;
+
+#[cfg(not(target_arch = "wasm32"))]
 pub mod converge;
 
 #[cfg(not(target_arch = "wasm32"))]
