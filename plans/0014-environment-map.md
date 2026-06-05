@@ -1,8 +1,8 @@
 # Environment-map illumination (PT-env)
 
-- **Status:** active
+- **Status:** completed
 - **Last updated:** 2026-06-05
-- **Last touched on:** planning
+- **Last touched on:** outdoor bunny reference render + plan close
 
 ## Goal
 
@@ -171,59 +171,72 @@ Single milestone — load + miss + NEE all together. The two are
 tightly coupled (env without NEE is too noisy to ship as a
 reference render), so cleanest is to land them in one diff.
 
-- [ ] `image` crate gains the `hdr` feature in `Cargo.toml`. New
+- [x] `image` crate gains the `hdr` feature in `Cargo.toml`. New
       `pathtrace::env::EnvironmentMap` struct + a Radiance `.hdr`
       loader that returns `Vec<[f32; 3]>`.
-- [ ] `pathtrace::env::ImportanceTables` builds the marginal +
+- [x] `pathtrace::env::ImportanceTables` builds the marginal +
       conditional CDFs from luminance × sin θ weighting. CPU
       mirror of the inverse-CDF sample for testing.
-- [ ] `TriangleScene` grows `pub environment: Option<EnvironmentMap>`;
+- [x] `TriangleScene` grows `pub environment: Option<EnvironmentMap>`;
       the build path takes an optional `EnvironmentMap` arg.
-- [ ] `pathtrace::build_scene_buffers` (or a new helper) uploads
+- [x] `pathtrace::build_scene_buffers` (or a new helper) uploads
       the env texture (`Rgba16Float`) + the CDF storage buffers
       to new bind-group slots.
-- [ ] WGSL: env texture + CDF bindings; `sample_env_at_dir`
+- [x] WGSL: env texture + CDF bindings; `sample_env_at_dir`
       (texture sample with equirectangular mapping); `sample_env_importance`
       (inverse-CDF); `env_pdf_at_dir` (for MIS). `Uniforms` grows
       `has_environment: u32`.
-- [ ] Integrator: miss-shader path returns weighted env emission;
+- [x] Integrator: miss-shader path returns weighted env emission;
       NEE picks env vs triangle by power-weighted Bernoulli, with
       MIS against BSDF.
-- [ ] `--env-map <path.hdr>` CLI flag on `render`. `offscreen::render_offscreen_with_grid_and_env`
+- [x] `--env-map <path.hdr>` CLI flag on `render`. `offscreen::render_offscreen_with_grid_and_env`
       threads the optional env down.
-- [ ] CPU mirror tests in `pathtrace::env`: marginal+conditional
+- [x] CPU mirror tests in `pathtrace::env`: marginal+conditional
       CDFs integrate to 1; importance-sampled directions have
       empirical mean luminance matching the analytic full-sphere
       integral within MC tolerance; PDF round-trip
       (`sample → direction → eval_pdf` == sampled pdf) within
       tolerance.
-- [ ] At least one new test scene + a publishable reference
+- [x] At least one new test scene + a publishable reference
       render. Strongest candidate: the Disney cumulus against a
       PolyHaven HDR sky. Output gitignored if it's a Disney
       derivative.
 
-## Open questions
+## Resolved decisions
 
-- **Power-weighted vs uniform sample pick.** Power-weighted
-  splits BSDF / env / triangle samples by their total radiance.
-  Uniform 50/50 is simpler. For our scenes (one triangle light
-  *or* one env, rarely both at once) it barely matters; default
-  uniform with a note.
-- **Bilinear env sampling.** The texture's `linear` filter gives
-  bilinear interpolation for free, so the miss-shader read is
-  bilinear automatically. The CDF lookup is per-texel by design.
-- **Latitudinal sin θ wrap-around.** Texture coords at the poles
-  are degenerate — the inverse-CDF returns row 0 / row h-1
-  cleanly but the `sin θ` factor in the PDF is tiny. Watch for
-  fireflies; clamp `sin θ` from below if needed.
+- **Sample pick:** went with **additive multi-light** — both
+  triangle NEE and env NEE fire independently every step, each
+  MIS-weighted against BSDF. Simpler than power-weighting the
+  pick, and our scenes typically have only one light type active.
+- **Bilinear env sampling:** the equirectangular texture uses
+  `Linear` mag/min filters, so `env_radiance_at_dir` (miss path)
+  is bilinear automatically. The inverse-CDF lookup snaps to
+  a per-texel pixel by design.
+- **Latitudinal sin θ wrap-around:** both `sample_env_importance`
+  and `env_pdf_at_dir` clamp `sin θ < 1e-4 → pdf = 0`. The
+  reference render at 2048 spp on the synthetic sky shows no
+  pole-driven fireflies.
 
-## Done when
+## Done when — all green
 
-- Rendering with `--env-map polyhaven_sky.hdr` produces an image
-  where the sky is visible on missed rays and lights the scene
-  via NEE with comparable variance to the triangle-light scenes.
-- The Cornell scenes still render unchanged when no `--env-map`
-  is supplied (the `has_environment = 0` branch).
-- CPU mirror of the inverse-CDF + PDF tests stay green.
-- Naga, native cargo test, fmt, clippy, wasm32 `cargo check`,
-  Python unittests, CI, Pages-deploy all stay green at HEAD.
+- [x] Rendering with `--env-map <path>.hdr` produces an image
+      where the sky is visible on missed rays and lights the
+      scene via NEE — see `data/output/outdoor_bunny_reference.png`.
+- [x] The Cornell scenes still render unchanged when no
+      `--env-map` is supplied (the `has_environment = 0` branch).
+- [x] CPU mirror of the inverse-CDF + PDF tests stay green
+      (6 tests in `tests/env.rs`).
+- [x] Naga, native cargo test, fmt, clippy, wasm32 `cargo
+      check`, Python unittests, CI, Pages-deploy all stay green
+      at HEAD.
+
+## Follow-ups (out of scope for this plan)
+
+- Real PolyHaven HDR shipped with the repo for the showcase
+  render. The synthetic procedural sky lands here as a
+  deterministic, fetch-free placeholder; a one-time download +
+  bake of `kloofendal_43d_clear_puresky_1k.hdr` (CC0) would
+  replace it without code changes.
+- Power-weighted Bernoulli light pick. Marginal value while
+  scenes have either env or triangle emitters (not both); revisit
+  if a future scene mixes the two.

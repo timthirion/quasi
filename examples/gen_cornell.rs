@@ -385,6 +385,26 @@ fn main() {
         bytes.len(),
         floor_only_quads.len() * 2 + bunny_indices.len() / 3,
     );
+
+    // 8) Outdoor cumulus — the PT-env × PT-cloud crossover showcase.
+    //    Just the cumulus AABB with the cloud material, sitting on
+    //    the floor. All lighting comes from the env dome.
+    let bytes = build_gltf_with_extra_mesh(
+        &floor_only_quads,
+        &floor_only_materials,
+        &cloud_positions,
+        &cloud_normals,
+        &cloud_indices,
+        cloud_mat,
+    );
+    let path = out_dir.join("outdoor_cumulus.gltf");
+    fs::write(&path, &bytes).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    println!(
+        "wrote {} ({} bytes, floor + procedural cloud → {} triangles)",
+        path.display(),
+        bytes.len(),
+        floor_only_quads.len() * 2 + cloud_indices.len() / 3,
+    );
 }
 
 // ---------------------------------------------------------------------------

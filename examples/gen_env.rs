@@ -32,9 +32,9 @@ fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
 fn synth_sky(width: u32, height: u32) -> Vec<Rgb<f32>> {
     let mut out = Vec::with_capacity((width * height) as usize);
 
-    let horizon = [1.10_f32, 0.95, 0.75];
-    let zenith = [0.30_f32, 0.45, 0.85];
-    let ground = [0.18_f32, 0.13, 0.08];
+    let horizon = [1.40_f32, 1.15, 0.85];
+    let zenith = [0.35_f32, 0.55, 1.00];
+    let ground = [0.22_f32, 0.16, 0.10];
 
     let sun_dir = {
         let theta = 35.0_f32.to_radians();
@@ -42,8 +42,13 @@ fn synth_sky(width: u32, height: u32) -> Vec<Rgb<f32>> {
         let st = theta.sin();
         [st * phi.cos(), theta.cos(), st * phi.sin()]
     };
-    let sun_radiance = [200.0_f32, 190.0, 160.0];
-    let sun_cos_threshold = 0.997; // half-angle ≈ 4.4°
+    // Soft halo around a small bright core. Brighter than the sky but
+    // tamed enough that single env samples hitting the sun don't
+    // dominate a tile with fireflies at low spp.
+    let sun_radiance = [40.0_f32, 38.0, 32.0];
+    let sun_halo_radiance = [8.0_f32, 7.5, 6.5];
+    let sun_cos_threshold = 0.9995; // core: half-angle ≈ 1.8°
+    let sun_halo_threshold = 0.985; // halo: half-angle ≈ 9.9°
 
     for y in 0..height {
         let v = (y as f32 + 0.5) / height as f32;
@@ -65,6 +70,10 @@ fn synth_sky(width: u32, height: u32) -> Vec<Rgb<f32>> {
             let cos_sun = dir[0] * sun_dir[0] + dir[1] * sun_dir[1] + dir[2] * sun_dir[2];
             if cos_sun > sun_cos_threshold {
                 rgb = sun_radiance;
+            } else if cos_sun > sun_halo_threshold {
+                let t = (cos_sun - sun_halo_threshold)
+                    / (sun_cos_threshold - sun_halo_threshold);
+                rgb = lerp3(rgb, sun_halo_radiance, t);
             }
 
             out.push(Rgb(rgb));
