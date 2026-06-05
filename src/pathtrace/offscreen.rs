@@ -133,7 +133,7 @@ fn create_aov_texture(
 /// the accumulated AOVs. Blocks the calling thread (intended for use
 /// from a CLI render command).
 pub fn render_offscreen(cfg: RenderConfig, scene: &TriangleScene) -> Aovs {
-    pollster::block_on(render_offscreen_async(cfg, scene, None))
+    pollster::block_on(render_offscreen_async(cfg, scene, None, None))
 }
 
 /// Same as [`render_offscreen`], but with a runtime-loaded cloud
@@ -143,13 +143,26 @@ pub fn render_offscreen_with_grid(
     scene: &TriangleScene,
     cloud_grid: Option<crate::pathtrace::grid::Grid3D>,
 ) -> Aovs {
-    pollster::block_on(render_offscreen_async(cfg, scene, cloud_grid))
+    pollster::block_on(render_offscreen_async(cfg, scene, cloud_grid, None))
+}
+
+/// Full offscreen entry: optional cloud grid + optional environment
+/// map. `render --env-map PATH` routes here so the HDR env contributes
+/// to both miss-shader emission and NEE.
+pub fn render_offscreen_with_grid_and_env(
+    cfg: RenderConfig,
+    scene: &TriangleScene,
+    cloud_grid: Option<crate::pathtrace::grid::Grid3D>,
+    env_map: Option<crate::pathtrace::env::EnvironmentMap>,
+) -> Aovs {
+    pollster::block_on(render_offscreen_async(cfg, scene, cloud_grid, env_map))
 }
 
 async fn render_offscreen_async(
     cfg: RenderConfig,
     scene_data: &TriangleScene,
     cloud_grid: Option<crate::pathtrace::grid::Grid3D>,
+    env_map: Option<crate::pathtrace::env::EnvironmentMap>,
 ) -> Aovs {
     assert!(
         cfg.width > 0 && cfg.height > 0,
@@ -216,9 +229,27 @@ async fn render_offscreen_async(
     uniforms.integrator_kind = cfg.integrator.as_u32();
     uniforms.use_bvh = u32::from(cfg.use_bvh);
 
-    let scene_buffers = match cloud_grid {
-        Some(g) => crate::pathtrace::build_scene_buffers_with_grid(&device, &queue, scene_data, g),
-        None => build_scene_buffers(&device, &queue, scene_data),
+    // PT-env: flip the has_environment flag + pass width/height into
+    // the inverse-CDF helpers. Stays at zero when no env map.
+    if let Some(env) = env_map.as_ref() {
+        uniforms.has_environment = 1;
+        uniforms.env_width = env.width;
+        uniforms.env_height = env.height;
+    }
+
+    let scene_buffers = match (cloud_grid, env_map) {
+        (Some(g), None) => {
+            crate::pathtrace::build_scene_buffers_with_grid(&device, &queue, scene_data, g)
+        }
+        (cg, env @ Some(_)) => {
+            let grid = cg.unwrap_or_else(|| {
+                crate::pathtrace::grid::from_bytes_or_empty(crate::pathtrace::CUMULUS_QVG)
+            });
+            crate::pathtrace::build_scene_buffers_with_grid_and_env(
+                &device, &queue, scene_data, grid, env,
+            )
+        }
+        (None, None) => build_scene_buffers(&device, &queue, scene_data),
     };
     let uniform_buf = scene_buffers.uniform.clone();
     let accum_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {

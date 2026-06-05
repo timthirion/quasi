@@ -73,6 +73,11 @@ struct RenderArgs {
     /// density grid (typically the output of `scripts/vdb_to_qvg.py`).
     /// Without this flag, the embedded procedural cumulus is used.
     cloud_grid: Option<PathBuf>,
+    /// `--env-map path.hdr` (PT-env) attaches a Radiance HDR
+    /// equirectangular environment map. Camera rays that miss the
+    /// scene return the sky radiance, and NEE samples the dome via
+    /// the luminance × sin θ importance tables.
+    env_map: Option<PathBuf>,
     /// `--brute-force` switches the WGSL fragment shader to a linear
     /// triangle scan; the default walks the BVH.
     brute_force: bool,
@@ -90,6 +95,7 @@ impl Default for RenderArgs {
             integrator: IntegratorKind::default(),
             scene: None,
             cloud_grid: None,
+            env_map: None,
             brute_force: false,
         }
     }
@@ -149,6 +155,12 @@ fn parse_render_args(args: &[String]) -> Result<RenderArgs, String> {
                     .ok_or_else(|| "--cloud-grid needs a path".to_string())?;
                 r.cloud_grid = Some(PathBuf::from(v));
             }
+            "--env-map" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| "--env-map needs a path".to_string())?;
+                r.env_map = Some(PathBuf::from(v));
+            }
             "--brute-force" => {
                 r.brute_force = true;
             }
@@ -164,6 +176,7 @@ fn parse_render_args(args: &[String]) -> Result<RenderArgs, String> {
                      \t--scene PATH        load a custom glTF scene (default: embedded Cornell)\n\
                      \t--cloud-grid PATH   load a runtime .qvg cloud density grid\n\
                      \t                    (default: embedded procedural cumulus)\n\
+                     \t--env-map PATH      attach a Radiance .hdr environment map\n\
                      \t--brute-force       skip the BVH and linear-scan triangles (verification)"
                 );
                 std::process::exit(0);
@@ -215,8 +228,23 @@ fn run_render(args: &[String]) {
             std::process::exit(1);
         })
     });
+    let env_map = cli.env_map.as_deref().map(|p| {
+        quasi::pathtrace::env::EnvironmentMap::from_hdr_file(p).unwrap_or_else(|e| {
+            eprintln!("failed to load --env-map {}: {e}", p.display());
+            std::process::exit(1);
+        })
+    });
+    if let Some(env) = env_map.as_ref() {
+        log::info!("env map: {} × {}", env.width, env.height);
+    }
     let start = std::time::Instant::now();
-    let aovs = render_offscreen_with_grid(cfg, &scene, cloud_grid);
+    let aovs = if env_map.is_some() {
+        quasi::pathtrace::offscreen::render_offscreen_with_grid_and_env(
+            cfg, &scene, cloud_grid, env_map,
+        )
+    } else {
+        render_offscreen_with_grid(cfg, &scene, cloud_grid)
+    };
     let render_dur = start.elapsed();
     log::info!(
         "render took {:.2}s ({} samples)",

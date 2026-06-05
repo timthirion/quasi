@@ -360,6 +360,31 @@ fn main() {
         path.display(),
         bytes.len(),
     );
+
+    // 7) Outdoor bunny — the PT-env publishable scene. No walls, no
+    //    ceiling, no triangle light: just a ground plane plus the
+    //    Stanford bunny. All illumination comes from `--env-map`.
+    //    Without an env map the rendering is pitch black except for
+    //    the ground plane (which would only see the env if visible),
+    //    so this scene is intentionally a no-op without --env-map.
+    let floor_only_quads: Vec<GpuQuad> = quads.iter().take(1).copied().collect();
+    let floor_only_materials: Vec<GpuMaterial> = materials.iter().take(1).copied().collect();
+    let bytes = build_gltf_with_extra_mesh(
+        &floor_only_quads,
+        &floor_only_materials,
+        &bunny_positions,
+        &bunny_normals,
+        &bunny_indices,
+        bunny_mat,
+    );
+    let path = out_dir.join("outdoor_bunny.gltf");
+    fs::write(&path, &bytes).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    println!(
+        "wrote {} ({} bytes, floor + Stanford bunny → {} triangles)",
+        path.display(),
+        bytes.len(),
+        floor_only_quads.len() * 2 + bunny_indices.len() / 3,
+    );
 }
 
 // ---------------------------------------------------------------------------

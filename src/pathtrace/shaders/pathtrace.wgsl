@@ -1533,6 +1533,129 @@ fn env_radiance_at_dir(dir: vec3<f32>) -> vec3<f32> {
     return rgba.rgb;
 }
 
+// --- PT-env: importance-sampling tables packed into `env_data`. ---
+//
+// Layout, matching `build_environment_resources` on the Rust side:
+//   [0 .. H + 1]                        marginal_cdf  (H+1 entries)
+//   [H + 1 .. H + 1 + H]                marginal_pdf  (H   entries)
+//   [H+1+H .. H+1+H + (W+1) * H]        conditional_cdf  ((W+1) * H entries)
+//   [.. + W * H]                        conditional_pdf  (W * H   entries)
+
+fn env_marginal_cdf_at(i: u32) -> f32 {
+    return env_data[i];
+}
+fn env_marginal_pdf_at(i: u32) -> f32 {
+    return env_data[U.env_height + 1u + i];
+}
+fn env_conditional_cdf_at(y: u32, x: u32) -> f32 {
+    let off = U.env_height + 1u + U.env_height;
+    return env_data[off + y * (U.env_width + 1u) + x];
+}
+fn env_conditional_pdf_at(y: u32, x: u32) -> f32 {
+    let off = U.env_height + 1u + U.env_height
+            + (U.env_width + 1u) * U.env_height;
+    return env_data[off + y * U.env_width + x];
+}
+
+// Binary search: largest `i` in [0, H-1] with marginal_cdf[i] <= xi.
+fn env_invert_marginal(xi: f32) -> u32 {
+    var lo: u32 = 0u;
+    var hi: u32 = U.env_height;
+    loop {
+        if (hi <= lo + 1u) { break; }
+        let mid = (lo + hi) >> 1u;
+        if (env_marginal_cdf_at(mid) <= xi) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+// Binary search inside a single row: largest `i` in [0, W-1] with
+// conditional_cdf[row][i] <= xi.
+fn env_invert_conditional(row: u32, xi: f32) -> u32 {
+    var lo: u32 = 0u;
+    var hi: u32 = U.env_width;
+    loop {
+        if (hi <= lo + 1u) { break; }
+        let mid = (lo + hi) >> 1u;
+        if (env_conditional_cdf_at(row, mid) <= xi) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+struct EnvSample {
+    dir: vec3<f32>,
+    pdf: f32,
+    le: vec3<f32>,
+    valid: bool,
+};
+
+fn sample_env_importance(xi: vec2<f32>) -> EnvSample {
+    var es: EnvSample;
+    es.valid = false;
+    if (U.has_environment == 0u) {
+        return es;
+    }
+    let row = env_invert_marginal(xi.y);
+    let col = env_invert_conditional(row, xi.x);
+    let phi = (f32(col) + 0.5) / f32(U.env_width)  * 2.0 * PI;
+    let theta = (f32(row) + 0.5) / f32(U.env_height) *       PI;
+    let st = sin(theta);
+    if (st < 1e-4) {
+        return es;
+    }
+    let dir = vec3<f32>(st * cos(phi), cos(theta), st * sin(phi));
+    let p_marginal = env_marginal_pdf_at(row);
+    let p_cond     = env_conditional_pdf_at(row, col);
+    let pdf = p_marginal * p_cond / (2.0 * PI * PI * st);
+    if (pdf <= 0.0) {
+        return es;
+    }
+    let u = (f32(col) + 0.5) / f32(U.env_width);
+    let v = (f32(row) + 0.5) / f32(U.env_height);
+    let rgba = textureSampleLevel(env_texture, env_sampler, vec2<f32>(u, v), 0.0);
+    es.dir = dir;
+    es.pdf = pdf;
+    es.le = rgba.rgb;
+    es.valid = true;
+    return es;
+}
+
+// PDF (solid-angle measure) of `dir` under env importance sampling.
+// Snaps the direction to the nearest texel via floor — matches the
+// `pdf_at_direction` quantisation in the CPU mirror.
+fn env_pdf_at_dir(dir: vec3<f32>) -> f32 {
+    if (U.has_environment == 0u) {
+        return 0.0;
+    }
+    let d = normalize(dir);
+    let theta = acos(clamp(d.y, -1.0, 1.0));
+    var phi = atan2(d.z, d.x);
+    if (phi < 0.0) {
+        phi = phi + 2.0 * PI;
+    }
+    let st = sin(theta);
+    if (st < 1e-4) {
+        return 0.0;
+    }
+    let u = phi / (2.0 * PI);
+    let v = theta / PI;
+    var x = u32(u * f32(U.env_width));
+    var y = u32(v * f32(U.env_height));
+    if (x >= U.env_width)  { x = U.env_width  - 1u; }
+    if (y >= U.env_height) { y = U.env_height - 1u; }
+    let p_marginal = env_marginal_pdf_at(y);
+    let p_cond     = env_conditional_pdf_at(y, x);
+    return p_marginal * p_cond / (2.0 * PI * PI * st);
+}
+
 // ----- Integrator -----
 
 struct Sample {
@@ -1578,18 +1701,27 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
         iter = iter + 1;
         let hit = trace_scene(ray);
         if (!hit.hit) {
-            // PT-env: a missed ray escapes into the env dome. Add
-            // env radiance scaled by `throughput`. MIS-weighting the
-            // env contribution against the BSDF pdf would tame
-            // fireflies — that lands when NEE on env arrives in the
-            // follow-up commit.
+            // PT-env: a missed ray escapes into the env dome. The
+            // BSDF-sample path collects env emission with a MIS
+            // weight against the NEE env-importance pdf, matching the
+            // triangle-light MIS pattern (`emit > 0.1` branch below).
+            // Camera rays (bounce == 0) and post-specular bounces
+            // take the full unweighted contribution.
             if (U.has_environment == 1u) {
-                result.radiance = result.radiance + throughput * env_radiance_at_dir(ray.dir);
+                let env_rad = env_radiance_at_dir(ray.dir);
+                var wmis = 1.0;
+                if (mis_nee_mode && bounce > 0 && !specular_bounce) {
+                    let env_p = env_pdf_at_dir(ray.dir);
+                    if (env_p > 0.0) {
+                        wmis = power_heuristic(prev_bsdf_pdf, env_p);
+                    }
+                }
+                result.radiance = result.radiance + throughput * env_rad * wmis;
                 if (bounce == 0) {
                     result.hit = true;
                     result.depth = 1e6;
                     result.normal = -ray.dir;
-                    result.albedo = env_radiance_at_dir(ray.dir);
+                    result.albedo = env_rad;
                 }
             }
             break;
@@ -1752,6 +1884,33 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
                         let wlight = power_heuristic(ls.pdf_w, bsdf_p);
                         result.radiance = result.radiance
                             + throughput * trans * f * cos_surf * ls.le * wlight / ls.pdf_w;
+                    }
+                }
+            }
+
+            // PT-env NEE: sample the environment dome via inverse-CDF
+            // on the luminance × sin θ tables. Independent of triangle
+            // NEE (additive multi-light), each MIS-weighted against
+            // BSDF. Shadow ray uses `LARGE_FAR` for `dist` — any
+            // opaque triangle on the way blocks it; a clean miss
+            // accumulates segment transmittance only.
+            if (U.has_environment == 1u) {
+                let xi_env = next_2d(s);
+                let es = sample_env_importance(xi_env);
+                if (es.valid) {
+                    let cos_env = dot(hit.normal, es.dir);
+                    if (cos_env > 0.0) {
+                        let shadow_o = hit.point + hit.normal * 0.001;
+                        let trans = shadow_transmittance(
+                            shadow_o, es.dir, 1e10, current_medium, s);
+                        let trans_sum = trans.x + trans.y + trans.z;
+                        if (trans_sum > 0.0) {
+                            let f = eval_bsdf(m, albedo, hit.normal, wo_dir, es.dir);
+                            let bsdf_p = bsdf_pdf(m, hit.normal, wo_dir, es.dir);
+                            let wlight = power_heuristic(es.pdf, bsdf_p);
+                            result.radiance = result.radiance
+                                + throughput * trans * f * cos_env * es.le * wlight / es.pdf;
+                        }
                     }
                 }
             }

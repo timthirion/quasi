@@ -438,6 +438,7 @@ pub(crate) fn build_scene_buffers(
 /// Same as `build_scene_buffers`, but using a caller-supplied
 /// `Grid3D` instead of the embedded cumulus. Used by `render
 /// --cloud-grid PATH` to pick a runtime-loaded grid.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn build_scene_buffers_with_grid(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -450,7 +451,6 @@ pub(crate) fn build_scene_buffers_with_grid(
 /// Full builder taking both an optional cloud grid and an optional
 /// environment map. PT-env's CLI flag `--env-map PATH` ends up here.
 #[cfg(not(target_arch = "wasm32"))]
-#[allow(dead_code)] // wired up by render_offscreen_with_grid_and_env later in plan 0014
 pub(crate) fn build_scene_buffers_with_grid_and_env(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -727,7 +727,7 @@ fn build_environment_resources_empty(
 /// usable density grid. The PT-vdb-ingest follow-up will swap this
 /// for an asset-loader path that takes the grid file from the scene
 /// description rather than the binary.
-const CUMULUS_QVG: &[u8] = include_bytes!("../data/grids/cumulus_64.qvg");
+pub(crate) const CUMULUS_QVG: &[u8] = include_bytes!("../data/grids/cumulus_64.qvg");
 
 /// Builds the cloud-density 3-D texture from a caller-supplied
 /// `Grid3D`. `build_scene_buffers` passes in the embedded default;
