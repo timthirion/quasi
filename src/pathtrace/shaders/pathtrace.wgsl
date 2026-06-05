@@ -81,6 +81,13 @@ struct Material {
     // and scattering albedo `σ_s / σ_t`. Isotropic phase function.
     scattering: vec3<f32>,
     _pad3: f32,
+    // PT-cloud: procedural-cloud sphere centre + radius. When
+    // `cloud_radius > 0`, the path tracer treats `absorption` and
+    // `scattering` as MAXIMUM values and modulates them by an fbm
+    // density inside the sphere via delta tracking. When zero, the
+    // medium is homogeneous (PT-fog behaviour).
+    cloud_center: vec3<f32>,
+    cloud_radius: f32,
 };
 
 struct Uniforms {
@@ -552,11 +559,62 @@ fn occluded(origin: vec3<f32>, dir: vec3<f32>, dist: f32) -> bool {
 // need to lift this cap.
 const SHADOW_BOUNCE_CAP: i32 = 6;
 
+// PT-cloud: per-segment medium transmittance. Homogeneous media
+// use the closed-form `exp(-σ_t · t)`; heterogeneous (PT-cloud)
+// media use ratio tracking — an unbiased Monte-Carlo estimate via
+// `T *= 1 - σ_t(x_i) / σ_t_maj` at each null-collision step.
+fn medium_transmittance_ratio_tracking(
+    m: Material,
+    origin: vec3<f32>,
+    dir: vec3<f32>,
+    t_length: f32,
+    s: ptr<function, SamplerState>,
+) -> vec3<f32> {
+    let sigma_t_max = medium_extinction(m);
+    let sigma_t_maj = extinction_majorant(sigma_t_max);
+    if (sigma_t_maj <= 0.0) {
+        return vec3<f32>(1.0);
+    }
+    var T = vec3<f32>(1.0);
+    var t: f32 = 0.0;
+    for (var iter = 0; iter < HETERO_MAX_ITER; iter = iter + 1) {
+        t = t - log(max(1.0 - next_1d(s), 1e-30)) / sigma_t_maj;
+        if (t >= t_length) {
+            return T;
+        }
+        let pos = origin + dir * t;
+        let density = cloud_density(pos, m.cloud_center, m.cloud_radius);
+        // density ∈ [0, ~1] doubles as σ_t(x) / σ_t_maj.
+        T = T * (vec3<f32>(1.0) - vec3<f32>(density));
+        let t_max_ch = max(T.x, max(T.y, T.z));
+        if (t_max_ch < 1e-3) {
+            return vec3<f32>(0.0);
+        }
+    }
+    return T;
+}
+
+fn medium_segment_transmittance(
+    medium: u32,
+    origin: vec3<f32>,
+    dir: vec3<f32>,
+    t_length: f32,
+    s: ptr<function, SamplerState>,
+) -> vec3<f32> {
+    let m = materials[medium];
+    if (m.cloud_radius > 0.0) {
+        return medium_transmittance_ratio_tracking(m, origin, dir, t_length, s);
+    }
+    let sigma_t = medium_extinction(m);
+    return exp(-sigma_t * t_length);
+}
+
 fn shadow_transmittance(
     origin: vec3<f32>,
     dir: vec3<f32>,
     dist: f32,
     start_medium: u32,
+    s: ptr<function, SamplerState>,
 ) -> vec3<f32> {
     var trans = vec3<f32>(1.0);
     var medium = start_medium;
@@ -574,8 +632,8 @@ fn shadow_transmittance(
             // No occluder before the light — apply the final segment
             // transmittance and we're done.
             if (medium != NO_MEDIUM) {
-                let sigma_t = medium_extinction(materials[medium]);
-                trans = trans * exp(-sigma_t * remaining);
+                trans = trans * medium_segment_transmittance(
+                    medium, origin_cur, dir, remaining, s);
             }
             return trans;
         }
@@ -586,8 +644,8 @@ fn shadow_transmittance(
             // other emitter). NEE treats this as "reached the
             // light" — apply the segment transmittance and stop.
             if (medium != NO_MEDIUM) {
-                let sigma_t = medium_extinction(materials[medium]);
-                trans = trans * exp(-sigma_t * h.t);
+                trans = trans * medium_segment_transmittance(
+                    medium, origin_cur, dir, h.t, s);
             }
             return trans;
         }
@@ -598,8 +656,8 @@ fn shadow_transmittance(
         // (in the previous medium), then flip across the boundary
         // and keep walking.
         if (medium != NO_MEDIUM) {
-            let sigma_t = medium_extinction(materials[medium]);
-            trans = trans * exp(-sigma_t * h.t);
+            trans = trans * medium_segment_transmittance(
+                medium, origin_cur, dir, h.t, s);
         }
         if (h.front_face == 1u) {
             medium = h.mat;
@@ -792,6 +850,101 @@ fn ggx_pdf(n_dot_h: f32, v_dot_h: f32, alpha: f32) -> f32 {
     return ggx_d(n_dot_h, alpha) * n_dot_h / (4.0 * max(v_dot_h, 1e-6));
 }
 
+// ----- Procedural cloud density (PT-cloud) -----
+//
+// 3-D value noise with smoothstep trilinear interpolation, three
+// octaves of fbm, smoothly windowed by a sphere defined by
+// `Material::cloud_center` + `Material::cloud_radius`. The density
+// function is deterministic per world-space position (the hash is
+// keyed off integer lattice coords), so different paths through
+// the same cloud see the same density field — required for an
+// unbiased renderer.
+
+const CLOUD_NOISE_FREQ: f32 = 4.0;
+const CLOUD_OCTAVES: i32 = 4;
+// Threshold + gain shape the cloud: smaller threshold + larger gain
+// produces puffy "cumulus" structure; lower gain gives uniform
+// haze. These values land somewhere between.
+const CLOUD_NOISE_THRESHOLD: f32 = 0.2;
+const CLOUD_NOISE_GAIN: f32 = 1.8;
+
+fn cloud_hash3(p: vec3<i32>) -> u32 {
+    let ux = u32(p.x + 73856093);
+    let uy = u32(p.y + 19349663);
+    let uz = u32(p.z + 83492791);
+    var h: u32 = ux * 0x9e3779b1u
+              ^ uy * 0x85ebca6bu
+              ^ uz * 0xc2b2ae35u;
+    h ^= h >> 16u;
+    h *= 0x85ebca6bu;
+    h ^= h >> 13u;
+    h *= 0xc2b2ae35u;
+    h ^= h >> 16u;
+    return h;
+}
+
+fn cloud_value_at(p: vec3<i32>) -> f32 {
+    return f32(cloud_hash3(p)) / 4294967296.0;
+}
+
+fn cloud_value_noise(pos: vec3<f32>) -> f32 {
+    let pf = floor(pos);
+    let pi = vec3<i32>(pf);
+    let frac = pos - pf;
+    let s = frac * frac * (vec3<f32>(3.0) - 2.0 * frac);
+
+    let c000 = cloud_value_at(pi + vec3<i32>(0, 0, 0));
+    let c100 = cloud_value_at(pi + vec3<i32>(1, 0, 0));
+    let c010 = cloud_value_at(pi + vec3<i32>(0, 1, 0));
+    let c110 = cloud_value_at(pi + vec3<i32>(1, 1, 0));
+    let c001 = cloud_value_at(pi + vec3<i32>(0, 0, 1));
+    let c101 = cloud_value_at(pi + vec3<i32>(1, 0, 1));
+    let c011 = cloud_value_at(pi + vec3<i32>(0, 1, 1));
+    let c111 = cloud_value_at(pi + vec3<i32>(1, 1, 1));
+
+    let x00 = mix(c000, c100, s.x);
+    let x10 = mix(c010, c110, s.x);
+    let x01 = mix(c001, c101, s.x);
+    let x11 = mix(c011, c111, s.x);
+    let y0 = mix(x00, x10, s.y);
+    let y1 = mix(x01, x11, s.y);
+    return mix(y0, y1, s.z);
+}
+
+fn cloud_fbm(pos: vec3<f32>) -> f32 {
+    var sum: f32 = 0.0;
+    var freq: f32 = 1.0;
+    var amp: f32 = 0.5;
+    var norm: f32 = 0.0;
+    for (var i = 0; i < CLOUD_OCTAVES; i = i + 1) {
+        sum = sum + amp * cloud_value_noise(pos * freq);
+        norm = norm + amp;
+        freq = freq * 2.0;
+        amp = amp * 0.5;
+    }
+    return sum / norm;
+}
+
+// Normalised density at `pos` for the cloud defined by `(center,
+// radius)`. Returns 0 outside the sphere, ramping up through the
+// edge falloff toward the noise-modulated interior. Bounded in
+// `[0, ~1.3]` (the noise term is in `[0, ~1]` after threshold +
+// gain, edge falloff in `[0, 1]`).
+fn cloud_density(pos: vec3<f32>, center: vec3<f32>, radius: f32) -> f32 {
+    let offset = pos - center;
+    let r = length(offset) / max(radius, 1e-6);
+    if (r >= 1.0) {
+        return 0.0;
+    }
+    // Edge falloff: smoothly ramps from 0 at the sphere surface to 1
+    // at half-radius and inwards. Keeps the cloud from having a
+    // hard-cut boundary.
+    let edge = smoothstep(1.0, 0.5, r);
+    let noise = cloud_fbm(pos * CLOUD_NOISE_FREQ);
+    let body = max(0.0, (noise - CLOUD_NOISE_THRESHOLD) * CLOUD_NOISE_GAIN);
+    return edge * body;
+}
+
 // ----- Participating media (PT-beer-lambert + PT-fog) -----
 //
 // Two helpers feed the volumetric loop in `path_trace`:
@@ -837,8 +990,71 @@ fn extinction_majorant(sigma_t: vec3<f32>) -> f32 {
     return max(sigma_t.x, max(sigma_t.y, sigma_t.z));
 }
 
+// Heterogeneous (PT-cloud) — delta tracking. Steps through the
+// medium with the scalar majorant, rejecting "fictitious"
+// collisions with probability `1 - σ_t(x) / σ_t_maj`. On a real
+// collision: scatter with probability σ_s/σ_t (the single-
+// scattering albedo) or absorb (path terminates). Iteration cap
+// protects against pathological loops in extreme-density volumes.
+const HETERO_MAX_ITER: i32 = 256;
+
+fn sample_volume_distance_heterogeneous(
+    m: Material,
+    ray_origin: vec3<f32>,
+    ray_dir: vec3<f32>,
+    t_max: f32,
+    s: ptr<function, SamplerState>,
+) -> VolumeSample {
+    var out: VolumeSample;
+    out.scattered = 0u;
+    out.t = t_max;
+    out.weight = vec3<f32>(1.0);
+    let sigma_t_max = medium_extinction(m);
+    let sigma_t_maj = extinction_majorant(sigma_t_max);
+    if (sigma_t_maj <= 0.0) {
+        return out;
+    }
+    // Single-scattering albedo at maximum density. For PT-cloud's
+    // grey scenes this is the same as the local albedo at every
+    // point; coloured media would want spectral MIS (deferred).
+    var albedo_max: f32 = 0.0;
+    if (sigma_t_max.x > 1e-30) {
+        albedo_max = clamp(m.scattering.x / sigma_t_max.x, 0.0, 1.0);
+    }
+    var t: f32 = 0.0;
+    for (var iter = 0; iter < HETERO_MAX_ITER; iter = iter + 1) {
+        t = t - log(max(1.0 - next_1d(s), 1e-30)) / sigma_t_maj;
+        if (t >= t_max) {
+            return out;
+        }
+        let pos = ray_origin + ray_dir * t;
+        let density = cloud_density(pos, m.cloud_center, m.cloud_radius);
+        let p_real = density;  // density ∈ [0, ~1] doubles as σ_t/σ_t_maj
+        if (next_1d(s) < p_real) {
+            // Real collision. Decide scatter vs absorb on the
+            // local single-scattering albedo (same as albedo_max
+            // for grey media since σ_s and σ_a scale together).
+            if (next_1d(s) < albedo_max) {
+                out.scattered = 1u;
+                out.t = t;
+                out.weight = vec3<f32>(1.0);
+                return out;
+            }
+            // Absorbed — path terminates.
+            out.scattered = 0u;
+            out.t = t;
+            out.weight = vec3<f32>(0.0);
+            return out;
+        }
+        // Null collision — continue stepping.
+    }
+    return out;
+}
+
 fn sample_volume_distance(
     medium: u32,
+    ray_origin: vec3<f32>,
+    ray_dir: vec3<f32>,
     t_max: f32,
     s: ptr<function, SamplerState>,
 ) -> VolumeSample {
@@ -850,6 +1066,9 @@ fn sample_volume_distance(
         return out;
     }
     let m = materials[medium];
+    if (m.cloud_radius > 0.0) {
+        return sample_volume_distance_heterogeneous(m, ray_origin, ray_dir, t_max, s);
+    }
     let sigma_t = medium_extinction(m);
     let sigma_t_maj = extinction_majorant(sigma_t);
     if (sigma_t_maj <= 0.0) {
@@ -1188,7 +1407,8 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
             if (sigma_s_sum <= 0.0) {
                 throughput = throughput * exp(-medium_mat.absorption * hit.t);
             } else {
-                let vs = sample_volume_distance(current_medium, hit.t, s);
+                let vs = sample_volume_distance(
+                    current_medium, ray.origin, ray.dir, hit.t, s);
                 throughput = throughput * vs.weight;
                 if (vs.scattered == 1u) {
                     // Volume scatter event inside the medium.
@@ -1203,7 +1423,7 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
                         let ls = sample_light(scatter_pos, s);
                         if (ls.valid) {
                             let trans = shadow_transmittance(
-                                scatter_pos, ls.wi, ls.dist, current_medium);
+                                scatter_pos, ls.wi, ls.dist, current_medium, s);
                             let trans_sum = trans.x + trans.y + trans.z;
                             if (trans_sum > 0.0) {
                                 let f = vec3<f32>(PHASE_ISOTROPIC);
@@ -1307,7 +1527,7 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
                 if (cos_surf > 0.0) {
                     let shadow_o = hit.point + hit.normal * 0.001;
                     let trans = shadow_transmittance(
-                        shadow_o, ls.wi, ls.dist, current_medium);
+                        shadow_o, ls.wi, ls.dist, current_medium, s);
                     let trans_sum = trans.x + trans.y + trans.z;
                     if (trans_sum > 0.0) {
                         let f = eval_bsdf(m, albedo, hit.normal, wo_dir, ls.wi);

@@ -56,6 +56,13 @@ pub struct GpuMaterial {
     /// Fog / smoke scenes set this; closed-form Beer-Lambert glass
     /// leaves it zero.
     pub scattering: [f32; 3],
+    /// Procedural-cloud sphere centre. Only consulted when
+    /// `cloud_radius > 0`; emitted to glTF `extras.cloud_center`.
+    pub cloud_center: [f32; 3],
+    /// Procedural-cloud sphere radius. `0.0` = homogeneous medium;
+    /// non-zero routes the path tracer onto delta tracking with a
+    /// procedural fbm density inside the sphere.
+    pub cloud_radius: f32,
 }
 
 /// Camera + scalars uniform — the only data the WGSL shader still reads
@@ -125,6 +132,8 @@ fn mat(albedo: V3, emission: V3) -> GpuMaterial {
         ior: 0.0,
         absorption: [0.0, 0.0, 0.0],
         scattering: [0.0, 0.0, 0.0],
+        cloud_center: [0.0, 0.0, 0.0],
+        cloud_radius: 0.0,
     }
 }
 
@@ -240,9 +249,10 @@ mod tests {
         assert_eq!(size_of::<GpuQuad>(), 48);
         // 32 bytes pre-PT-dielectrics; PT-dielectrics added `ior` (→ 36);
         // PT-beer-lambert added `absorption` (→ 48); PT-fog added
-        // `scattering` (→ 60). The runtime `Material` in `mesh.rs`
-        // lives separately and stays std430-padded at 80 bytes.
-        assert_eq!(size_of::<GpuMaterial>(), 60);
+        // `scattering` (→ 60); PT-cloud added `cloud_center` +
+        // `cloud_radius` (→ 76). The runtime `Material` in `mesh.rs`
+        // lives separately and stays std430-padded at 96 bytes.
+        assert_eq!(size_of::<GpuMaterial>(), 76);
         // camera (48) + 8 × u32 = 80. T1 dropped the per-quad arrays;
         // triangle data lives in storage buffers now. T2 added
         // `use_bvh` in what used to be the trailing pad slot.

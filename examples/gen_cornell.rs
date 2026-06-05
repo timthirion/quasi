@@ -59,6 +59,8 @@ fn main() {
         ior: 0.0,
         absorption: [0.0, 0.0, 0.0],
         scattering: [0.0, 0.0, 0.0],
+        cloud_center: [0.0, 0.0, 0.0],
+        cloud_radius: 0.0,
     };
     let (sphere_positions, sphere_normals, sphere_indices) = icosphere(5, [0.0, 0.5, 0.0], 0.5);
     let bytes = build_gltf_with_extra_mesh(
@@ -107,6 +109,8 @@ fn main() {
         ior: 0.0,
         absorption: [0.0, 0.0, 0.0],
         scattering: [0.0, 0.0, 0.0],
+        cloud_center: [0.0, 0.0, 0.0],
+        cloud_radius: 0.0,
     };
     let bytes = build_gltf_with_extra_mesh(
         &room_quads,
@@ -139,6 +143,8 @@ fn main() {
         ior: 0.0,
         absorption: [0.0, 0.0, 0.0],
         scattering: [0.0, 0.0, 0.0],
+        cloud_center: [0.0, 0.0, 0.0],
+        cloud_radius: 0.0,
     };
     let bytes = build_gltf_with_extra_mesh(
         &room_quads,
@@ -174,6 +180,8 @@ fn main() {
         // body; tiny green absorption leaves the colour green-leaning.
         absorption: [1.2, 0.1, 1.5],
         scattering: [0.0, 0.0, 0.0],
+        cloud_center: [0.0, 0.0, 0.0],
+        cloud_radius: 0.0,
     };
     let bytes = build_gltf_with_extra_mesh(
         &room_quads,
@@ -208,6 +216,8 @@ fn main() {
         ior: 1.5,
         absorption: [0.0, 0.0, 0.0],
         scattering: [0.0, 0.0, 0.0],
+        cloud_center: [0.0, 0.0, 0.0],
+        cloud_radius: 0.0,
     };
     let bytes = build_gltf_with_extra_mesh(
         &room_quads,
@@ -250,6 +260,8 @@ fn main() {
         // keeps the room bright without a smoke-dense feel.
         absorption: [0.05, 0.05, 0.05],
         scattering: [0.5, 0.5, 0.5],
+        cloud_center: [0.0, 0.0, 0.0],
+        cloud_radius: 0.0,
     };
     // Extends ABOVE the ceiling (max_y = 2.05 vs ceiling at 2.0) so
     // the entire room volume sits inside the fog — light tile,
@@ -280,6 +292,49 @@ fn main() {
         path.display(),
         bytes.len(),
         room_quads.len() * 2 + fog_indices.len() / 3,
+    );
+
+    // 5c) Cornell with a procedural cloud — the PT-cloud publishable
+    //     scene. A cube bounding box marks the cloud volume's
+    //     spatial extent; the WGSL evaluates an fbm-modulated
+    //     density inside the sphere defined by `cloud_center` +
+    //     `cloud_radius`. Delta tracking handles the heterogeneous
+    //     extinction; ratio tracking handles shadow rays.
+    let cloud_mat = GpuMaterial {
+        albedo: [1.0, 1.0, 1.0],
+        roughness: 1.0,
+        emission: [0.0, 0.0, 0.0],
+        metallic: 0.0,
+        ior: 0.0,
+        // Maximum extinction values; the procedural density (in
+        // [0, ~1]) modulates these down per-position. Very high
+        // scattering relative to absorption — characteristic of
+        // water-droplet clouds (single-scattering albedo ≈ 0.99).
+        absorption: [0.1, 0.1, 0.1],
+        scattering: [10.0, 10.0, 10.0],
+        cloud_center: [0.0, 1.0, 0.0],
+        cloud_radius: 0.5,
+    };
+    let (cloud_positions, cloud_normals, cloud_indices) = aabb_box(
+        // Cube bounding the cloud sphere with a small margin.
+        [-0.6, 0.4, -0.6],
+        [0.6, 1.6, 0.6],
+    );
+    let bytes = build_gltf_with_extra_mesh(
+        &room_quads,
+        &room_materials,
+        &cloud_positions,
+        &cloud_normals,
+        &cloud_indices,
+        cloud_mat,
+    );
+    let path = out_dir.join("cornell_cloud.gltf");
+    fs::write(&path, &bytes).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    println!(
+        "wrote {} ({} bytes, room + procedural cloud → {} triangles)",
+        path.display(),
+        bytes.len(),
+        room_quads.len() * 2 + cloud_indices.len() / 3,
     );
 
     // 6) Cornell with a textured floor — the PT-textures publishable
@@ -799,6 +854,8 @@ fn build_cornell_textured_floor() -> Vec<u8> {
         ior: 0.0,
         absorption: [0.0, 0.0, 0.0],
         scattering: [0.0, 0.0, 0.0],
+        cloud_center: [0.0, 0.0, 0.0],
+        cloud_radius: 0.0,
     });
     // Quad 0 is the floor (per `cornell_box`); rebind it to the new
     // textured material.
@@ -962,6 +1019,13 @@ fn emit_gltf(
                     r#""scattering":[{},{},{}]"#,
                     m.scattering[0], m.scattering[1], m.scattering[2],
                 ));
+            }
+            if m.cloud_radius > 0.0 {
+                extras_parts.push(format!(
+                    r#""cloud_center":[{},{},{}]"#,
+                    m.cloud_center[0], m.cloud_center[1], m.cloud_center[2],
+                ));
+                extras_parts.push(format!(r#""cloud_radius":{}"#, m.cloud_radius));
             }
             let extras = if extras_parts.is_empty() {
                 String::new()

@@ -84,6 +84,13 @@ pub const NO_TEXTURE: u32 = u32::MAX;
 /// as clear glass). The extinction coefficient is the sum of the two
 /// (`σ_t = σ_a + σ_s`); the scattering albedo is `σ_s / σ_t`.
 ///
+/// `cloud_center` + `cloud_radius` (PT-cloud) define a procedural
+/// heterogeneous medium. When `cloud_radius > 0`, the path tracer
+/// treats `absorption` and `scattering` as the **maximum** values
+/// and modulates by a procedural fbm density inside the sphere.
+/// When `cloud_radius == 0`, the medium is homogeneous (PT-fog
+/// behaviour).
+///
 /// std430 layout (4-byte scalars need no extra padding):
 ///   albedo:                    vec3 + scalar → 16 bytes
 ///   emission:                  vec3 + scalar → 16 bytes
@@ -92,7 +99,9 @@ pub const NO_TEXTURE: u32 = u32::MAX;
 ///   _pad:                      2 × u32       → 16 bytes
 ///   absorption:                vec3 + f32 pad → 16 bytes
 ///   scattering:                vec3 + f32 pad → 16 bytes
-///   total: 80 bytes.
+///   cloud_center:              vec3 +
+///   cloud_radius:              f32           → 16 bytes
+///   total: 96 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable, PartialEq)]
 pub struct Material {
@@ -119,6 +128,15 @@ pub struct Material {
     /// hitting a surface. PT-fog uses an isotropic phase function.
     pub scattering: [f32; 3],
     pub _pad_scattering: f32,
+    /// Procedural cloud sphere centre, world-space. Read only when
+    /// `cloud_radius > 0` — defines the position of the fbm-
+    /// modulated density volume.
+    pub cloud_center: [f32; 3],
+    /// Procedural cloud sphere radius. Sentinel `0.0` means
+    /// homogeneous medium (no procedural modulation); non-zero
+    /// routes the path tracer onto delta tracking with a procedural
+    /// density inside the sphere.
+    pub cloud_radius: f32,
 }
 
 impl Default for Material {
@@ -141,6 +159,8 @@ impl Default for Material {
             _pad_absorption: 0.0,
             scattering: [0.0, 0.0, 0.0],
             _pad_scattering: 0.0,
+            cloud_center: [0.0, 0.0, 0.0],
+            cloud_radius: 0.0,
         }
     }
 }
@@ -457,6 +477,8 @@ fn extract_material(material: &gltf::Material, texture_remap: &[u32]) -> Materia
         _pad_absorption: 0.0,
         scattering: extras.scattering,
         _pad_scattering: 0.0,
+        cloud_center: extras.cloud_center,
+        cloud_radius: extras.cloud_radius,
     }
 }
 
@@ -468,6 +490,10 @@ struct MaterialExtras {
     absorption: [f32; 3],
     #[serde(default)]
     scattering: [f32; 3],
+    #[serde(default)]
+    cloud_center: [f32; 3],
+    #[serde(default)]
+    cloud_radius: f32,
 }
 
 fn walk_node(
@@ -585,12 +611,11 @@ mod tests {
     }
 
     #[test]
-    fn material_is_80_bytes_with_volume_fields_at_48_and_64() {
-        // PT-textures: 48 bytes (added base_color_texture_idx + pad).
-        // PT-dielectrics: still 48 (packed `ior` into the pad).
-        // PT-beer-lambert: 64 (appended absorption: vec3 + pad).
-        // PT-fog: 80 (appended scattering: vec3 + pad).
-        assert_eq!(std::mem::size_of::<Material>(), 80);
+    fn material_is_96_bytes_with_cloud_fields_at_80() {
+        // PT-textures: 48; PT-dielectrics: 48 (ior in pad);
+        // PT-beer-lambert: 64 (+ absorption); PT-fog: 80 (+ scattering);
+        // PT-cloud: 96 (+ cloud_center + cloud_radius).
+        assert_eq!(std::mem::size_of::<Material>(), 96);
         assert_eq!(
             std::mem::offset_of!(Material, base_color_texture_idx),
             32,
@@ -598,6 +623,8 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Material, ior), 36);
         assert_eq!(std::mem::offset_of!(Material, absorption), 48);
         assert_eq!(std::mem::offset_of!(Material, scattering), 64);
+        assert_eq!(std::mem::offset_of!(Material, cloud_center), 80);
+        assert_eq!(std::mem::offset_of!(Material, cloud_radius), 92);
     }
 
     // ---- Material ----
