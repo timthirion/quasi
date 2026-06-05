@@ -5,6 +5,35 @@ use quasi::pathtrace::grid::{bake_cumulus, Grid3D};
 use std::io::Cursor;
 
 #[test]
+fn qvg_exact_bytes_match_documented_format() {
+    // Pins the on-disk format so Rust and Python can't silently
+    // drift. The same input pinned in `scripts/test_qvg_writer.py`
+    // produces exactly these bytes — if either side regresses,
+    // its own test fails first.
+    let mut g = Grid3D::new([3, 4, 5], [-1.0, -2.0, -3.0], [1.0, 2.0, 3.0]);
+    for (i, v) in g.voxels.iter_mut().enumerate() {
+        *v = i as u8;
+    }
+    let mut buf = Vec::new();
+    g.save(&mut buf).unwrap();
+    assert_eq!(&buf[0..4], b"QVG1");
+    let read_u32 = |off: usize| u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+    let read_f32 = |off: usize| f32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+    assert_eq!(read_u32(4), 3);
+    assert_eq!(read_u32(8), 4);
+    assert_eq!(read_u32(12), 5);
+    assert_eq!(read_f32(16), -1.0);
+    assert_eq!(read_f32(20), -2.0);
+    assert_eq!(read_f32(24), -3.0);
+    assert_eq!(read_f32(28), 1.0);
+    assert_eq!(read_f32(32), 2.0);
+    assert_eq!(read_f32(36), 3.0);
+    assert_eq!(read_u32(40), 60);
+    let payload: Vec<u8> = (0..60).collect();
+    assert_eq!(&buf[44..], &payload[..]);
+}
+
+#[test]
 fn qvg_round_trips_through_save_and_load() {
     let mut g = Grid3D::new([4, 5, 6], [-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]);
     for (i, v) in g.voxels.iter_mut().enumerate() {

@@ -27,6 +27,33 @@ use std::path::Path;
 
 const MAGIC: [u8; 4] = *b"QVG1";
 
+/// Decode a `.qvg` from an embedded byte slice or fall back to a
+/// 1×1×1 zero grid if the bytes don't parse. Used by the path
+/// tracer to load the embedded default cumulus at startup.
+pub fn from_bytes_or_empty(bytes: &[u8]) -> Grid3D {
+    let mut cursor = std::io::Cursor::new(bytes);
+    Grid3D::load(&mut cursor).unwrap_or_else(|_| {
+        Grid3D::new([1, 1, 1], [0.0; 3], [1.0; 3])
+    })
+}
+
+/// Load a `.qvg` from disk; on any I/O or parse failure, log a
+/// warning and return the embedded default. The path-tracer
+/// `--cloud-grid <path>` flag uses this so a typo in the CLI
+/// degrades to the default rather than crashing the render.
+pub fn load_from_path_or_default(path: &Path, default_bytes: &[u8]) -> Grid3D {
+    match Grid3D::load_from_path(path) {
+        Ok(g) => g,
+        Err(e) => {
+            log::warn!(
+                "PT-vdb: failed to load grid from {}: {e}; falling back to embedded default",
+                path.display(),
+            );
+            from_bytes_or_empty(default_bytes)
+        }
+    }
+}
+
 /// Dense 3-D density grid in CPU memory.
 #[derive(Clone, Debug)]
 pub struct Grid3D {

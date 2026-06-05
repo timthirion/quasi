@@ -94,6 +94,9 @@ natively is half-done. Guard platform-specific code with `#[cfg(target_arch =
 - Path tracing as a WGSL megakernel rendering to an HDR texture, progressively
   accumulated across frames (ping-pong textures), then tonemapped to the surface.
 - Verification (metrics, convergence) lives in native-only code and tests.
+- Asset-pipeline utilities that need a Python toolchain (currently the OpenVDB
+  `.vdb` → `.qvg` converter) live under `scripts/` at the repo root, outside
+  the Rust crate so the build stays portable. See `scripts/README.md`.
 
 ## Coding Style
 

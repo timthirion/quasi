@@ -25,7 +25,7 @@ use quasi::pathtrace::default_triangle_scene;
 #[cfg(not(target_arch = "wasm32"))]
 use quasi::pathtrace::integrator::IntegratorKind;
 #[cfg(not(target_arch = "wasm32"))]
-use quasi::pathtrace::offscreen::{render_offscreen, RenderConfig};
+use quasi::pathtrace::offscreen::{render_offscreen_with_grid, RenderConfig};
 #[cfg(not(target_arch = "wasm32"))]
 use quasi::pathtrace::output::write_render;
 #[cfg(not(target_arch = "wasm32"))]
@@ -69,6 +69,10 @@ struct RenderArgs {
     /// `--scene path.gltf` to load a custom triangle scene; default
     /// uses the Cornell Box embedded in the binary.
     scene: Option<PathBuf>,
+    /// `--cloud-grid path.qvg` to swap in a runtime-loaded cloud
+    /// density grid (typically the output of `scripts/vdb_to_qvg.py`).
+    /// Without this flag, the embedded procedural cumulus is used.
+    cloud_grid: Option<PathBuf>,
     /// `--brute-force` switches the WGSL fragment shader to a linear
     /// triangle scan; the default walks the BVH.
     brute_force: bool,
@@ -85,6 +89,7 @@ impl Default for RenderArgs {
             sampler: SamplerKind::default(),
             integrator: IntegratorKind::default(),
             scene: None,
+            cloud_grid: None,
             brute_force: false,
         }
     }
@@ -138,6 +143,12 @@ fn parse_render_args(args: &[String]) -> Result<RenderArgs, String> {
                     .ok_or_else(|| "--scene needs a path".to_string())?;
                 r.scene = Some(PathBuf::from(v));
             }
+            "--cloud-grid" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| "--cloud-grid needs a path".to_string())?;
+                r.cloud_grid = Some(PathBuf::from(v));
+            }
             "--brute-force" => {
                 r.brute_force = true;
             }
@@ -151,6 +162,8 @@ fn parse_render_args(args: &[String]) -> Result<RenderArgs, String> {
                      \t--sampler NAME      pcg | halton | sobol (default: pcg)\n\
                      \t--integrator NAME   misnee | bsdf (default: misnee)\n\
                      \t--scene PATH        load a custom glTF scene (default: embedded Cornell)\n\
+                     \t--cloud-grid PATH   load a runtime .qvg cloud density grid\n\
+                     \t                    (default: embedded procedural cumulus)\n\
                      \t--brute-force       skip the BVH and linear-scan triangles (verification)"
                 );
                 std::process::exit(0);
@@ -196,8 +209,14 @@ fn run_render(args: &[String]) {
         scene.triangle_count(),
         scene.emissive_triangles.len(),
     );
+    let cloud_grid = cli.cloud_grid.as_deref().map(|p| {
+        quasi::pathtrace::grid::Grid3D::load_from_path(p).unwrap_or_else(|e| {
+            eprintln!("failed to load --cloud-grid {}: {e}", p.display());
+            std::process::exit(1);
+        })
+    });
     let start = std::time::Instant::now();
-    let aovs = render_offscreen(cfg, &scene);
+    let aovs = render_offscreen_with_grid(cfg, &scene, cloud_grid);
     let render_dur = start.elapsed();
     log::info!(
         "render took {:.2}s ({} samples)",

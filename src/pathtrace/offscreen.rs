@@ -133,10 +133,24 @@ fn create_aov_texture(
 /// the accumulated AOVs. Blocks the calling thread (intended for use
 /// from a CLI render command).
 pub fn render_offscreen(cfg: RenderConfig, scene: &TriangleScene) -> Aovs {
-    pollster::block_on(render_offscreen_async(cfg, scene))
+    pollster::block_on(render_offscreen_async(cfg, scene, None))
 }
 
-async fn render_offscreen_async(cfg: RenderConfig, scene_data: &TriangleScene) -> Aovs {
+/// Same as [`render_offscreen`], but with a runtime-loaded cloud
+/// density grid. Pass `None` to use the embedded procedural cumulus.
+pub fn render_offscreen_with_grid(
+    cfg: RenderConfig,
+    scene: &TriangleScene,
+    cloud_grid: Option<crate::pathtrace::grid::Grid3D>,
+) -> Aovs {
+    pollster::block_on(render_offscreen_async(cfg, scene, cloud_grid))
+}
+
+async fn render_offscreen_async(
+    cfg: RenderConfig,
+    scene_data: &TriangleScene,
+    cloud_grid: Option<crate::pathtrace::grid::Grid3D>,
+) -> Aovs {
     assert!(
         cfg.width > 0 && cfg.height > 0,
         "render size must be non-zero"
@@ -202,7 +216,10 @@ async fn render_offscreen_async(cfg: RenderConfig, scene_data: &TriangleScene) -
     uniforms.integrator_kind = cfg.integrator.as_u32();
     uniforms.use_bvh = u32::from(cfg.use_bvh);
 
-    let scene_buffers = build_scene_buffers(&device, &queue, scene_data);
+    let scene_buffers = match cloud_grid {
+        Some(g) => crate::pathtrace::build_scene_buffers_with_grid(&device, &queue, scene_data, g),
+        None => build_scene_buffers(&device, &queue, scene_data),
+    };
     let uniform_buf = scene_buffers.uniform.clone();
     let accum_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("offscreen-accum-uniform"),

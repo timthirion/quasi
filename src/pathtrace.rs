@@ -385,6 +385,23 @@ pub(crate) fn build_scene_buffers(
     queue: &wgpu::Queue,
     scene_data: &TriangleScene,
 ) -> SceneBuffers {
+    build_scene_buffers_with_grid(
+        device,
+        queue,
+        scene_data,
+        crate::pathtrace::grid::from_bytes_or_empty(CUMULUS_QVG),
+    )
+}
+
+/// Same as `build_scene_buffers`, but using a caller-supplied
+/// `Grid3D` instead of the embedded cumulus. Used by `render
+/// --cloud-grid PATH` to pick a runtime-loaded grid.
+pub(crate) fn build_scene_buffers_with_grid(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    scene_data: &TriangleScene,
+    cloud_grid_data: crate::pathtrace::grid::Grid3D,
+) -> SceneBuffers {
     let uniform = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("pathtrace-uniforms"),
         size: std::mem::size_of::<scene::Uniforms>() as u64,
@@ -434,7 +451,8 @@ pub(crate) fn build_scene_buffers(
         "bvh-tri-indices",
     );
     let (textures, textures_view, sampler) = build_texture_array(device, queue, &scene_data.textures);
-    let (cloud_grid, cloud_grid_view, cloud_grid_sampler) = build_cloud_grid_texture(device, queue);
+    let (cloud_grid, cloud_grid_view, cloud_grid_sampler) =
+        build_cloud_grid_texture_from(device, queue, cloud_grid_data);
     SceneBuffers {
         uniform,
         vertex,
@@ -459,17 +477,15 @@ pub(crate) fn build_scene_buffers(
 /// description rather than the binary.
 const CUMULUS_QVG: &[u8] = include_bytes!("../data/grids/cumulus_64.qvg");
 
-fn build_cloud_grid_texture(
+/// Builds the cloud-density 3-D texture from a caller-supplied
+/// `Grid3D`. `build_scene_buffers` passes in the embedded default;
+/// `--cloud-grid PATH` swaps a runtime grid in via
+/// `build_scene_buffers_with_grid`.
+pub(crate) fn build_cloud_grid_texture_from(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
+    grid: crate::pathtrace::grid::Grid3D,
 ) -> (wgpu::Texture, wgpu::TextureView, wgpu::Sampler) {
-    // Decode the embedded `.qvg`. On unexpected failure, fall back to
-    // a 1×1×1 zero grid so the bind group still validates.
-    let mut cursor = std::io::Cursor::new(CUMULUS_QVG);
-    let grid = crate::pathtrace::grid::Grid3D::load(&mut cursor).unwrap_or_else(|e| {
-        log::warn!("PT-vdb: cumulus_64.qvg failed to load ({e}); using empty grid");
-        crate::pathtrace::grid::Grid3D::new([1, 1, 1], [0.0; 3], [1.0; 3])
-    });
     let [w, h, d] = grid.dims;
     let size = wgpu::Extent3d {
         width: w,
