@@ -5,27 +5,143 @@
 [![Rust 2021](https://img.shields.io/badge/rust-2021_edition-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2021/index.html)
 [![WebGPU](https://img.shields.io/badge/runs_in-WebGPU-purple.svg)](https://wgpu.rs)
 
-The **Rust** implementation of Quasi, a high-quality global illumination renderer.
-It targets one API — WebGPU, via [`wgpu`](https://wgpu.rs) and WGSL — so the same
-code runs natively and in the browser, letting blog posts embed live, interactive
-renders. See [`plans/ROADMAP.md`](plans/ROADMAP.md) for direction and `AGENTS.md`
-for the stack and conventions.
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="data/output/cornell_glass_bunny_reference.png" width="360" alt="Green-glass Stanford bunny">
+      <br><sub><b>PT-beer-lambert</b> — Stanford bunny in green glass, Beer-Lambert absorption distance-modulated through the body.</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="data/output/cornell_foggy_room_reference.png" width="360" alt="God-rays through fog">
+      <br><sub><b>PT-fog</b> — Cornell room filled with homogeneous fog, light scattering off particles in the room, soft halo around the ceiling light.</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="data/output/cornell_cloud_reference.png" width="360" alt="Procedural cumulus cloud">
+      <br><sub><b>PT-vdb</b> — Procedural cumulus cloud, heterogeneous density sampled from a 3-D grid via delta tracking, anisotropic phase via Henyey-Greenstein at g = 0.4.</sub>
+    </td>
+    <td align="center">
+      <img src="data/output/cornell_glass_sphere_reference.png" width="360" alt="Glass icosphere">
+      <br><sub><b>PT-dielectrics</b> — Glass icosphere with Snell refraction, Fresnel rim, total internal reflection, and a focused caustic on the floor underneath.</sub>
+    </td>
+  </tr>
+</table>
 
-## Running
+## What is Quasi?
 
-### Native
+A Rust path tracer that targets **WebGPU** — so the same code runs
+natively (Metal / Vulkan / DX12 via [`wgpu`](https://wgpu.rs)) and
+inside the browser. One codebase, one shading language ([WGSL](https://www.w3.org/TR/WGSL/)),
+one set of tests. The goal is published-quality reference renders
+*and* live, interactive widgets you can drop into a blog post —
+orbit the camera, flip the integrator, watch convergence — without
+recompiling anything for a separate web target.
 
-```bash
-cargo run        # opens a window (Esc to quit)
+It's actively in development against a sequence of focused plans
+in [`plans/`](plans/). Ten of them have closed so far, each one
+shipping a reference render and pinning the math in CPU-side
+tests.
+
+## Features
+
+**Materials**
+- Textured Lambertian (`PT-textures`)
+- GGX microfacet conductors with Smith G + Schlick Fresnel (`PT-ggx`)
+- Smooth dielectrics — full Snell + unpolarised Fresnel + TIR (`PT-dielectrics`)
+
+**Participating media**
+- Distance-modulated Beer-Lambert absorption inside dielectrics (`PT-beer-lambert`)
+- Homogeneous single-scattering fog with NEE-through-volume shadow rays (`PT-fog`)
+- Heterogeneous clouds via 3-D density grids, delta tracking +
+  ratio tracking, Henyey-Greenstein anisotropy (`PT-cloud` + `PT-hg`)
+- OpenVDB ingest pipeline so production cloud data drops straight in (`PT-vdb` + `PT-vdb-ingest`)
+
+**Geometry**
+- glTF triangle scenes with embedded material extras
+- SAH binned BVH on CPU + WGSL stack-walked traversal (~350× speedup on 20 K triangles)
+
+**Integrator + samplers**
+- Multiple-Importance Sampling + Next-Event Estimation
+- PCG, Halton, and Sobol samplers (runtime-switchable)
+
+**Runtime**
+- Single WGSL megakernel, progressive HDR accumulation, AOV outputs (radiance / albedo / normal / depth)
+- Native + WebGPU build from one source
+
+## Quick start
+
+**Windowed renderer:**
+
+```sh
+cargo run --release            # opens a window; Esc to quit
 ```
 
-### Web (WebGPU)
+**Headless render to PNG + EXR:**
 
-```bash
-wasm-pack build --target web      # builds pkg/
-python3 -m http.server            # serve the repo root
-# open http://localhost:8000/ in a WebGPU-capable browser
+```sh
+cargo run --release -- render \
+    --scene data/gltf/cornell_glass_bunny.gltf \
+    --width 512 --height 512 --spp 1024 \
+    --out my_render
 ```
 
-Current state (plan 0001, M0): a fullscreen gradient renders in both targets,
-proving the dual-target pipeline.
+The `--scene` and `--cloud-grid` flags accept any of the
+`data/gltf/cornell_*.gltf` scenes and `data/grids/*.qvg` density
+grids. Without `--cloud-grid`, the renderer falls back to the
+embedded procedural cumulus.
+
+**Browser build:**
+
+```sh
+wasm-pack build --target web   # produces pkg/
+python3 -m http.server         # then open http://localhost:8000/
+```
+
+## Architecture
+
+A core renderer crate owns the `wgpu` device + queue, scenes, and
+the WGSL path-tracing pipeline; thin native (winit) and web
+(canvas) entry points drive it. Path tracing is a WGSL megakernel
+rendering to ping-pong HDR textures; verification (convergence,
+RMSE-vs-reference) lives in native-only tests.
+
+The tech-stack details, coding conventions, and testing doctrine
+live in [`AGENTS.md`](AGENTS.md).
+
+## Where it's going
+
+The forward direction lives in [`plans/ROADMAP.md`](plans/ROADMAP.md);
+each shipped feature has its own [`plans/NNNN-*.md`](plans/) file
+with the design, milestones, tests, and any "tuning notes worth
+remembering" that came out of the work. Plans `0001` through
+`0010` have closed; `0011` (this README) is the current one in
+flight.
+
+## VDB ingest
+
+Real production cloud data ships as OpenVDB `.vdb` files. The
+[`scripts/`](scripts/) folder contains a C++ converter that
+resamples a `.vdb` to our `.qvg` density-grid format and the
+documented end-to-end pipeline for using the Walt Disney
+Animation Studios Cloud Data Set — see
+[`scripts/README.md`](scripts/README.md).
+
+## License + credits
+
+This codebase is [Apache-2.0](LICENSE).
+
+The procedurally-baked cumulus in [`data/grids/cumulus_64.qvg`](data/grids/)
+is generated by [`examples/gen_cloud.rs`](examples/gen_cloud.rs)
+and falls under the same license as the rest of the repo.
+
+If you render with the Disney WDAS Cloud Data Set
+(`--cloud-grid data/grids/disney_*.qvg`), the resulting image is
+a derivative work of Disney's CC BY-SA 3.0 dataset; credit
+accordingly:
+
+> Cloud volume: Walt Disney Animation Studios Cloud Data Set,
+> CC BY-SA 3.0.
+
+The Stanford bunny in [`data/obj/stanford-bunny.obj`](data/obj/)
+comes from the Stanford 3D Scanning Repository.
