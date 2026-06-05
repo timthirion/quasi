@@ -554,9 +554,10 @@ fn build_scene_buffers_full(
 
 /// PT-env: assembles the env texture + sampler + importance-sampling
 /// data buffer. When `env_map` is `None`, returns a 1×1 black pixel
-/// + a stub data buffer so the bind group still validates; the WGSL
-/// integrator reads the `has_environment` uniform flag and skips
-/// env contributions entirely in that case.
+/// + a stub data buffer so the bind group still validates.
+///
+/// The WGSL integrator reads the `has_environment` uniform flag and
+/// skips env contributions entirely in that case.
 #[cfg(not(target_arch = "wasm32"))]
 fn build_environment_resources(
     device: &wgpu::Device,
