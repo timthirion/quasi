@@ -1,6 +1,7 @@
 # quasi
 
 [![CI](https://github.com/timthirion/quasi/actions/workflows/ci.yml/badge.svg)](https://github.com/timthirion/quasi/actions/workflows/ci.yml)
+[![Live demo](https://img.shields.io/badge/live-demo-brightgreen.svg)](https://timthirion.github.io/quasi/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust 2021](https://img.shields.io/badge/rust-2021_edition-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2021/index.html)
 [![WebGPU](https://img.shields.io/badge/runs_in-WebGPU-purple.svg)](https://wgpu.rs)
@@ -97,6 +98,13 @@ embedded procedural cumulus.
 wasm-pack build --target web   # produces pkg/
 python3 -m http.server         # then open http://localhost:8000/
 ```
+
+A live build of `main` is published at
+[**timthirion.github.io/quasi**](https://timthirion.github.io/quasi/)
+via GitHub Pages. The same `pkg/` powers a minimal
+[`embed.html`](https://timthirion.github.io/quasi/embed.html?sampler=sobol&compact=1)
+designed for blog `<iframe>` use — pin the sampler, integrator, and
+compact mode via query string.
 
 ## Architecture
 

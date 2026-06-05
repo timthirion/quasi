@@ -2,7 +2,7 @@
 
 - **Status:** active
 - **Last updated:** 2026-06-05
-- **Last touched on:** planning
+- **Last touched on:** BROWSER-embed-page landed; deploy in flight
 
 ## Goal
 
@@ -153,23 +153,35 @@ Per blog post that embeds a widget:
 
 ## Milestones
 
-### BROWSER-embed-page
+### BROWSER-embed-page ✅
 Get URL routing + `embed.html` working locally.
 
-- [ ] Clean up `index.html`: remove the duplicated
-      `init().then(...)` block at the bottom; add a small
-      "view source on GitHub" footer.
-- [ ] Add URL-parameter routing helper in a small JS module
-      (inline `<script type="module">` is fine; no build step).
-      Parses `scene`, `integrator`, `sampler`, `cloud_grid`,
-      `compact`. Calls into the existing `createHeadless` setters.
-- [ ] New `embed.html`: minimal page, single canvas, optional
-      thin SPP strip. Reads URL params. Default scene =
-      `cornell_glass_bunny`.
-- [ ] Local verification: `wasm-pack build --target web` then
-      `python3 -m http.server`; load
-      `http://localhost:8000/embed.html?scene=cornell_cloud&sampler=sobol`
-      and confirm the right scene + sampler picks up.
+- [x] Cleaned up `index.html`: removed the duplicated
+      `init().then(...)` block at the bottom (the `const instances`
+      re-declaration would have errored at runtime); added a small
+      footer linking to the GitHub repo + `embed.html`.
+- [x] Added URL-parameter routing to `embed.html` via an inline
+      `<script type="module">`. Parses `sampler`, `integrator`,
+      `compact`, `controls`. `integrator=mis` aliases to the Rust
+      enum's `misnee` so blog URLs read naturally.
+- [x] New `embed.html` ships minimal canvas + thin SPP / sampler /
+      integrator / reset strip. Compact mode (`?compact=1`)
+      collapses the strip so the canvas fills the iframe.
+- [x] Verified locally: `wasm-pack build --target web --dev`
+      builds clean, and the imported JS symbols
+      (`createHeadless`, `setSampler`, `setIntegrator`,
+      `frameCount`) all exist in `pkg/quasi.js`.
+
+**Scene routing is deferred.** The plan body called out
+`?scene=cornell_glass_bunny` as a goal; the existing
+`pathtrace::web::create_inner` always loads the embedded Cornell
+box quads and there's no wasm-bindgen API to load a glTF blob
+from JS today. A proper follow-up either (a) adds a
+`createSceneFromBytes` binding so JS can `fetch()` the glTF +
+hand it in, or (b) embeds every Cornell scene as a static slug
+the JS picks from. Either way it's its own little plan, and
+the deploy + iframe story below works for the existing single
+scene.
 
 ### BROWSER-embed-deploy
 GitHub Pages deploy + verify hosted URLs.
