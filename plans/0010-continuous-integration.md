@@ -1,8 +1,8 @@
 # Continuous integration
 
-- **Status:** active
+- **Status:** done
 - **Last updated:** 2026-06-05
-- **Last touched on:** planning
+- **Last touched on:** CI-base landed — plan closed
 
 ## Goal
 
@@ -86,19 +86,36 @@ in plan 0011.
 
 ## Milestones
 
-### CI-base
+### CI-base ✅
 Single milestone covering the whole thing.
 
-- [ ] `.github/workflows/ci.yml`: Rust job runs fmt + clippy +
-      test + wasm check; Python job runs the `scripts/` test
-      discovery.
-- [ ] Cargo + cargo target caching wired up (apt-get install
-      libwayland-dev if the wasm32 build needs it, etc.).
-- [ ] First push triggers a build; iterate until both jobs land
-      green.
-- [ ] Once green, add the CI status badge to `README.md` in a
-      small follow-up commit (then the aesthetic README rewrite
-      in plan 0011 can ride on top).
+- [x] `.github/workflows/ci.yml`: Rust job runs fmt + clippy + test
+      + wasm32 check; Python job runs the `scripts/` test discovery.
+      Concurrency group cancels in-flight runs when a newer commit
+      lands. `RUSTFLAGS: -D warnings` makes accidental warnings
+      hard failures.
+- [x] Caching via `Swatinem/rust-cache@v2` keyed on `Cargo.lock`.
+      No apt deps needed — `cargo check --target
+      wasm32-unknown-unknown --lib` builds cleanly without the
+      native winit toolchain.
+- [x] First push (commit `40aec02`) triggered the workflow; both
+      jobs landed green on the first attempt. Rust job: 2 m 35 s
+      cold. Python job: ~10 s.
+- [x] CI status badge added to `README.md` alongside license + Rust
+      edition + WebGPU shields, ahead of the aesthetic README
+      rewrite in plan 0011.
+
+**Pre-existing nits fixed in the same commit.** `cargo fmt` had
+drifted on 12 files; `cargo clippy --all-targets -- -D warnings`
+flagged four kinds of leftovers (excessive-precision golden-ratio
+literal, manual range check, unused loop index). All cleaned so
+the first CI run was fully green rather than reporting a backlog.
+
+**Node 20 deprecation warning.** `actions/checkout@v4` +
+`actions/setup-python@v5` print a Node 20 deprecation notice; June
+2026 cut-over to Node 24. Tracking as a follow-up — bump to
+`actions/checkout@v5` (when published) or set
+`FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true`. Not blocking.
 
 ## Open questions
 
