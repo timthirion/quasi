@@ -72,7 +72,7 @@ pub struct GpuMaterial {
 /// out of a uniform buffer in T1. Triangle geometry and materials live
 /// in storage buffers bound alongside this uniform.
 ///
-/// Layout: 80 bytes (camera 48 + 8 × u32 = 80). Must match `Uniforms`
+/// Layout: 96 bytes (camera 48 + 12 × u32 = 96). Must match `Uniforms`
 /// in `pathtrace.wgsl` byte-for-byte.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -92,6 +92,18 @@ pub struct Uniforms {
     /// 1 = walk the BVH (T2 default), 0 = linear scan (verification
     /// path retained behind `render --brute-force`).
     pub use_bvh: u32,
+    /// PT-env: 1 = the env_texture binding carries a real HDR map;
+    /// 0 = the stub 1×1 black pixel. Gates miss-shader env reads and
+    /// future env-NEE sampling.
+    pub has_environment: u32,
+    /// PT-env: width of the equirectangular env texture. 1 for the
+    /// stub.
+    pub env_width: u32,
+    /// PT-env: height of the equirectangular env texture.
+    pub env_height: u32,
+    /// 16-byte alignment pad for the uniform buffer. Read by WGSL but
+    /// ignored.
+    pub _pad_env: u32,
 }
 
 /// CPU description of the Cornell Box.
@@ -261,10 +273,15 @@ mod tests {
         // camera (48) + 8 × u32 = 80. T1 dropped the per-quad arrays;
         // triangle data lives in storage buffers now. T2 added
         // `use_bvh` in what used to be the trailing pad slot.
-        assert_eq!(size_of::<Uniforms>(), 80);
+        // PT-env grew Uniforms by 4 × u32 (has_environment, env_width,
+        // env_height, pad) — 80 → 96 bytes.
+        assert_eq!(size_of::<Uniforms>(), 96);
         assert_eq!(offset_of!(Uniforms, triangle_count), 48);
         assert_eq!(offset_of!(Uniforms, integrator_kind), 48 + 6 * 4);
         assert_eq!(offset_of!(Uniforms, use_bvh), 48 + 7 * 4);
+        assert_eq!(offset_of!(Uniforms, has_environment), 48 + 8 * 4);
+        assert_eq!(offset_of!(Uniforms, env_width), 48 + 9 * 4);
+        assert_eq!(offset_of!(Uniforms, env_height), 48 + 10 * 4);
     }
 
     #[test]

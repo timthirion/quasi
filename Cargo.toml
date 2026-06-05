@@ -21,6 +21,7 @@ pollster = "0.3"
 env_logger = "0.11"
 image = { version = "0.25", default-features = false, features = ["png", "hdr"] }
 exr = "1"
+half = { version = "2", default-features = false }
 
 [dev-dependencies]
 naga = { version = "29", features = ["wgsl-in"] }

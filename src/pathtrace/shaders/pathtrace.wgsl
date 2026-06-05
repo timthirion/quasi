@@ -108,6 +108,12 @@ struct Uniforms {
     sampler_kind: u32,
     integrator_kind: u32,
     use_bvh: u32,
+    // PT-env: 1 if `env_texture` carries a real HDR map; 0 means the
+    // stub 1×1 black pixel.
+    has_environment: u32,
+    env_width: u32,
+    env_height: u32,
+    _pad_env: u32,
 };
 
 struct BvhNode {
@@ -133,6 +139,13 @@ struct BvhNode {
 // so the trilinear sample is already in [0, 1].
 @group(0) @binding(10) var cloud_grid: texture_3d<f32>;
 @group(0) @binding(11) var cloud_grid_sampler: sampler;
+// PT-env: equirectangular HDR env map (Rgba16Float) + linear sampler,
+// plus a flat storage buffer with the importance-sampling tables. The
+// tables are read only by `sample_env_importance` / `env_pdf_at_dir`
+// (added in the NEE-on-env follow-up).
+@group(0) @binding(12) var env_texture: texture_2d<f32>;
+@group(0) @binding(13) var env_sampler: sampler;
+@group(0) @binding(14) var<storage, read> env_data: array<f32>;
 
 struct VsOut {
     @builtin(position) position: vec4<f32>,
@@ -1497,6 +1510,29 @@ fn get_camera_ray(uv_in: vec2<f32>, s: ptr<function, SamplerState>) -> Ray {
     return ray;
 }
 
+// ----- Environment map (PT-env) -----
+//
+// Equirectangular convention matches `pathtrace::env`:
+//   φ = atan2(dir.z, dir.x); θ = acos(dir.y).
+//   u = φ / 2π; v = θ / π.
+//
+// Returns black when no env map is bound (`has_environment == 0`).
+fn env_radiance_at_dir(dir: vec3<f32>) -> vec3<f32> {
+    if (U.has_environment == 0u) {
+        return vec3<f32>(0.0);
+    }
+    let d = normalize(dir);
+    let theta = acos(clamp(d.y, -1.0, 1.0));
+    var phi = atan2(d.z, d.x);
+    if (phi < 0.0) {
+        phi = phi + 2.0 * PI;
+    }
+    let u = phi / (2.0 * PI);
+    let v = theta / PI;
+    let rgba = textureSampleLevel(env_texture, env_sampler, vec2<f32>(u, v), 0.0);
+    return rgba.rgb;
+}
+
 // ----- Integrator -----
 
 struct Sample {
@@ -1542,6 +1578,20 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
         iter = iter + 1;
         let hit = trace_scene(ray);
         if (!hit.hit) {
+            // PT-env: a missed ray escapes into the env dome. Add
+            // env radiance scaled by `throughput`. MIS-weighting the
+            // env contribution against the BSDF pdf would tame
+            // fireflies — that lands when NEE on env arrives in the
+            // follow-up commit.
+            if (U.has_environment == 1u) {
+                result.radiance = result.radiance + throughput * env_radiance_at_dir(ray.dir);
+                if (bounce == 0) {
+                    result.hit = true;
+                    result.depth = 1e6;
+                    result.normal = -ray.dir;
+                    result.albedo = env_radiance_at_dir(ray.dir);
+                }
+            }
             break;
         }
         // PT-beer-lambert + PT-fog: handle the segment we just

@@ -144,6 +144,9 @@ pub struct State {
     _sampler: wgpu::Sampler,
     _cloud_grid: wgpu::Texture,
     _cloud_grid_sampler: wgpu::Sampler,
+    _env_texture: wgpu::Texture,
+    _env_sampler: wgpu::Sampler,
+    _env_data: wgpu::Buffer,
 
     targets: Targets,
 
@@ -332,6 +335,30 @@ pub(crate) fn build_pathtrace_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayou
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            // PT-env: equirectangular HDR environment map + clamp-to-edge
+            // linear sampler. `Rgba16Float` so radiance > 1 survives the
+            // texture roundtrip cleanly (sky HDRs commonly have suns at
+            // 10–1000×). Empty scenes get a 1×1 black pixel and the
+            // `has_environment` uniform flag gates reads.
+            wgpu::BindGroupLayoutEntry {
+                binding: 12,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 13,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            // PT-env: marginal + conditional CDF/PDF tables packed into
+            // one storage buffer. Layout doc lives on `build_env_storage`.
+            storage(14),
         ],
     })
 }
@@ -359,6 +386,17 @@ pub(crate) struct SceneBuffers {
     pub cloud_grid: wgpu::Texture,
     pub cloud_grid_view: wgpu::TextureView,
     pub cloud_grid_sampler: wgpu::Sampler,
+    /// PT-env: equirectangular HDR environment map. Always present;
+    /// a 1×1 black pixel stands in when no env is set, and the
+    /// integrator's `has_environment` uniform flag gates whether to
+    /// read it at all.
+    pub env_texture: wgpu::Texture,
+    pub env_view: wgpu::TextureView,
+    pub env_sampler: wgpu::Sampler,
+    /// Importance-sampling tables for the env map. Always present;
+    /// a stub buffer with a single 1.0 entry stands in when no env
+    /// is set. Layout is documented on `build_env_storage`.
+    pub env_data: wgpu::Buffer,
 }
 
 fn make_storage_buffer(
@@ -388,11 +426,12 @@ pub(crate) fn build_scene_buffers(
     queue: &wgpu::Queue,
     scene_data: &TriangleScene,
 ) -> SceneBuffers {
-    build_scene_buffers_with_grid(
+    build_scene_buffers_full(
         device,
         queue,
         scene_data,
         crate::pathtrace::grid::from_bytes_or_empty(CUMULUS_QVG),
+        None,
     )
 }
 
@@ -404,6 +443,34 @@ pub(crate) fn build_scene_buffers_with_grid(
     queue: &wgpu::Queue,
     scene_data: &TriangleScene,
     cloud_grid_data: crate::pathtrace::grid::Grid3D,
+) -> SceneBuffers {
+    build_scene_buffers_full(device, queue, scene_data, cloud_grid_data, None)
+}
+
+/// Full builder taking both an optional cloud grid and an optional
+/// environment map. PT-env's CLI flag `--env-map PATH` ends up here.
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)] // wired up by render_offscreen_with_grid_and_env later in plan 0014
+pub(crate) fn build_scene_buffers_with_grid_and_env(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    scene_data: &TriangleScene,
+    cloud_grid_data: crate::pathtrace::grid::Grid3D,
+    env_map: Option<crate::pathtrace::env::EnvironmentMap>,
+) -> SceneBuffers {
+    build_scene_buffers_full(device, queue, scene_data, cloud_grid_data, env_map)
+}
+
+#[cfg(target_arch = "wasm32")]
+type WebEnv = ();
+
+fn build_scene_buffers_full(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    scene_data: &TriangleScene,
+    cloud_grid_data: crate::pathtrace::grid::Grid3D,
+    #[cfg(not(target_arch = "wasm32"))] env_map: Option<crate::pathtrace::env::EnvironmentMap>,
+    #[cfg(target_arch = "wasm32")] _env_map: Option<WebEnv>,
 ) -> SceneBuffers {
     let uniform = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("pathtrace-uniforms"),
@@ -457,6 +524,12 @@ pub(crate) fn build_scene_buffers_with_grid(
         build_texture_array(device, queue, &scene_data.textures);
     let (cloud_grid, cloud_grid_view, cloud_grid_sampler) =
         build_cloud_grid_texture_from(device, queue, cloud_grid_data);
+    #[cfg(not(target_arch = "wasm32"))]
+    let (env_texture, env_view, env_sampler, env_data) =
+        build_environment_resources(device, queue, env_map.as_ref());
+    #[cfg(target_arch = "wasm32")]
+    let (env_texture, env_view, env_sampler, env_data) =
+        build_environment_resources_empty(device, queue);
     SceneBuffers {
         uniform,
         vertex,
@@ -472,7 +545,181 @@ pub(crate) fn build_scene_buffers_with_grid(
         cloud_grid,
         cloud_grid_view,
         cloud_grid_sampler,
+        env_texture,
+        env_view,
+        env_sampler,
+        env_data,
     }
+}
+
+/// PT-env: assembles the env texture + sampler + importance-sampling
+/// data buffer. When `env_map` is `None`, returns a 1×1 black pixel
+/// + a stub data buffer so the bind group still validates; the WGSL
+/// integrator reads the `has_environment` uniform flag and skips
+/// env contributions entirely in that case.
+#[cfg(not(target_arch = "wasm32"))]
+fn build_environment_resources(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    env_map: Option<&crate::pathtrace::env::EnvironmentMap>,
+) -> (
+    wgpu::Texture,
+    wgpu::TextureView,
+    wgpu::Sampler,
+    wgpu::Buffer,
+) {
+    use crate::pathtrace::env::{EnvironmentMap, ImportanceTables};
+    let stub = EnvironmentMap::new(1, 1, vec![[0.0, 0.0, 0.0]]);
+    let env = env_map.unwrap_or(&stub);
+    let w = env.width;
+    let h = env.height;
+    // Texture upload: Rgba16Float (4 × f16 per pixel).
+    let rgba16: Vec<u16> = env
+        .pixels
+        .iter()
+        .flat_map(|p| {
+            [
+                half::f16::from_f32(p[0]).to_bits(),
+                half::f16::from_f32(p[1]).to_bits(),
+                half::f16::from_f32(p[2]).to_bits(),
+                half::f16::from_f32(1.0).to_bits(),
+            ]
+        })
+        .collect();
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("pathtrace-env-texture"),
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        bytemuck::cast_slice(&rgba16),
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(w * 8),
+            rows_per_image: Some(h),
+        },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+    );
+    let view = texture.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("pathtrace-env-view"),
+        dimension: Some(wgpu::TextureViewDimension::D2),
+        ..Default::default()
+    });
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("pathtrace-env-sampler"),
+        // Equirectangular wraps on φ but clamps on θ — i.e. tile in x,
+        // clamp in y. Repeat on x lets a ray pointing past 2π wrap
+        // cleanly to 0.
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
+    });
+
+    // Importance-sample data buffer. Layout:
+    //   [0..h+1]                          marginal_cdf
+    //   [h+1..h+1+h]                      marginal_pdf
+    //   [h+1+h..h+1+h + (w+1)*h]          conditional_cdf
+    //   [.. + w*h]                        conditional_pdf
+    //
+    // For the empty stub (1×1) this is just a few floats; for a 2K
+    // env map it's ~16 MB. wgpu's default storage-buffer-size limit
+    // accepts both.
+    let tables = ImportanceTables::build(env);
+    let mut data = Vec::<f32>::new();
+    data.extend_from_slice(&tables.marginal_cdf);
+    data.extend_from_slice(&tables.marginal_pdf);
+    data.extend_from_slice(&tables.conditional_cdf);
+    data.extend_from_slice(&tables.conditional_pdf);
+    let env_data = make_storage_buffer(device, queue, bytemuck::cast_slice(&data), "env-tables");
+    (texture, view, sampler, env_data)
+}
+
+/// Wasm32 fallback: no HDR loading dep on wasm, but the bind group
+/// layout still needs valid env resources. Hands back a 1×1 black
+/// texture + a stub data buffer.
+#[cfg(target_arch = "wasm32")]
+fn build_environment_resources_empty(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> (
+    wgpu::Texture,
+    wgpu::TextureView,
+    wgpu::Sampler,
+    wgpu::Buffer,
+) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("pathtrace-env-texture-empty"),
+        size: wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    // Write a single black RGBA half-float texel so the texture isn't
+    // an uninitialised allocation (some validators complain).
+    let zero = [0u16; 4];
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        bytemuck::cast_slice(&zero),
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(8),
+            rows_per_image: Some(1),
+        },
+        wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+    );
+    let view = texture.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("pathtrace-env-view-empty"),
+        dimension: Some(wgpu::TextureViewDimension::D2),
+        ..Default::default()
+    });
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("pathtrace-env-sampler-empty"),
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+    // 4 bytes of zero — enough for a non-empty storage binding.
+    let env_data = make_storage_buffer(device, queue, &[0u8; 4], "env-tables-empty");
+    (texture, view, sampler, env_data)
 }
 
 /// Embeds the procedural-cumulus `.qvg` so every scene boots with a
@@ -714,6 +961,18 @@ pub(crate) fn build_pathtrace_bg(
                 binding: 11,
                 resource: wgpu::BindingResource::Sampler(&buffers.cloud_grid_sampler),
             },
+            wgpu::BindGroupEntry {
+                binding: 12,
+                resource: wgpu::BindingResource::TextureView(&buffers.env_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 13,
+                resource: wgpu::BindingResource::Sampler(&buffers.env_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 14,
+                resource: buffers.env_data.as_entire_binding(),
+            },
         ],
     })
 }
@@ -922,6 +1181,10 @@ impl State {
             cloud_grid: cloud_grid_tex,
             cloud_grid_view: _,
             cloud_grid_sampler: cloud_grid_sampler_obj,
+            env_texture: env_tex,
+            env_view: _,
+            env_sampler: env_sampler_obj,
+            env_data: env_data_buf,
         } = scene_buffers;
 
         let accum_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -964,6 +1227,9 @@ impl State {
             _sampler: sampler_obj,
             _cloud_grid: cloud_grid_tex,
             _cloud_grid_sampler: cloud_grid_sampler_obj,
+            _env_texture: env_tex,
+            _env_sampler: env_sampler_obj,
+            _env_data: env_data_buf,
             targets,
             uniforms,
             camera: OrbitCamera::new(),

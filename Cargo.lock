@@ -1488,6 +1488,7 @@ dependencies = [
  "env_logger",
  "exr",
  "gltf",
+ "half",
  "image",
  "js-sys",
  "log",
