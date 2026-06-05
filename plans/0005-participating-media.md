@@ -180,6 +180,19 @@ god-rays Cornell room is the visual.
       shader. Existing scenes (Cornell quads, glass bunny, glass
       sphere, metal bunny, textured floor) all render unchanged.
 
+**Geometry choice for the fog volume.** After the winding fix, the
+fog box no longer needs the air-gap workaround for the y=1.99
+ceiling-light. Final volume extends **above the ceiling** (y from
+0.01 to 2.05) so the entire Cornell interior sits inside the
+medium — light tile, ceiling, walls, floor all included. The fog
+box's +y face at y=2.05 is unreachable from any in-room ray
+(ceiling at y=2.0 hits first), so it's dead geometry. This avoids
+the alternative — fog top *just below* the ceiling — which would
+land coincident with the WGSL ceiling-shadow offset
+(`shadow_o = hit.point + normal · 0.001` → y=1.999 for a y=2.0
+ceiling hit). Going above the ceiling sidesteps that whole class
+of degeneracy.
+
 **Two bugs landed-and-fixed during PT-fog**, both worth noting
 because the rendered images looked plausible right up until you
 compared them to what the math demanded:

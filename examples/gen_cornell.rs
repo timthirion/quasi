@@ -251,16 +251,19 @@ fn main() {
         absorption: [0.05, 0.05, 0.05],
         scattering: [0.5, 0.5, 0.5],
     };
-    // Sized inside the Cornell room (interior is x∈[-1,1], y∈[0,2],
-    // z∈[-1,1]). Pulled in by a hair to avoid coincident-surface
-    // ambiguities with the floor / walls; the top is pulled WELL
-    // below the ceiling light at y=1.99 so the air gap around the
-    // light lets god-rays read cleanly (a coincident fog-top /
-    // light-tile is geometrically degenerate — shadow rays
-    // intermittently miss the light if they overlap exactly).
+    // Extends ABOVE the ceiling (max_y = 2.05 vs ceiling at 2.0) so
+    // the entire room volume sits inside the fog — light tile,
+    // ceiling, and all the walls. The fog box's +y face at y=2.05
+    // is unreachable from any in-room ray (the ceiling at y=2.0
+    // hits first), so it's effectively dead geometry. The
+    // alternative — fog top *just below* the ceiling — runs us
+    // into shadow-origin / fog-top coincidence (the WGSL ceiling
+    // shadow offset of 0.001 would land directly on the fog top
+    // if it sat at y=1.999). Going above the ceiling sidesteps
+    // that whole class of degeneracy and visually nothing changes.
     let (fog_positions, fog_normals, fog_indices) = aabb_box(
         [-0.99, 0.01, -0.99],
-        [0.99, 1.7, 0.99],
+        [0.99, 2.05, 0.99],
     );
     let bytes = build_gltf_with_extra_mesh(
         &room_quads,
