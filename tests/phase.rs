@@ -72,7 +72,7 @@ fn pdf_normalises_to_one_over_the_sphere() {
 fn importance_sample_mean_cosine_matches_g() {
     // `E[cos θ]` under HG = `g`. Estimate by Monte Carlo with a
     // golden-ratio Kronecker sequence.
-    let g_seq = 1.32471795724474602596_f64;
+    let g_seq = 1.324_717_957_244_746_f64;
     let a = (1.0 / g_seq) as f32;
     for &g in &[-0.7_f32, -0.3, 0.0, 0.3, 0.6, 0.85] {
         let n = 100_000_u32;
@@ -93,7 +93,7 @@ fn importance_sample_mean_cosine_matches_g() {
 #[test]
 fn sample_cos_theta_stays_in_unit_range() {
     // Cover the canonical interval edges as well.
-    let g_seq = 1.32471795724474602596_f64;
+    let g_seq = 1.324_717_957_244_746_f64;
     let a = (1.0 / g_seq) as f32;
     for &g in &[-0.9_f32, -0.5, -0.1, 0.0, 0.1, 0.5, 0.9] {
         for i in 0..1000_u32 {

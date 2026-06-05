@@ -38,7 +38,10 @@ fn fresnel_at_normal_incidence_matches_classic_formula() {
 #[test]
 fn fresnel_at_grazing_returns_one() {
     let got = dielectric::fresnel(0.0, ETA_AIR, ETA_GLASS);
-    assert!(approx(got, 1.0, 1e-5), "Fresnel at θ_i = 90° must be 1; got {got}");
+    assert!(
+        approx(got, 1.0, 1e-5),
+        "Fresnel at θ_i = 90° must be 1; got {got}"
+    );
 }
 
 #[test]
@@ -46,7 +49,10 @@ fn fresnel_energy_conserves_over_full_range() {
     for k in 0..=20 {
         let cos = k as f32 / 20.0;
         let f = dielectric::fresnel(cos, ETA_AIR, ETA_GLASS);
-        assert!(f >= 0.0 && f <= 1.0, "Fresnel out of range at cos={cos}: {f}");
+        assert!(
+            (0.0..=1.0).contains(&f),
+            "Fresnel out of range at cos={cos}: {f}"
+        );
     }
 }
 
@@ -58,10 +64,14 @@ fn refract_satisfies_snell_law() {
     for k in 1..=9 {
         let theta_i = (k as f32 / 10.0) * std::f32::consts::FRAC_PI_2;
         let wo = [-theta_i.sin(), theta_i.cos(), 0.0]; // pointing away from surface, into +y hemisphere
-        let wt = dielectric::refract(wo, n, ETA_AIR, ETA_GLASS).expect("no TIR going into denser medium");
+        let wt = dielectric::refract(wo, n, ETA_AIR, ETA_GLASS)
+            .expect("no TIR going into denser medium");
         // wt should point into the *transmitted* hemisphere
         // (`dot(n, wt) < 0`).
-        assert!(wt[1] < 0.0, "refracted direction must point into transmitted hemisphere");
+        assert!(
+            wt[1] < 0.0,
+            "refracted direction must point into transmitted hemisphere"
+        );
         let sin_t = (wt[0] * wt[0] + wt[2] * wt[2]).sqrt();
         let expected_sin_t = ETA_AIR / ETA_GLASS * theta_i.sin();
         assert!(
@@ -109,7 +119,10 @@ fn tir_kicks_in_past_critical_angle() {
     // Fresnel must also report 1.0 past the critical angle (since
     // the WGSL signals TIR through Fresnel directly).
     let f_over = dielectric::fresnel(theta_over.cos(), ETA_GLASS, ETA_AIR);
-    assert!(approx(f_over, 1.0, 1e-5), "Fresnel must hit 1.0 past TIR; got {f_over}");
+    assert!(
+        approx(f_over, 1.0, 1e-5),
+        "Fresnel must hit 1.0 past TIR; got {f_over}"
+    );
 }
 
 #[test]

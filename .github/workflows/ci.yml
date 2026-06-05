@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# Cancel in-flight runs for the same branch/PR when a newer commit lands.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  rust:
+    name: Rust (fmt + clippy + test + wasm32 check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry + build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Each job gets its own cache slot so the wasm32 build's
+          # target dir doesn't blow away the native one between
+          # subsequent CI runs.
+          shared-key: rust-quality
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Tests
+        run: cargo test --all-targets
+
+      - name: wasm32 check
+        # `cargo check` (not build) because we don't ship a wasm
+        # artifact from CI — we just need to know it still compiles.
+        run: cargo check --target wasm32-unknown-unknown --lib
+
+  python:
+    name: Python (.qvg writer tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run unittests
+        # No third-party deps — the .qvg writer is pure-Python by
+        # design so pyopenvdb's install pain doesn't gate CI.
+        run: python3 -m unittest discover scripts -p 'test_*.py' -v

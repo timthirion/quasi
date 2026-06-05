@@ -279,10 +279,8 @@ fn main() {
     // shadow offset of 0.001 would land directly on the fog top
     // if it sat at y=1.999). Going above the ceiling sidesteps
     // that whole class of degeneracy and visually nothing changes.
-    let (fog_positions, fog_normals, fog_indices) = aabb_box(
-        [-0.99, 0.01, -0.99],
-        [0.99, 2.05, 0.99],
-    );
+    let (fog_positions, fog_normals, fog_indices) =
+        aabb_box([-0.99, 0.01, -0.99], [0.99, 2.05, 0.99]);
     let bytes = build_gltf_with_extra_mesh(
         &room_quads,
         &room_materials,
@@ -543,17 +541,12 @@ fn aabb_box(min: [f32; 3], max: [f32; 3]) -> (Vec<[f32; 3]>, Vec<[f32; 3]>, Vec<
     ];
     let tris: Vec<u32> = vec![
         // -x face (normal -x). CCW viewed from -x.
-        0, 7, 3,  0, 4, 7,
-        // +x face (normal +x). CCW viewed from +x.
-        1, 2, 6,  1, 6, 5,
-        // -y face (normal -y, bottom). CCW viewed from -y.
-        0, 1, 5,  0, 5, 4,
-        // +y face (normal +y, top). CCW viewed from +y.
-        2, 3, 7,  2, 7, 6,
-        // -z face (normal -z, back). CCW viewed from -z.
-        0, 3, 2,  0, 2, 1,
-        // +z face (normal +z, front). CCW viewed from +z.
-        4, 5, 6,  4, 6, 7,
+        0, 7, 3, 0, 4, 7, // +x face (normal +x). CCW viewed from +x.
+        1, 2, 6, 1, 6, 5, // -y face (normal -y, bottom). CCW viewed from -y.
+        0, 1, 5, 0, 5, 4, // +y face (normal +y, top). CCW viewed from +y.
+        2, 3, 7, 2, 7, 6, // -z face (normal -z, back). CCW viewed from -z.
+        0, 3, 2, 0, 2, 1, // +z face (normal +z, front). CCW viewed from +z.
+        4, 5, 6, 4, 6, 7,
     ];
     let positions: Vec<[f32; 3]> = p.to_vec();
     // Flat normals don't matter for a medium-volume boundary (the
@@ -598,7 +591,11 @@ mod tests {
         ];
         let (positions, _normals, tris) = aabb_box(min, max);
         assert_eq!(tris.len() % 3, 0);
-        assert_eq!(tris.len() / 3, 12, "box must have 12 triangles (6 faces × 2)");
+        assert_eq!(
+            tris.len() / 3,
+            12,
+            "box must have 12 triangles (6 faces × 2)"
+        );
         for tri in tris.chunks(3) {
             let v0 = positions[tri[0] as usize];
             let v1 = positions[tri[1] as usize];
@@ -989,9 +986,7 @@ fn emit_gltf(
         ));
 
         let attributes = match uv_acc {
-            Some(uv) => format!(
-                r#""POSITION":{pos_acc},"NORMAL":{nor_acc},"TEXCOORD_0":{uv}"#
-            ),
+            Some(uv) => format!(r#""POSITION":{pos_acc},"NORMAL":{nor_acc},"TEXCOORD_0":{uv}"#),
             None => format!(r#""POSITION":{pos_acc},"NORMAL":{nor_acc}"#),
         };
         primitives_json.push(format!(

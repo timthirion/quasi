@@ -98,8 +98,7 @@ fn sample_uvw_midpoint_averages_neighbours() {
     let sampled = g.sample_uvw([0.5, 0.5, 0.5]);
     // At uv = (0.5, 0.5, 0.5), texel coords = `(0.5*2-0.5, ...) = (0.5, 0.5, 0.5)`
     // which sits exactly at the midpoint of all 8 voxels → 8-way average.
-    let mean: f32 =
-        values.iter().map(|&v| v as f32).sum::<f32>() / 8.0 / 255.0;
+    let mean: f32 = values.iter().map(|&v| v as f32).sum::<f32>() / 8.0 / 255.0;
     assert!(
         (sampled - mean).abs() < 1e-5,
         "got {sampled}, expected mean {mean}",

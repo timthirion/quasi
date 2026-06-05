@@ -20,8 +20,7 @@ const CORNELL_METAL_BUNNY: &[u8] = include_bytes!("../data/gltf/cornell_metal_bu
 const CORNELL_GLASS_SPHERE: &[u8] = include_bytes!("../data/gltf/cornell_glass_sphere.gltf");
 const CORNELL_GLASS_BUNNY: &[u8] = include_bytes!("../data/gltf/cornell_glass_bunny.gltf");
 const CORNELL_FOGGY_ROOM: &[u8] = include_bytes!("../data/gltf/cornell_foggy_room.gltf");
-const CORNELL_TEXTURED_FLOOR: &[u8] =
-    include_bytes!("../data/gltf/cornell_textured_floor.gltf");
+const CORNELL_TEXTURED_FLOOR: &[u8] = include_bytes!("../data/gltf/cornell_textured_floor.gltf");
 
 #[test]
 fn cornell_quads_has_expected_topology() {
@@ -85,7 +84,10 @@ fn cornell_metal_bunny_topology_matches_clay_bunny_but_material_is_metallic() {
     // Same geometry as the clay bunny — only the bunny material differs.
     assert_eq!(metal.triangle_count(), clay.triangle_count());
     assert_eq!(metal.materials.len(), clay.materials.len());
-    assert_eq!(metal.emissive_triangles.len(), clay.emissive_triangles.len());
+    assert_eq!(
+        metal.emissive_triangles.len(),
+        clay.emissive_triangles.len()
+    );
 
     // The new scene must carry at least one fully metallic (metallic=1)
     // material — anything less and the WGSL `metallic > 0.5` dispatch
@@ -100,7 +102,10 @@ fn cornell_metal_bunny_topology_matches_clay_bunny_but_material_is_metallic() {
     // contrast. Pins that the regression won't be hidden by an old
     // metallic value sneaking into the all-Lambertian scenes.
     let any_metal_in_clay = clay.materials.iter().any(|m| m.metallic >= 0.5);
-    assert!(!any_metal_in_clay, "cornell_bunny should be pure Lambertian");
+    assert!(
+        !any_metal_in_clay,
+        "cornell_bunny should be pure Lambertian"
+    );
 }
 
 #[test]
@@ -111,7 +116,10 @@ fn cornell_glass_sphere_topology_matches_lambertian_sphere_but_carries_ior() {
     // Same icosphere geometry, just a different sphere material.
     assert_eq!(glass.triangle_count(), lambertian.triangle_count());
     assert_eq!(glass.materials.len(), lambertian.materials.len());
-    assert_eq!(glass.emissive_triangles.len(), lambertian.emissive_triangles.len());
+    assert_eq!(
+        glass.emissive_triangles.len(),
+        lambertian.emissive_triangles.len()
+    );
 
     // Round-trip the ior through `extras` and out — the glass
     // scene must carry exactly one dielectric material with
@@ -121,15 +129,26 @@ fn cornell_glass_sphere_topology_matches_lambertian_sphere_but_carries_ior() {
         .iter()
         .filter(|m| m.ior > 0.0 && m.emission.iter().all(|&e| e < 0.1))
         .collect();
-    assert_eq!(glass_mats.len(), 1, "expected exactly one dielectric material");
+    assert_eq!(
+        glass_mats.len(),
+        1,
+        "expected exactly one dielectric material"
+    );
     let m = glass_mats[0];
-    assert!((m.ior - 1.5).abs() < 1e-3, "ior should round-trip to 1.5; got {}", m.ior);
+    assert!(
+        (m.ior - 1.5).abs() < 1e-3,
+        "ior should round-trip to 1.5; got {}",
+        m.ior
+    );
 
     // ...and the Lambertian sphere scene has *no* dielectrics —
     // pins that the extras round-trip doesn't accidentally fire for
     // scenes that omit it.
     let any_dielectric = lambertian.materials.iter().any(|m| m.ior > 0.0);
-    assert!(!any_dielectric, "cornell_sphere should carry no dielectrics");
+    assert!(
+        !any_dielectric,
+        "cornell_sphere should carry no dielectrics"
+    );
 }
 
 #[test]
@@ -149,7 +168,11 @@ fn cornell_glass_bunny_has_a_dielectric_with_non_zero_absorption() {
         "expected exactly one absorbing-dielectric material",
     );
     let m = dielectrics[0];
-    assert!((m.ior - 1.5).abs() < 1e-3, "ior should be 1.5; got {}", m.ior);
+    assert!(
+        (m.ior - 1.5).abs() < 1e-3,
+        "ior should be 1.5; got {}",
+        m.ior
+    );
     // Sanity: green-tinted glass means the green channel attenuates
     // less than the red and blue channels.
     assert!(
@@ -159,7 +182,10 @@ fn cornell_glass_bunny_has_a_dielectric_with_non_zero_absorption() {
     );
     // And the clay bunny carries no absorption, by contrast.
     let clay = load_glb_bytes(CORNELL_BUNNY).expect("load cornell_bunny.gltf");
-    let any_absorbing = clay.materials.iter().any(|m| m.absorption.iter().any(|&c| c > 0.0));
+    let any_absorbing = clay
+        .materials
+        .iter()
+        .any(|m| m.absorption.iter().any(|&c| c > 0.0));
     assert!(!any_absorbing, "cornell_bunny should be pure Lambertian");
 }
 
@@ -175,7 +201,11 @@ fn cornell_foggy_room_has_a_pure_scattering_medium_volume() {
                 && m.scattering.iter().any(|&c| c > 0.0)
         })
         .collect();
-    assert_eq!(media.len(), 1, "expected exactly one pure-scattering medium material");
+    assert_eq!(
+        media.len(),
+        1,
+        "expected exactly one pure-scattering medium material"
+    );
     let m = media[0];
     // Scattering must dominate absorption — otherwise we'd see a
     // dark Beer-Lambert effect instead of god-rays.
@@ -198,12 +228,13 @@ fn cornell_textured_floor_texture_contains_non_zero_pixels() {
         .filter(|p| !(p[0] == 255 && p[1] == 255 && p[2] == 255))
         .count();
     let total = tex.rgba.len() / 4;
-    eprintln!(
-        "texture: {total} pixels; {non_zero_alpha} non-zero alpha; {non_white} non-white",
-    );
+    eprintln!("texture: {total} pixels; {non_zero_alpha} non-zero alpha; {non_white} non-white",);
     eprintln!("first 16 bytes: {:?}", &tex.rgba[..16]);
     assert!(non_zero_alpha > total / 2, "texture is mostly transparent");
-    assert!(non_white > total / 2, "texture is mostly white — PNG decode failed?");
+    assert!(
+        non_white > total / 2,
+        "texture is mostly white — PNG decode failed?"
+    );
 }
 
 #[test]
@@ -211,11 +242,7 @@ fn cornell_textured_floor_carries_uvs_on_floor_vertices() {
     let scene = load_glb_bytes(CORNELL_TEXTURED_FLOOR).expect("load");
     // At least one vertex must have a non-zero UV. If every vertex
     // has uv = (0, 0), the texture sample collapses to a single texel.
-    let with_uv = scene
-        .vertices
-        .iter()
-        .filter(|v| v.uv != [0.0, 0.0])
-        .count();
+    let with_uv = scene.vertices.iter().filter(|v| v.uv != [0.0, 0.0]).count();
     assert!(
         with_uv > 0,
         "every vertex's UV is (0, 0); the loader didn't see TEXCOORD_0"

@@ -29,10 +29,8 @@ fn hash3(p: [i32; 3]) -> u32 {
     let ux = (p[0].wrapping_add(73_856_093)) as u32;
     let uy = (p[1].wrapping_add(19_349_663)) as u32;
     let uz = (p[2].wrapping_add(83_492_791)) as u32;
-    let mut h = ux
-        .wrapping_mul(0x9e37_79b1)
-        ^ uy.wrapping_mul(0x85eb_ca6b)
-        ^ uz.wrapping_mul(0xc2b2_ae35);
+    let mut h =
+        ux.wrapping_mul(0x9e37_79b1) ^ uy.wrapping_mul(0x85eb_ca6b) ^ uz.wrapping_mul(0xc2b2_ae35);
     h ^= h >> 16;
     h = h.wrapping_mul(0x85eb_ca6b);
     h ^= h >> 13;
@@ -101,15 +99,18 @@ pub fn fbm(pos: [f32; 3]) -> f32 {
 /// Procedural cloud density at `pos`. Matches WGSL `cloud_density`.
 /// Returns 0 outside the sphere; positive inside.
 pub fn density(pos: [f32; 3], center: [f32; 3], radius: f32) -> f32 {
-    let r2 = (pos[0] - center[0]).powi(2)
-        + (pos[1] - center[1]).powi(2)
-        + (pos[2] - center[2]).powi(2);
+    let r2 =
+        (pos[0] - center[0]).powi(2) + (pos[1] - center[1]).powi(2) + (pos[2] - center[2]).powi(2);
     let r = r2.sqrt() / radius.max(1e-6);
     if r >= 1.0 {
         return 0.0;
     }
     let edge = smoothstep(1.0, 0.5, r);
-    let scaled = [pos[0] * NOISE_FREQ, pos[1] * NOISE_FREQ, pos[2] * NOISE_FREQ];
+    let scaled = [
+        pos[0] * NOISE_FREQ,
+        pos[1] * NOISE_FREQ,
+        pos[2] * NOISE_FREQ,
+    ];
     let n = fbm(scaled);
     let body = ((n - NOISE_THRESHOLD) * NOISE_GAIN).max(0.0);
     edge * body

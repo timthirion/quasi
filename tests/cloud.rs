@@ -31,7 +31,10 @@ fn density_is_zero_outside_the_sphere() {
         [-0.7, 0.3, -0.7],
     ] {
         let d = cloud::density(offset, CENTER, RADIUS);
-        assert_eq!(d, 0.0, "outside-sphere density should be 0 at {offset:?}; got {d}");
+        assert_eq!(
+            d, 0.0,
+            "outside-sphere density should be 0 at {offset:?}; got {d}"
+        );
     }
 }
 
@@ -44,7 +47,11 @@ fn density_is_zero_exactly_at_the_boundary() {
         [0.0, 0.0, RADIUS],
         [-RADIUS, 0.0, 0.0],
     ] {
-        let pos = [CENTER[0] + offset[0], CENTER[1] + offset[1], CENTER[2] + offset[2]];
+        let pos = [
+            CENTER[0] + offset[0],
+            CENTER[1] + offset[1],
+            CENTER[2] + offset[2],
+        ];
         let d = cloud::density(pos, CENTER, RADIUS);
         assert_eq!(d, 0.0, "boundary density should be 0 at {pos:?}; got {d}");
     }

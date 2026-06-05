@@ -28,8 +28,8 @@ pub mod ggx;
 pub mod grid;
 pub mod integrator;
 pub mod medium;
-pub mod phase;
 pub mod mesh;
+pub mod phase;
 pub mod sampler;
 pub mod scene;
 
@@ -450,7 +450,8 @@ pub(crate) fn build_scene_buffers_with_grid(
         bytemuck::cast_slice(&scene_data.bvh.triangle_indices),
         "bvh-tri-indices",
     );
-    let (textures, textures_view, sampler) = build_texture_array(device, queue, &scene_data.textures);
+    let (textures, textures_view, sampler) =
+        build_texture_array(device, queue, &scene_data.textures);
     let (cloud_grid, cloud_grid_view, cloud_grid_sampler) =
         build_cloud_grid_texture_from(device, queue, cloud_grid_data);
     SceneBuffers {

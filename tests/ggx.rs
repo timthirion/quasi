@@ -62,7 +62,7 @@ fn importance_sample_recovers_normalisation() {
     let normal = [0.0_f32, 1.0, 0.0];
     // Deterministic 2-D low-discrepancy sequence: golden-ratio
     // Kronecker. Cheap and reproducible — no rand crate needed.
-    let g = 1.32471795724474602596_f64;
+    let g = 1.324_717_957_244_746_f64;
     let a1 = (1.0 / g) as f32;
     let a2 = (1.0 / (g * g)) as f32;
 
@@ -114,8 +114,8 @@ fn schlick_endpoints() {
         assert!((at_normal[i] - f0[i]).abs() < 1e-5);
     }
     let at_grazing = ggx::schlick_fresnel(0.0, f0);
-    for i in 0..3 {
-        assert!((at_grazing[i] - 1.0).abs() < 1e-5);
+    for &v in &at_grazing {
+        assert!((v - 1.0).abs() < 1e-5);
     }
 }
 

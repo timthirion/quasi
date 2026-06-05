@@ -17,9 +17,7 @@
 use quasi::pathtrace::medium;
 
 fn approx_eq3(a: [f32; 3], b: [f32; 3], tol: f32) -> bool {
-    (a[0] - b[0]).abs() < tol
-        && (a[1] - b[1]).abs() < tol
-        && (a[2] - b[2]).abs() < tol
+    (a[0] - b[0]).abs() < tol && (a[1] - b[1]).abs() < tol && (a[2] - b[2]).abs() < tol
 }
 
 #[test]
@@ -45,7 +43,10 @@ fn attenuation_at_zero_distance_is_identity() {
 fn positive_absorption_strictly_decreases_with_distance() {
     let sigma = [0.7_f32, 0.3, 1.1];
     let t_steps = [0.0_f32, 0.25, 0.5, 1.0, 2.0, 4.0];
-    let series: Vec<[f32; 3]> = t_steps.iter().map(|&t| medium::attenuation(sigma, t)).collect();
+    let series: Vec<[f32; 3]> = t_steps
+        .iter()
+        .map(|&t| medium::attenuation(sigma, t))
+        .collect();
     for w in series.windows(2) {
         for c in 0..3 {
             assert!(
@@ -103,7 +104,7 @@ fn sample_distance_at_xi_half_matches_log_two_over_sigma_t() {
 #[test]
 fn sample_distance_monte_carlo_mean_matches_one_over_sigma_t() {
     // E[t] under Exp(σ_t) is 1 / σ_t. Estimate over many samples.
-    let g = 1.32471795724474602596_f64;
+    let g = 1.324_717_957_244_746_f64;
     let a1 = (1.0 / g) as f32;
 
     for &sigma_t in &[0.4_f32, 1.5, 3.0] {

@@ -32,9 +32,7 @@ const MAGIC: [u8; 4] = *b"QVG1";
 /// tracer to load the embedded default cumulus at startup.
 pub fn from_bytes_or_empty(bytes: &[u8]) -> Grid3D {
     let mut cursor = std::io::Cursor::new(bytes);
-    Grid3D::load(&mut cursor).unwrap_or_else(|_| {
-        Grid3D::new([1, 1, 1], [0.0; 3], [1.0; 3])
-    })
+    Grid3D::load(&mut cursor).unwrap_or_else(|_| Grid3D::new([1, 1, 1], [0.0; 3], [1.0; 3]))
 }
 
 /// Load a `.qvg` from disk; on any I/O or parse failure, log a
@@ -277,11 +275,7 @@ fn cumulus_density(p: [f32; 3], radius: f32) -> f32 {
     // 4-octave fbm using the same value-noise scheme as the WGSL
     // cloud helpers. Cheap and deterministic per position.
     let noise_freq = 3.5;
-    let scaled = [
-        p[0] * noise_freq,
-        p[1] * noise_freq,
-        p[2] * noise_freq,
-    ];
+    let scaled = [p[0] * noise_freq, p[1] * noise_freq, p[2] * noise_freq];
     let n = fbm(scaled, 4);
 
     // Threshold + gain shape the puffiness. These values keep
@@ -304,10 +298,8 @@ fn hash3(p: [i32; 3]) -> u32 {
     let ux = (p[0].wrapping_add(73_856_093)) as u32;
     let uy = (p[1].wrapping_add(19_349_663)) as u32;
     let uz = (p[2].wrapping_add(83_492_791)) as u32;
-    let mut h = ux
-        .wrapping_mul(0x9e37_79b1)
-        ^ uy.wrapping_mul(0x85eb_ca6b)
-        ^ uz.wrapping_mul(0xc2b2_ae35);
+    let mut h =
+        ux.wrapping_mul(0x9e37_79b1) ^ uy.wrapping_mul(0x85eb_ca6b) ^ uz.wrapping_mul(0xc2b2_ae35);
     h ^= h >> 16;
     h = h.wrapping_mul(0x85eb_ca6b);
     h ^= h >> 13;

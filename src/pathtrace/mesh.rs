@@ -428,9 +428,7 @@ fn ingest_referenced_images(
                 out
             }
             other => {
-                log::warn!(
-                    "texture image #{img_idx}: unsupported glTF format {other:?}, skipping",
-                );
+                log::warn!("texture image #{img_idx}: unsupported glTF format {other:?}, skipping",);
                 continue;
             }
         };
@@ -622,10 +620,7 @@ mod tests {
         // PT-cloud: 96 (+ cloud_center + cloud_radius);
         // PT-hg: still 96 (phase_g reuses the scattering pad).
         assert_eq!(std::mem::size_of::<Material>(), 96);
-        assert_eq!(
-            std::mem::offset_of!(Material, base_color_texture_idx),
-            32,
-        );
+        assert_eq!(std::mem::offset_of!(Material, base_color_texture_idx), 32,);
         assert_eq!(std::mem::offset_of!(Material, ior), 36);
         assert_eq!(std::mem::offset_of!(Material, absorption), 48);
         assert_eq!(std::mem::offset_of!(Material, scattering), 64);
