@@ -1,8 +1,8 @@
 # Browser embed (blog widget pipeline)
 
-- **Status:** active
+- **Status:** done
 - **Last updated:** 2026-06-05
-- **Last touched on:** BROWSER-embed-page landed; deploy in flight
+- **Last touched on:** BROWSER-embed-deploy landed — plan closed
 
 ## Goal
 
@@ -183,19 +183,33 @@ the JS picks from. Either way it's its own little plan, and
 the deploy + iframe story below works for the existing single
 scene.
 
-### BROWSER-embed-deploy
+### BROWSER-embed-deploy ✅
 GitHub Pages deploy + verify hosted URLs.
 
-- [ ] New `.github/workflows/pages.yml` — wasm-pack build,
-      collect deploy artifacts, `actions/upload-pages-artifact`,
-      `actions/deploy-pages`. Runs after CI (or alongside).
-- [ ] One-time GitHub repo settings tweak (documented in plan):
-      Settings → Pages → Source: GitHub Actions.
-- [ ] First deploy lands; verify the hosted URLs work end-to-end.
-      Maybe add a 1-line README badge linking to the live demo.
-- [ ] Two-or-three preset pages in `examples/web/`:
-      `cornell_glass_bunny.html`, `cornell_cloud.html`, plus
-      perhaps the raster planner demo split out from `index.html`.
+- [x] `.github/workflows/pages.yml` lands: wasm-pack build, the
+      deploy directory assembled with `index.html`, `embed.html`,
+      `pkg/`, `data/gltf/`, `data/grids/`, then
+      `actions/upload-pages-artifact` + `actions/deploy-pages`.
+      `concurrency: pages` serialises deploys.
+- [x] One-time settings tweak performed by the user: Settings →
+      Pages → Source: GitHub Actions. First push after the
+      workflow landed failed the deploy step with
+      `Ensure GitHub Pages has been enabled`; the user enabled
+      it; the rerun went green.
+- [x] First deploy live at
+      [`https://timthirion.github.io/quasi/`](https://timthirion.github.io/quasi/).
+      `index.html`, `embed.html`, and `pkg/quasi_bg.wasm` all
+      return HTTP 200 with the correct content types.
+- [x] README gets a "Live demo" shield badge + a paragraph in the
+      Browser-build section pointing at the live build + the
+      iframe-friendly `embed.html` URL pattern.
+
+**Preset pages deferred.** The plan body called out 2-3 preset
+HTML files in `examples/web/` (per-scene shortcuts). Since scene
+routing is itself deferred to a follow-up plan, the presets would
+just be URL-param aliases for `embed.html` — low value relative
+to the linked URL going straight to it. Will revisit once scene
+routing lands.
 
 ## Open questions
 
