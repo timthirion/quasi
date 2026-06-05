@@ -224,34 +224,14 @@
           trajReadout.textContent = `t = ${t.toFixed(2)}`;
         });
       }).catch(console.error);
-
-      const instances = [];
-      init().then(async () => {
-        // Default chrome (CSS-overridden in #a).
-        instances.push(await create("a"));
-        instances.push(await create("b"));
-
-        // Headless: embedder drives the canvas via setters + a polling readout.
-        const headless = await createHeadless("c");
-        instances.push(headless);
-
-        document.getElementById("c-sampler").addEventListener("change", e => {
-          headless.setSampler(e.target.value);
-        });
-        document.getElementById("c-integrator").addEventListener("change", e => {
-          headless.setIntegrator(e.target.value);
-        });
-        document.getElementById("c-reset").addEventListener("click", () => {
-          headless.reset();
-        });
-
-        const spp = document.getElementById("c-spp");
-        const tick = () => {
-          spp.textContent = `${headless.frameCount()} spp`;
-          requestAnimationFrame(tick);
-        };
-        requestAnimationFrame(tick);
-      }).catch(console.error);
     </script>
+
+    <hr style="border-color: #333; margin: 24px 16px;" />
+    <p style="opacity: 0.7; font-size: 13px;">
+      Source on
+      <a style="color: #9cf;" href="https://github.com/timthirion/quasi">GitHub</a>.
+      Want a stripped-down embeddable widget? See
+      <a style="color: #9cf;" href="embed.html?sampler=sobol">embed.html</a>.
+    </p>
   </body>
 </html>

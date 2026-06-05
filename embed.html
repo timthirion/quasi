@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Quasi — embed</title>
+    <link rel="icon" href="data:," />
+    <style>
+      /*
+        Minimal embed: a canvas filling the viewport plus an optional
+        thin readout strip. Designed for `<iframe>` embedding inside a
+        blog post; the iframe's own width/height controls the render
+        size and the wasm side picks it up via the ResizeObserver.
+
+        URL params (parsed in the inline script below):
+          - sampler:    pcg | halton | sobol      (default: pcg)
+          - integrator: mis | misnee | bsdf       (default: mis)
+          - compact:    1                         (default: chrome shown)
+          - controls:   0                         (hide the controls strip entirely)
+       */
+
+      html, body {
+        margin: 0;
+        height: 100%;
+        background: #111;
+        color: #ccc;
+        font-family: ui-sans-serif, system-ui, sans-serif;
+        overflow: hidden;
+      }
+      #host {
+        position: absolute;
+        left: 0;
+        right: 0;
+        top: 0;
+        bottom: 28px;  /* leave room for the controls strip */
+        background: #000;
+      }
+      #controls {
+        position: absolute;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        height: 28px;
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        padding: 0 12px;
+        font-size: 12px;
+        background: rgba(0, 0, 0, 0.6);
+        border-top: 1px solid #222;
+      }
+      #controls.hidden { display: none; }
+      #controls.hidden + #host { bottom: 0; }
+      #controls select, #controls button {
+        font: inherit;
+        background: #1c1c1c;
+        color: #ccc;
+        border: 1px solid #333;
+        border-radius: 3px;
+        padding: 2px 6px;
+      }
+      #controls button { cursor: pointer; }
+      #spp {
+        margin-left: auto;
+        font-family: ui-monospace, monospace;
+        opacity: 0.75;
+      }
+
+      /* Compact mode: hide the chrome entirely, let the canvas fill. */
+      body.compact #controls { display: none; }
+      body.compact #host { bottom: 0; }
+    </style>
+  </head>
+  <body>
+    <div id="host"></div>
+    <div id="controls">
+      <label>Sampler
+        <select id="sampler-select">
+          <option value="pcg">PCG</option>
+          <option value="halton">Halton</option>
+          <option value="sobol">Sobol</option>
+        </select>
+      </label>
+      <label>Integrator
+        <select id="integrator-select">
+          <option value="mis">MIS+NEE</option>
+          <option value="bsdf">Pure BSDF</option>
+        </select>
+      </label>
+      <button id="reset" type="button">Reset</button>
+      <span id="spp">0 spp</span>
+    </div>
+
+    <script type="module">
+      import init, { createHeadless } from "./pkg/quasi.js";
+
+      // ---- URL-parameter parsing ---------------------------------
+      // Each blog post pins exactly what it wants via the iframe `src`.
+      // Unknown values fall back to the default with a console warn.
+
+      const params = new URLSearchParams(window.location.search);
+
+      // `mis` aliases to `misnee` (the underlying Rust enum). Both work in
+      // URL params; the iframe-friendly one is shorter to type.
+      const integratorFromParam = (v) => {
+        if (v === "mis" || v === "misnee") return "misnee";
+        if (v === "bsdf") return "bsdf";
+        return null;
+      };
+      const samplerFromParam = (v) => {
+        if (v === "pcg" || v === "halton" || v === "sobol") return v;
+        return null;
+      };
+
+      const wantSampler    = samplerFromParam(params.get("sampler"));
+      const wantIntegrator = integratorFromParam(params.get("integrator"));
+      const wantCompact    = params.get("compact") === "1";
+      const wantControlsOff = params.get("controls") === "0";
+
+      if (wantCompact || wantControlsOff) {
+        document.body.classList.add("compact");
+      }
+
+      const samplerSelect    = document.getElementById("sampler-select");
+      const integratorSelect = document.getElementById("integrator-select");
+      const resetBtn         = document.getElementById("reset");
+      const sppReadout       = document.getElementById("spp");
+
+      if (wantSampler)    samplerSelect.value    = wantSampler;
+      if (wantIntegrator) integratorSelect.value = wantIntegrator === "misnee" ? "mis" : wantIntegrator;
+
+      // ---- Boot the renderer -------------------------------------
+
+      init().then(async () => {
+        const inst = await createHeadless("host");
+
+        // Apply URL-pinned config before kicking the render loop visibly.
+        if (wantSampler)    inst.setSampler(wantSampler);
+        if (wantIntegrator) inst.setIntegrator(wantIntegrator);
+
+        samplerSelect.addEventListener("change", (e) => {
+          inst.setSampler(e.target.value);
+        });
+        integratorSelect.addEventListener("change", (e) => {
+          // Map iframe-friendly `mis` back to the Rust enum value `misnee`.
+          const v = e.target.value === "mis" ? "misnee" : e.target.value;
+          inst.setIntegrator(v);
+        });
+        resetBtn.addEventListener("click", () => inst.reset());
+
+        const tickReadout = () => {
+          sppReadout.textContent = `${inst.frameCount()} spp`;
+          requestAnimationFrame(tickReadout);
+        };
+        requestAnimationFrame(tickReadout);
+      }).catch((e) => {
+        console.error(e);
+        const host = document.getElementById("host");
+        host.style.color = "#f88";
+        host.style.padding = "16px";
+        host.textContent =
+          "Quasi failed to start. This page needs a WebGPU-capable " +
+          "browser (recent Chrome, Edge, or Safari Technology Preview).";
+      });
+    </script>
+  </body>
+</html>
