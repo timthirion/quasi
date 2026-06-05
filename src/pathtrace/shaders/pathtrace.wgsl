@@ -14,6 +14,11 @@
 // pure BSDF) dispatch at runtime off `U.sampler_kind` / `U.integrator_kind`.
 
 const MAX_BOUNCES: i32 = 5;
+// Total loop iterations including medium-boundary crossings, which
+// don't count as real bounces (no BSDF eval, no scatter). Bounded
+// generously above MAX_BOUNCES so a path can cross a couple of
+// medium volumes without losing bounce budget.
+const MAX_PATH_ITERATIONS: i32 = 32;
 const PI: f32 = 3.14159265359;
 
 const SAMPLER_PCG: u32 = 0u;
@@ -1467,7 +1472,23 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
     var current_medium: u32 = NO_MEDIUM;
     let mis_nee_mode = U.integrator_kind == INTEGRATOR_MIS_NEE;
 
-    for (var bounce = 0; bounce < MAX_BOUNCES; bounce = bounce + 1) {
+    // `bounce` counts REAL light bounces (surface BSDF + volume
+    // scattering). `iter` counts everything including medium-volume
+    // boundary crossings (which don't sample a direction or
+    // attenuate throughput on their own — they're just bookkeeping).
+    // Keeping the two separate matters: without it, a camera ray
+    // that enters and exits a cloud bounding box "spends" two of its
+    // MAX_BOUNCES on doing nothing, so the in-silhouette pixels get
+    // ~2 fewer indirect-light bounces than out-of-silhouette pixels
+    // and the bounding-box silhouette reads as a visible darker
+    // square in the rendered image.
+    var bounce: i32 = 0;
+    var iter: i32 = 0;
+    loop {
+        if (bounce >= MAX_BOUNCES || iter >= MAX_PATH_ITERATIONS) {
+            break;
+        }
+        iter = iter + 1;
         let hit = trace_scene(ray);
         if (!hit.hit) {
             break;
@@ -1546,6 +1567,8 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
                     }
                     ray.origin = scatter_pos;
                     ray.dir = wi;
+                    // Volume scattering counts as a real bounce.
+                    bounce = bounce + 1;
                     continue;
                 }
             }
@@ -1682,6 +1705,9 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
                 current_medium = NO_MEDIUM;
             }
         }
+
+        // Surface BSDF bounce — counts as a real light bounce.
+        bounce = bounce + 1;
     }
     return result;
 }
