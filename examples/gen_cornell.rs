@@ -59,6 +59,7 @@ fn main() {
         ior: 0.0,
         absorption: [0.0, 0.0, 0.0],
         scattering: [0.0, 0.0, 0.0],
+        phase_g: 0.0,
         cloud_center: [0.0, 0.0, 0.0],
         cloud_radius: 0.0,
     };
@@ -109,6 +110,7 @@ fn main() {
         ior: 0.0,
         absorption: [0.0, 0.0, 0.0],
         scattering: [0.0, 0.0, 0.0],
+        phase_g: 0.0,
         cloud_center: [0.0, 0.0, 0.0],
         cloud_radius: 0.0,
     };
@@ -143,6 +145,7 @@ fn main() {
         ior: 0.0,
         absorption: [0.0, 0.0, 0.0],
         scattering: [0.0, 0.0, 0.0],
+        phase_g: 0.0,
         cloud_center: [0.0, 0.0, 0.0],
         cloud_radius: 0.0,
     };
@@ -180,6 +183,7 @@ fn main() {
         // body; tiny green absorption leaves the colour green-leaning.
         absorption: [1.2, 0.1, 1.5],
         scattering: [0.0, 0.0, 0.0],
+        phase_g: 0.0,
         cloud_center: [0.0, 0.0, 0.0],
         cloud_radius: 0.0,
     };
@@ -216,6 +220,7 @@ fn main() {
         ior: 1.5,
         absorption: [0.0, 0.0, 0.0],
         scattering: [0.0, 0.0, 0.0],
+        phase_g: 0.0,
         cloud_center: [0.0, 0.0, 0.0],
         cloud_radius: 0.0,
     };
@@ -260,6 +265,7 @@ fn main() {
         // keeps the room bright without a smoke-dense feel.
         absorption: [0.05, 0.05, 0.05],
         scattering: [0.5, 0.5, 0.5],
+        phase_g: 0.0,
         cloud_center: [0.0, 0.0, 0.0],
         cloud_radius: 0.0,
     };
@@ -312,6 +318,14 @@ fn main() {
         // water-droplet clouds (single-scattering albedo ≈ 0.99).
         absorption: [0.1, 0.1, 0.1],
         scattering: [10.0, 10.0, 10.0],
+        // Forward-scattering anisotropy. Real water-droplet Mie
+        // scattering peaks near g ≈ 0.85, but at that value the
+        // overhead-lit Cornell cloud reads as washed out (forward
+        // scattering pushes light *down* through the cloud, away
+        // from camera). 0.4 is a compromise — visibly anisotropic
+        // (multi-scatter softened, top-edge slightly brighter)
+        // without collapsing the cloud body.
+        phase_g: 0.4,
         cloud_center: [0.0, 1.0, 0.0],
         cloud_radius: 0.5,
     };
@@ -854,6 +868,7 @@ fn build_cornell_textured_floor() -> Vec<u8> {
         ior: 0.0,
         absorption: [0.0, 0.0, 0.0],
         scattering: [0.0, 0.0, 0.0],
+        phase_g: 0.0,
         cloud_center: [0.0, 0.0, 0.0],
         cloud_radius: 0.0,
     });
@@ -1019,6 +1034,9 @@ fn emit_gltf(
                     r#""scattering":[{},{},{}]"#,
                     m.scattering[0], m.scattering[1], m.scattering[2],
                 ));
+            }
+            if m.phase_g != 0.0 {
+                extras_parts.push(format!(r#""phase_g":{}"#, m.phase_g));
             }
             if m.cloud_radius > 0.0 {
                 extras_parts.push(format!(

@@ -27,6 +27,7 @@ pub mod dielectric;
 pub mod ggx;
 pub mod integrator;
 pub mod medium;
+pub mod phase;
 pub mod mesh;
 pub mod sampler;
 pub mod scene;

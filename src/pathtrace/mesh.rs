@@ -127,7 +127,10 @@ pub struct Material {
     /// inside the medium may *scatter* (change direction) before
     /// hitting a surface. PT-fog uses an isotropic phase function.
     pub scattering: [f32; 3],
-    pub _pad_scattering: f32,
+    /// PT-hg: Henyey-Greenstein asymmetry parameter. `0.0` = isotropic
+    /// (PT-fog default); positive = forward-scattering (water clouds at
+    /// 0.7–0.85 give the "silver lining" look); negative = backward.
+    pub phase_g: f32,
     /// Procedural cloud sphere centre, world-space. Read only when
     /// `cloud_radius > 0` — defines the position of the fbm-
     /// modulated density volume.
@@ -158,7 +161,7 @@ impl Default for Material {
             absorption: [0.0, 0.0, 0.0],
             _pad_absorption: 0.0,
             scattering: [0.0, 0.0, 0.0],
-            _pad_scattering: 0.0,
+            phase_g: 0.0,
             cloud_center: [0.0, 0.0, 0.0],
             cloud_radius: 0.0,
         }
@@ -476,7 +479,7 @@ fn extract_material(material: &gltf::Material, texture_remap: &[u32]) -> Materia
         absorption: extras.absorption,
         _pad_absorption: 0.0,
         scattering: extras.scattering,
-        _pad_scattering: 0.0,
+        phase_g: extras.phase_g,
         cloud_center: extras.cloud_center,
         cloud_radius: extras.cloud_radius,
     }
@@ -490,6 +493,8 @@ struct MaterialExtras {
     absorption: [f32; 3],
     #[serde(default)]
     scattering: [f32; 3],
+    #[serde(default)]
+    phase_g: f32,
     #[serde(default)]
     cloud_center: [f32; 3],
     #[serde(default)]
@@ -611,10 +616,11 @@ mod tests {
     }
 
     #[test]
-    fn material_is_96_bytes_with_cloud_fields_at_80() {
+    fn material_is_96_bytes_with_phase_g_at_76() {
         // PT-textures: 48; PT-dielectrics: 48 (ior in pad);
         // PT-beer-lambert: 64 (+ absorption); PT-fog: 80 (+ scattering);
-        // PT-cloud: 96 (+ cloud_center + cloud_radius).
+        // PT-cloud: 96 (+ cloud_center + cloud_radius);
+        // PT-hg: still 96 (phase_g reuses the scattering pad).
         assert_eq!(std::mem::size_of::<Material>(), 96);
         assert_eq!(
             std::mem::offset_of!(Material, base_color_texture_idx),
@@ -623,6 +629,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Material, ior), 36);
         assert_eq!(std::mem::offset_of!(Material, absorption), 48);
         assert_eq!(std::mem::offset_of!(Material, scattering), 64);
+        assert_eq!(std::mem::offset_of!(Material, phase_g), 76);
         assert_eq!(std::mem::offset_of!(Material, cloud_center), 80);
         assert_eq!(std::mem::offset_of!(Material, cloud_radius), 92);
     }

@@ -78,9 +78,12 @@ struct Material {
     _pad2: f32,
     // PT-fog: per-channel scattering coefficient. Together with
     // `absorption` defines the medium's extinction `σ_t = σ_a + σ_s`
-    // and scattering albedo `σ_s / σ_t`. Isotropic phase function.
+    // and scattering albedo `σ_s / σ_t`.
     scattering: vec3<f32>,
-    _pad3: f32,
+    // PT-hg: Henyey-Greenstein asymmetry parameter. `0` = isotropic
+    // (PT-fog default); positive = forward-scattering (clouds);
+    // negative = backward.
+    phase_g: f32,
     // PT-cloud: procedural-cloud sphere centre + radius. When
     // `cloud_radius > 0`, the path tracer treats `absorption` and
     // `scattering` as MAXIMUM values and modulates them by an fbm
@@ -1092,17 +1095,54 @@ fn sample_volume_distance(
     return out;
 }
 
-// Isotropic phase function direction (uniform on the sphere).
-// `pdf = 1 / (4π)`.
-fn uniform_sphere_sample(s: ptr<function, SamplerState>) -> vec3<f32> {
-    let r = next_2d(s);
-    let z = 1.0 - 2.0 * r.x;
-    let phi = 2.0 * PI * r.y;
-    let xy_radius = sqrt(max(0.0, 1.0 - z * z));
-    return vec3<f32>(xy_radius * cos(phi), xy_radius * sin(phi), z);
-}
+// Henyey-Greenstein phase function (PT-hg).
+//
+// `p(cos θ; g) = (1 - g²) / (4π · (1 + g² - 2g cos θ)^{3/2})`
+//
+// `g ∈ [-1, 1]`. `g = 0` is the isotropic phase (`1 / (4π)`);
+// positive `g` peaks forward (cos θ → 1), negative peaks backward.
+// `phase_hg_eval` is also the sample pdf — the phase function IS
+// its own importance-sampling pdf (zonal symmetry collapses the
+// problem to 1-D cosine inversion).
 
 const PHASE_ISOTROPIC: f32 = 0.07957747154594767; // 1 / (4 * π)
+
+fn phase_hg_eval(cos_theta: f32, g: f32) -> f32 {
+    if (abs(g) < 1e-4) {
+        return PHASE_ISOTROPIC;
+    }
+    let denom = 1.0 + g * g - 2.0 * g * cos_theta;
+    return (1.0 - g * g) / (4.0 * PI * denom * sqrt(max(denom, 1e-30)));
+}
+
+// Sample a Henyey-Greenstein direction relative to the incoming
+// direction `incoming` (unit vector along the ray that's about to
+// scatter). Returns a unit world-space direction.
+fn sample_hg_direction(incoming: vec3<f32>, g: f32, s: ptr<function, SamplerState>) -> vec3<f32> {
+    let r = next_2d(s);
+    var cos_theta: f32;
+    if (abs(g) < 1e-4) {
+        cos_theta = 1.0 - 2.0 * r.x;
+    } else {
+        let sqr = (1.0 - g * g) / (1.0 - g + 2.0 * g * r.x);
+        cos_theta = clamp((1.0 + g * g - sqr * sqr) / (2.0 * g), -1.0, 1.0);
+    }
+    let sin_theta = sqrt(max(0.0, 1.0 - cos_theta * cos_theta));
+    let phi = 2.0 * PI * r.y;
+
+    // Local orthonormal basis aligned to `incoming` (+z). Same
+    // axis-swap trick as `cosine_sample_hemisphere`.
+    let nrm = normalize(incoming);
+    var a: vec3<f32>;
+    if (abs(nrm.x) > 0.9) {
+        a = vec3<f32>(0.0, 1.0, 0.0);
+    } else {
+        a = vec3<f32>(1.0, 0.0, 0.0);
+    }
+    let vv = normalize(cross(nrm, a));
+    let uu = cross(nrm, vv);
+    return normalize(uu * cos(phi) * sin_theta + vv * sin(phi) * sin_theta + nrm * cos_theta);
+}
 
 // A "medium volume" material has no dielectric BSDF (ior == 0) but
 // carries non-zero extinction (absorption or scattering). The ray
@@ -1414,11 +1454,12 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
                     // Volume scatter event inside the medium.
                     let scatter_pos = ray.origin + ray.dir * vs.t;
 
-                    // NEE through media — isotropic phase function
-                    // makes f and pdf both equal `1/(4π)`, so the
-                    // MIS weight just gates the contribution; we
-                    // pre-compute it that way for symmetry with the
-                    // surface-NEE path.
+                    // NEE through media — phase function evaluated
+                    // at the shadow-ray direction (Henyey-Greenstein
+                    // for non-zero `phase_g`, isotropic otherwise).
+                    // Phase pdf is the function itself; we use it as
+                    // both `f` and the MIS BSDF pdf.
+                    let g = medium_mat.phase_g;
                     if (mis_nee_mode) {
                         let ls = sample_light(scatter_pos, s);
                         if (ls.valid) {
@@ -1426,18 +1467,22 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
                                 scatter_pos, ls.wi, ls.dist, current_medium, s);
                             let trans_sum = trans.x + trans.y + trans.z;
                             if (trans_sum > 0.0) {
-                                let f = vec3<f32>(PHASE_ISOTROPIC);
-                                let wlight = power_heuristic(ls.pdf_w, PHASE_ISOTROPIC);
+                                let cos_nee = dot(ray.dir, ls.wi);
+                                let phase = phase_hg_eval(cos_nee, g);
+                                let f = vec3<f32>(phase);
+                                let wlight = power_heuristic(ls.pdf_w, phase);
                                 result.radiance = result.radiance
                                     + throughput * f * trans * ls.le * wlight / ls.pdf_w;
                             }
                         }
                     }
 
-                    // Phase-function bounce — isotropic, uniform on
-                    // the sphere. `f / pdf = 1` so `bs.weight` is 1.
-                    let wi = uniform_sphere_sample(s);
-                    prev_bsdf_pdf = PHASE_ISOTROPIC;
+                    // Phase-function bounce. `f / pdf = 1` because
+                    // we importance-sample directly from the phase
+                    // function — bs.weight stays 1.
+                    let wi = sample_hg_direction(ray.dir, g, s);
+                    let cos_bounce = dot(ray.dir, wi);
+                    prev_bsdf_pdf = phase_hg_eval(cos_bounce, g);
                     prev_point = scatter_pos;
                     specular_bounce = false;
                     // `current_medium` is unchanged — the scatter
