@@ -71,8 +71,7 @@ fn synth_sky(width: u32, height: u32) -> Vec<Rgb<f32>> {
             if cos_sun > sun_cos_threshold {
                 rgb = sun_radiance;
             } else if cos_sun > sun_halo_threshold {
-                let t = (cos_sun - sun_halo_threshold)
-                    / (sun_cos_threshold - sun_halo_threshold);
+                let t = (cos_sun - sun_halo_threshold) / (sun_cos_threshold - sun_halo_threshold);
                 rgb = lerp3(rgb, sun_halo_radiance, t);
             }
 
