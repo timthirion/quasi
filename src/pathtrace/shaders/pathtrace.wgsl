@@ -578,11 +578,22 @@ fn medium_transmittance_ratio_tracking(
     if (sigma_t_maj <= 0.0) {
         return vec3<f32>(1.0);
     }
+    // Clip the loop to the ray's actual sphere-intersection range.
+    // Outside the sphere `density == 0`, so iterating there only
+    // wastes RNG samples and (because the per-pixel sample count
+    // diverges) produces a visible bounding-box silhouette at
+    // moderate spp.
+    let range = cloud_sphere_range(origin, dir, m.cloud_center, m.cloud_radius);
+    let t_start = max(0.0, range.x);
+    let t_end = min(t_length, range.y);
+    if (range.y <= 0.0 || t_start >= t_end) {
+        return vec3<f32>(1.0);
+    }
     var T = vec3<f32>(1.0);
-    var t: f32 = 0.0;
+    var t: f32 = t_start;
     for (var iter = 0; iter < HETERO_MAX_ITER; iter = iter + 1) {
         t = t - log(max(1.0 - next_1d(s), 1e-30)) / sigma_t_maj;
-        if (t >= t_length) {
+        if (t >= t_end) {
             return T;
         }
         let pos = origin + dir * t;
@@ -948,6 +959,34 @@ fn cloud_density(pos: vec3<f32>, center: vec3<f32>, radius: f32) -> f32 {
     return edge * body;
 }
 
+// Analytic ray-sphere intersection used to clip volume tracking to
+// the support of the cloud density (the sphere bounded by
+// `cloud_radius`). Outside the sphere `density == 0`, so iterating
+// through that range only burns RNG samples without affecting the
+// estimator — and the sample-count mismatch between pixels whose
+// rays cross the cloud bounding box but miss the sphere vs. those
+// that don't show up as a hard square boundary at moderate spp.
+//
+// Returns `(t_enter, t_exit)`. When the ray misses the sphere
+// outright, both come back negative; the caller checks `t_exit > 0`
+// before doing any work.
+fn cloud_sphere_range(
+    ray_origin: vec3<f32>,
+    ray_dir: vec3<f32>,
+    center: vec3<f32>,
+    radius: f32,
+) -> vec2<f32> {
+    let oc = ray_origin - center;
+    let b = dot(oc, ray_dir);
+    let c = dot(oc, oc) - radius * radius;
+    let disc = b * b - c;
+    if (disc <= 0.0) {
+        return vec2<f32>(-1.0, -1.0);
+    }
+    let sd = sqrt(disc);
+    return vec2<f32>(-b - sd, -b + sd);
+}
+
 // ----- Participating media (PT-beer-lambert + PT-fog) -----
 //
 // Two helpers feed the volumetric loop in `path_trace`:
@@ -1024,10 +1063,19 @@ fn sample_volume_distance_heterogeneous(
     if (sigma_t_max.x > 1e-30) {
         albedo_max = clamp(m.scattering.x / sigma_t_max.x, 0.0, 1.0);
     }
-    var t: f32 = 0.0;
+    // Clip delta tracking to the ray's actual sphere-intersection
+    // range (see comment on `medium_transmittance_ratio_tracking`
+    // for why — bounding-box silhouette artifact at moderate spp).
+    let range = cloud_sphere_range(ray_origin, ray_dir, m.cloud_center, m.cloud_radius);
+    let t_start = max(0.0, range.x);
+    let t_end = min(t_max, range.y);
+    if (range.y <= 0.0 || t_start >= t_end) {
+        return out;
+    }
+    var t: f32 = t_start;
     for (var iter = 0; iter < HETERO_MAX_ITER; iter = iter + 1) {
         t = t - log(max(1.0 - next_1d(s), 1e-30)) / sigma_t_maj;
-        if (t >= t_max) {
+        if (t >= t_end) {
             return out;
         }
         let pos = ray_origin + ray_dir * t;
