@@ -1,8 +1,8 @@
 # README aesthetic rewrite
 
-- **Status:** active
+- **Status:** done
 - **Last updated:** 2026-06-05
-- **Last touched on:** planning
+- **Last touched on:** README-revamp landed — plan closed
 
 ## Goal
 
@@ -98,17 +98,21 @@ Grouped:
 
 ## Milestones
 
-### README-revamp
+### README-revamp ✅
 Single milestone — content + layout pass.
 
-- [ ] Write the new `README.md` with the section structure above.
-      Hero gallery uses HTML `<img>` tags inside a markdown table
-      for size control.
-- [ ] Verify the rendered output on GitHub (or via a local
-      markdown preview) — image paths resolve, the table renders
-      as a 2×2 grid, the badges still work.
-- [ ] Linking sanity: `AGENTS.md`, `plans/ROADMAP.md`,
-      `scripts/README.md`, `LICENSE` all point to live files.
+- [x] New `README.md` ships in commit `2488792`. Structure:
+      title + badges, hero gallery (2×2 HTML `<table>` with
+      `<img width="360">`), pitch, features grouped by area,
+      quick-start, architecture pointer, roadmap pointer, scripts
+      pointer, license + credits.
+- [x] GitHub render verified via `gh api .../readme -H 'Accept:
+      application/vnd.github.html'`: badge row resolves, the 2×2
+      table renders, all four `cornell_*_reference.png` paths
+      resolve to the repo's image files, all internal links
+      (`AGENTS.md`, `plans/`, `plans/ROADMAP.md`,
+      `scripts/README.md`, `LICENSE`, `examples/gen_cloud.rs`,
+      `data/grids/`, `data/obj/`) resolve.
 
 ## Open questions
 
