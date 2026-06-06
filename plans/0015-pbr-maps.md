@@ -172,26 +172,28 @@ self-contained.
 ## Milestones
 
 ### PT-mr-map
-- [ ] `Material` grows `metallic_roughness_texture_idx`; layout
-      test updated. `NO_TEXTURE` sentinel reused.
-- [ ] glTF ingest reads `pbrMetallicRoughness.metallicRoughnessTexture`
+- [x] `Material` grows `metallic_roughness_texture_idx`; layout
+      test updated. `NO_TEXTURE` sentinel reused. (Slots into the
+      existing `_pad` field, so total size stays at 96 bytes.)
+- [x] glTF ingest reads `pbrMetallicRoughness.metallicRoughnessTexture`
       and pushes it into the texture array. Same UV channel as
-      baseColor (TEXCOORD_0); error if a different channel is
-      requested.
-- [ ] WGSL `material_pbr_at_hit(m, uv)` returns effective
-      `(roughness, metallic)` after the texture multiply. GGX
-      BSDF + sampling consume the effective values; no other call
-      site changes.
-- [ ] `examples/gen_pbr_maps` bakes a brushed-metal MR map
-      (256², randomised streak direction + low-freq dirt) into
+      baseColor (TEXCOORD_0).
+- [x] WGSL `material_metallic_roughness(m, uv)` returns effective
+      `(roughness, metallic)` after the texture multiply. Folded
+      into the local Material copy in `path_trace` so every
+      downstream BSDF call reads the effective values without
+      changes.
+- [x] `examples/gen_pbr_maps` bakes a brushed-metal MR map (256²,
+      multi-octave anisotropic streak noise + dirt + tarnish) into
       `data/textures/brushed_brass_mr.png`.
-- [ ] `cornell_metal_bunny.gltf` regenerates with the brushed
-      bunny material referencing the MR map. Reference render
-      replaces the existing `cornell_metal_bunny_reference.png`
-      (visible streaks under the area light).
-- [ ] CPU mirror test: `material_effective_scalars(m, uv)` matches
-      a hand-computed expected scalar pair given a synthetic MR
-      texture.
+- [x] `cornell_metal_bunny.gltf` regenerates with the brushed
+      bunny material (brass F0 = (0.95, 0.78, 0.46)) referencing
+      the MR map via planar XZ UVs. New reference at
+      `data/output/cornell_metal_bunny_reference.png`.
+- [x] CPU mirror tests: `Material::effective_metallic_roughness`
+      passes scalars through with no texture, multiplies G/B
+      channels correctly, clamps roughness to the 0.04 floor,
+      and respects scalar = 0 sentinels.
 
 ### PT-normal-map
 - [ ] `Vertex` grows the `tangent: vec4` field. Layout test

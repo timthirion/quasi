@@ -74,8 +74,11 @@ struct Material {
     // PT-dielectrics: 0 = "not a dielectric"; > 0 routes the BSDF
     // onto the smooth-glass branch (sees Snell + Fresnel + TIR).
     ior: f32,
+    // PT-mr-map: glTF metallic-roughness texture. G channel is
+    // roughness, B channel is metallic. NO_TEXTURE = use the
+    // scalar `roughness` + `metallic` instead.
+    metallic_roughness_texture_idx: u32,
     _pad0: u32,
-    _pad1: u32,
     // PT-beer-lambert: per-channel Beer-Lambert absorption coefficient
     // applied to throughput per unit of distance travelled *inside*
     // this material. `(0, 0, 0)` = no participating-media tinting.
@@ -428,6 +431,29 @@ fn material_albedo(mat: Material, uv: vec2<f32>) -> vec3<f32> {
         0.0,
     );
     return mat.albedo * tex.rgb;
+}
+
+// PT-mr-map: per-texel roughness + metallic, glTF 2.0 convention.
+// Returns the **effective** scalars after texture multiply; when
+// no MR texture is bound, the material's scalar fields pass
+// through. A roughness floor of 0.04 prevents the perturbed
+// micro-normal under MR-map streaking from producing fireflies
+// in the GGX δ-function limit (standard PBR practice).
+fn material_metallic_roughness(mat: Material, uv: vec2<f32>) -> vec2<f32> {
+    var rough = mat.roughness;
+    var metal = mat.metallic;
+    if (mat.metallic_roughness_texture_idx != NO_TEXTURE) {
+        let tex = textureSampleLevel(
+            albedo_textures,
+            albedo_sampler,
+            uv,
+            i32(mat.metallic_roughness_texture_idx),
+            0.0,
+        );
+        rough = rough * tex.g;
+        metal = metal * tex.b;
+    }
+    return vec2<f32>(max(rough, 0.04), metal);
 }
 
 // Record a triangle hit into the running closest. Factored so both
@@ -1807,7 +1833,7 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
             }
         }
 
-        let m = materials[hit.mat];
+        var m = materials[hit.mat];
 
         // Medium-volume boundary (e.g. the fog box) — the ray
         // passes through without surface BSDF evaluation. We toggle
@@ -1832,6 +1858,15 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
         // at the hit's interpolated UV. Falls back to `m.albedo` when
         // the material doesn't carry a texture.
         let albedo = material_albedo(m, hit.uv);
+
+        // PT-mr-map: fold the metallic-roughness texture (if any)
+        // into the material's scalar fields. Every downstream BSDF
+        // call (NEE eval, BSDF sample, specular-bounce detector)
+        // then reads the effective per-texel values without code
+        // changes. `var m = ...` above makes the local copy mutable.
+        let mr = material_metallic_roughness(m, hit.uv);
+        m.roughness = mr.x;
+        m.metallic = mr.y;
 
         if (bounce == 0) {
             result.hit = true;

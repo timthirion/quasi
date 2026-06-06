@@ -136,9 +136,9 @@ fn main() {
     //    is brushed steel (metallic = 1, roughness = 0.3, F0 from the
     //    Schlick conductor albedo).
     let metal_bunny_mat = GpuMaterial {
-        // F0 for steel ≈ (0.56, 0.57, 0.58) in linear; we go a touch
-        // warmer to make the colour bleed from the red wall pop.
-        albedo: [0.60, 0.58, 0.55],
+        // F0 for brass ≈ (0.95, 0.78, 0.46) in linear — warm gold
+        // that picks up the red/green walls beautifully under MIS.
+        albedo: [0.95, 0.78, 0.46],
         roughness: 0.3,
         emission: [0.0, 0.0, 0.0],
         metallic: 1.0,
@@ -149,7 +149,18 @@ fn main() {
         cloud_center: [0.0, 0.0, 0.0],
         cloud_radius: 0.0,
     };
-    let bytes = build_gltf_with_extra_mesh(
+    // PT-mr-map: the metal bunny material's per-texel roughness +
+    // metallic come from the brushed-brass MR texture
+    // (`data/textures/brushed_brass_mr.png`, baked by
+    // `cargo run --example gen_pbr_maps`). The scalar fields
+    // multiply into the texture sample, so `metallic = 1.0,
+    // roughness = 1.0` lets the texel values pass through.
+    let metal_bunny_mat = GpuMaterial {
+        metallic: 1.0,
+        roughness: 1.0,
+        ..metal_bunny_mat
+    };
+    let bytes = build_cornell_brushed_metal_bunny(
         &room_quads,
         &room_materials,
         &bunny_positions,
@@ -160,7 +171,7 @@ fn main() {
     let path = out_dir.join("cornell_metal_bunny.gltf");
     fs::write(&path, &bytes).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
     println!(
-        "wrote {} ({} bytes, room + brushed-steel bunny → {} triangles)",
+        "wrote {} ({} bytes, room + brushed-brass bunny + MR map → {} triangles)",
         path.display(),
         bytes.len(),
         room_quads.len() * 2 + bunny_indices.len() / 3,
@@ -876,14 +887,60 @@ fn build_gltf_with_extra_mesh(
         indices: sphere_indices.to_vec(),
     });
     let no_textures = vec![None; palette.len()];
-    emit_gltf(&palette, &no_textures, &batches, &[])
+    emit_gltf(&palette, &no_textures, &no_textures, &batches, &[])
 }
 
 fn build_gltf(quads: &[GpuQuad], materials: &[GpuMaterial], subdiv: usize) -> Vec<u8> {
     let (palette, quad_material) = unique_materials(materials);
     let batches = triangulate(quads, &quad_material, palette.len(), subdiv);
     let no_textures = vec![None; palette.len()];
-    emit_gltf(&palette, &no_textures, &batches, &[])
+    emit_gltf(&palette, &no_textures, &no_textures, &batches, &[])
+}
+
+/// PT-mr-map: `data/gltf/cornell_metal_bunny.gltf` regenerated with the
+/// brushed-brass metallic-roughness texture. The bunny vertices get
+/// **planar XZ UVs** (one tile across the bunny's footprint) so the
+/// streaks read as horizontal bands — natural for brushed metal.
+fn build_cornell_brushed_metal_bunny(
+    quads: &[GpuQuad],
+    materials: &[GpuMaterial],
+    bunny_positions: &[[f32; 3]],
+    bunny_normals: &[[f32; 3]],
+    bunny_indices: &[u32],
+    bunny_material: GpuMaterial,
+) -> Vec<u8> {
+    let (mut palette, quad_material) = unique_materials(materials);
+    let bunny_mat_idx = palette.len();
+    palette.push(bunny_material);
+
+    // Planar XZ UVs over the bunny's footprint (roughly [-0.4, 0.4] in
+    // both axes). Two tiles end-to-end across the body so the brushed
+    // streaks read at a sensible density.
+    let bunny_uvs: Vec<[f32; 2]> = bunny_positions
+        .iter()
+        .map(|p| [(p[0] + 0.4) * 2.5, (p[2] + 0.4) * 2.5])
+        .collect();
+
+    let mut batches = triangulate(quads, &quad_material, palette.len(), 1);
+    batches.push(PrimitiveBatch {
+        material_idx: bunny_mat_idx,
+        positions: bunny_positions.to_vec(),
+        normals: bunny_normals.to_vec(),
+        uvs: bunny_uvs,
+        indices: bunny_indices.to_vec(),
+    });
+
+    // Texture index 0 = brushed brass MR map. The bunny material's
+    // base-color slot is empty (uniform brass colour); the MR slot
+    // points at layer 0.
+    let mut base_textures: Vec<Option<u32>> = vec![None; palette.len()];
+    let mut mr_textures: Vec<Option<u32>> = vec![None; palette.len()];
+    mr_textures[bunny_mat_idx] = Some(0);
+    let _ = &mut base_textures; // explicit no-op for clarity
+
+    let textures: &[&[u8]] = &[include_bytes!("../data/textures/brushed_brass_mr.png")];
+
+    emit_gltf(&palette, &base_textures, &mr_textures, &batches, textures)
 }
 
 /// `data/gltf/cornell_textured_floor.gltf` — same Cornell as
@@ -922,9 +979,10 @@ fn build_cornell_textured_floor() -> Vec<u8> {
 
     let mut material_textures: Vec<Option<u32>> = vec![None; palette.len()];
     material_textures[floor_mat_idx] = Some(0);
+    let no_mr = vec![None; palette.len()];
     let textures: &[&[u8]] = &[include_bytes!("../data/textures/uv_checker_color.png")];
 
-    emit_gltf(&palette, &material_textures, &batches, textures)
+    emit_gltf(&palette, &material_textures, &no_mr, &batches, textures)
 }
 
 /// `material_textures[i] = Some(layer)` means material `i` uses
@@ -932,11 +990,13 @@ fn build_cornell_textured_floor() -> Vec<u8> {
 /// of raw PNG byte slices; each gets embedded as a base64 data URI.
 fn emit_gltf(
     palette: &[GpuMaterial],
-    material_textures: &[Option<u32>],
+    material_base_textures: &[Option<u32>],
+    material_mr_textures: &[Option<u32>],
     batches: &[PrimitiveBatch],
     textures: &[&[u8]],
 ) -> Vec<u8> {
-    assert_eq!(palette.len(), material_textures.len());
+    assert_eq!(palette.len(), material_base_textures.len());
+    assert_eq!(palette.len(), material_mr_textures.len());
     // --- Binary buffer + accessors ---
     let mut bin: Vec<u8> = Vec::new();
     let mut accessors_json: Vec<String> = Vec::new();
@@ -1044,11 +1104,16 @@ fn emit_gltf(
     // --- Materials JSON ---
     let materials_json: Vec<String> = palette
         .iter()
-        .zip(material_textures.iter())
+        .zip(material_base_textures.iter())
+        .zip(material_mr_textures.iter())
         .enumerate()
-        .map(|(i, (m, tex_idx))| {
-            let base_color_texture = match tex_idx {
+        .map(|(i, ((m, base_idx), mr_idx))| {
+            let base_color_texture = match base_idx {
                 Some(idx) => format!(r#","baseColorTexture":{{"index":{idx}}}"#),
+                None => String::new(),
+            };
+            let metallic_roughness_texture = match mr_idx {
+                Some(idx) => format!(r#","metallicRoughnessTexture":{{"index":{idx}}}"#),
                 None => String::new(),
             };
             // PT-dielectrics / PT-beer-lambert / PT-fog: non-standard
@@ -1091,12 +1156,13 @@ fn emit_gltf(
                 format!(r#","extras":{{{}}}"#, extras_parts.join(","))
             };
             format!(
-                r#"{{"name":"{name}","pbrMetallicRoughness":{{"baseColorFactor":[{ar},{ag},{ab},1.0],"metallicFactor":{met},"roughnessFactor":{rough}{tex}}},"emissiveFactor":[{er},{eg},{eb}]{extras}}}"#,
+                r#"{{"name":"{name}","pbrMetallicRoughness":{{"baseColorFactor":[{ar},{ag},{ab},1.0],"metallicFactor":{met},"roughnessFactor":{rough}{tex}{mrtex}}},"emissiveFactor":[{er},{eg},{eb}]{extras}}}"#,
                 name = material_label(m, i),
                 ar = m.albedo[0], ag = m.albedo[1], ab = m.albedo[2],
                 met = m.metallic, rough = m.roughness,
                 er = m.emission[0], eg = m.emission[1], eb = m.emission[2],
                 tex = base_color_texture,
+                mrtex = metallic_roughness_texture,
             )
         })
         .collect();

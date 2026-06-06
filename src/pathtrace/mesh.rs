@@ -92,15 +92,16 @@ pub const NO_TEXTURE: u32 = u32::MAX;
 /// behaviour).
 ///
 /// std430 layout (4-byte scalars need no extra padding):
-///   albedo:                    vec3 + scalar → 16 bytes
-///   emission:                  vec3 + scalar → 16 bytes
-///   base_color_texture_idx:    u32 +
-///   ior:                       f32 +
-///   _pad:                      2 × u32       → 16 bytes
-///   absorption:                vec3 + f32 pad → 16 bytes
-///   scattering:                vec3 + f32 pad → 16 bytes
-///   cloud_center:              vec3 +
-///   cloud_radius:              f32           → 16 bytes
+///   albedo:                          vec3 + scalar → 16 bytes
+///   emission:                        vec3 + scalar → 16 bytes
+///   base_color_texture_idx:          u32 +
+///   ior:                             f32 +
+///   metallic_roughness_texture_idx:  u32 +
+///   _pad:                            u32           → 16 bytes
+///   absorption:                      vec3 + f32 pad → 16 bytes
+///   scattering:                      vec3 + f32 pad → 16 bytes
+///   cloud_center:                    vec3 +
+///   cloud_radius:                    f32           → 16 bytes
 ///   total: 96 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable, PartialEq)]
@@ -117,7 +118,12 @@ pub struct Material {
     /// to the metallic/Lambertian branches. `1.5` is a reasonable
     /// default for glass; `1.33` for water.
     pub ior: f32,
-    pub _pad: [u32; 2],
+    /// PT-mr-map: layer index of the glTF metallic-roughness map.
+    /// The texture's **G channel is roughness, B channel is
+    /// metallic** (glTF 2.0 convention). When `NO_TEXTURE`, the
+    /// scalars `roughness` + `metallic` pass through unmodified.
+    pub metallic_roughness_texture_idx: u32,
+    pub _pad: u32,
     /// Per-channel Beer-Lambert absorption coefficient. Used by
     /// `path_trace` to attenuate throughput across each segment
     /// travelled *inside* a medium volume.
@@ -157,7 +163,8 @@ impl Default for Material {
             metallic: 0.0,
             base_color_texture_idx: NO_TEXTURE,
             ior: 0.0,
-            _pad: [0; 2],
+            metallic_roughness_texture_idx: NO_TEXTURE,
+            _pad: 0,
             absorption: [0.0, 0.0, 0.0],
             _pad_absorption: 0.0,
             scattering: [0.0, 0.0, 0.0],
@@ -173,6 +180,25 @@ impl Material {
     /// `emissive_triangles` list and (later) NEE light sampling.
     pub fn is_emissive(&self) -> bool {
         self.emission[0] > 0.0 || self.emission[1] > 0.0 || self.emission[2] > 0.0
+    }
+
+    /// PT-mr-map: CPU mirror of WGSL `material_metallic_roughness`.
+    /// Returns `(effective_roughness, effective_metallic)` after the
+    /// metallic-roughness texture multiply. Pass the sampled
+    /// `mr_texel` as RGBA bytes (G channel → roughness, B channel
+    /// → metallic) when the material carries an MR texture, or
+    /// `None` to use the scalar fields directly. The roughness
+    /// floor of 0.04 matches the WGSL clamp — without it, an MR
+    /// map that drives `roughness → 0` puts GGX into the δ-spike
+    /// limit on a perturbed micro-normal, which fireflies.
+    pub fn effective_metallic_roughness(&self, mr_texel: Option<[u8; 4]>) -> (f32, f32) {
+        let (r_mul, m_mul) = match mr_texel {
+            None => (1.0, 1.0),
+            Some(t) => (f32::from(t[1]) / 255.0, f32::from(t[2]) / 255.0),
+        };
+        let rough = (self.roughness * r_mul).max(0.04);
+        let metal = self.metallic * m_mul;
+        (rough, metal)
     }
 }
 
@@ -466,6 +492,17 @@ fn extract_material(material: &gltf::Material, texture_remap: &[u32]) -> Materia
         .as_ref()
         .and_then(|raw| serde_json::from_str(raw.get()).ok())
         .unwrap_or_default();
+    // PT-mr-map: the metallicRoughness texture lives at the same
+    // glTF binding tier as baseColor. Same TEXCOORD_0 channel
+    // assumption (we don't support per-texture UV channels). Push
+    // it into the same deduplicated texture array via the remap.
+    let metallic_roughness_texture_idx = pbr
+        .metallic_roughness_texture()
+        .and_then(|info| {
+            let src = info.texture().source().index();
+            texture_remap.get(src).copied()
+        })
+        .unwrap_or(NO_TEXTURE);
     Material {
         albedo: [base[0], base[1], base[2]],
         roughness: pbr.roughness_factor(),
@@ -473,7 +510,8 @@ fn extract_material(material: &gltf::Material, texture_remap: &[u32]) -> Materia
         metallic: pbr.metallic_factor(),
         base_color_texture_idx,
         ior: extras.ior,
-        _pad: [0; 2],
+        metallic_roughness_texture_idx,
+        _pad: 0,
         absorption: extras.absorption,
         _pad_absorption: 0.0,
         scattering: extras.scattering,
@@ -622,6 +660,10 @@ mod tests {
         assert_eq!(std::mem::size_of::<Material>(), 96);
         assert_eq!(std::mem::offset_of!(Material, base_color_texture_idx), 32,);
         assert_eq!(std::mem::offset_of!(Material, ior), 36);
+        assert_eq!(
+            std::mem::offset_of!(Material, metallic_roughness_texture_idx),
+            40,
+        );
         assert_eq!(std::mem::offset_of!(Material, absorption), 48);
         assert_eq!(std::mem::offset_of!(Material, scattering), 64);
         assert_eq!(std::mem::offset_of!(Material, phase_g), 76);
@@ -647,6 +689,60 @@ mod tests {
         assert!(m.is_emissive());
         m.emission = [1e-9, 0.0, 0.0];
         assert!(m.is_emissive());
+    }
+
+    // ---- PT-mr-map ----
+
+    #[test]
+    fn effective_mr_passes_scalars_through_when_no_texture() {
+        let m = Material {
+            roughness: 0.5,
+            metallic: 0.7,
+            ..Material::default()
+        };
+        let (rough, metal) = m.effective_metallic_roughness(None);
+        assert!(close(rough, 0.5));
+        assert!(close(metal, 0.7));
+    }
+
+    #[test]
+    fn effective_mr_multiplies_texel_channels() {
+        let m = Material {
+            roughness: 0.6,
+            metallic: 0.8,
+            ..Material::default()
+        };
+        // texel G ≈ 0.502, B = 1.0.
+        let (rough, metal) = m.effective_metallic_roughness(Some([0, 128, 255, 255]));
+        assert!(close(rough, 0.6 * (128.0 / 255.0)));
+        assert!(close(metal, 0.8));
+    }
+
+    #[test]
+    fn effective_mr_clamps_roughness_floor() {
+        let m = Material {
+            roughness: 0.02,
+            metallic: 1.0,
+            ..Material::default()
+        };
+        // No texture, scalar already below the 0.04 floor.
+        let (rough, _) = m.effective_metallic_roughness(None);
+        assert!(close(rough, 0.04));
+        // With a texture that drives the product to zero, still
+        // floored at 0.04.
+        let (rough_tex, _) = m.effective_metallic_roughness(Some([0, 0, 255, 255]));
+        assert!(close(rough_tex, 0.04));
+    }
+
+    #[test]
+    fn effective_mr_zero_metallic_holds() {
+        let m = Material {
+            roughness: 0.5,
+            metallic: 0.0,
+            ..Material::default()
+        };
+        let (_, metal) = m.effective_metallic_roughness(Some([0, 200, 200, 255]));
+        assert_eq!(metal, 0.0);
     }
 
     // ---- Math ----
