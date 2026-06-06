@@ -123,15 +123,42 @@ pub fn denoise(
         ];
     }
 
-    // Step 2 — five à-trous passes.
-    let mut buf = demod.clone();
+    // PT-denoise-tonemap (plan 0018): map the (demodulated)
+    // signal through Reinhard `t = c / (1 + c)` so the wavelet's
+    // colour edge stop sees a bounded `[0, 1)` range. Without
+    // this, a ceiling-light pixel (radiance L ≈ 30) next to a
+    // wall pixel (L ≈ 1) produces a colour-distance term of
+    // ≈ 900 that the σ_c = 0.5 default can't tame — the kernel
+    // pulls hard on the bright pixels and spreads a halo into
+    // the wall. Reinhard collapses that into `[0, 1)` so the
+    // colour stop behaves as designed.
+    let mut working = demod;
+    for px in working.iter_mut() {
+        px[0] /= 1.0 + px[0].max(0.0);
+        px[1] /= 1.0 + px[1].max(0.0);
+        px[2] /= 1.0 + px[2].max(0.0);
+    }
+
+    // Step 2 — five à-trous passes in tonemapped space.
+    let mut buf = working;
     let mut step = 1_i32;
     for _ in 0..params.passes {
         buf = atrous_pass(&buf, normal, depth, width, height, step, params);
         step *= 2;
     }
 
-    // Step 3 — remodulate, restoring the bypass pixels as-is.
+    // Step 3a — untonemap. `c = t / max(1 - t, ε)` inverts
+    // Reinhard exactly for `t < 1`. The kernel pulls some
+    // smoothing toward 1 around very bright pixels, so we floor
+    // `1 - t` to avoid blowing up the division.
+    for px in buf.iter_mut() {
+        let max_t = 1.0 - 1e-4;
+        px[0] = px[0].clamp(0.0, max_t) / (1.0 - px[0]).max(1e-4);
+        px[1] = px[1].clamp(0.0, max_t) / (1.0 - px[1]).max(1e-4);
+        px[2] = px[2].clamp(0.0, max_t) / (1.0 - px[2]).max(1e-4);
+    }
+
+    // Step 3b — remodulate, restoring the bypass pixels as-is.
     let mut out = vec![[0.0_f32; 4]; n];
     for i in 0..n {
         if !demod_valid[i] {
@@ -308,6 +335,94 @@ mod tests {
                 "right pixel y={y} R = {} expected ≈0",
                 out[r_idx][0],
             );
+        }
+    }
+
+    /// PT-denoise-tonemap: a uniform input that round-trips
+    /// through Reinhard tonemap → identity wavelet (uniform stays
+    /// uniform under any à-trous step) → Reinhard untonemap should
+    /// come back to the original radiance.
+    #[test]
+    fn tonemap_round_trip_is_identity_on_uniform_input() {
+        let w = 16;
+        let h = 16;
+        let n = (w * h) as usize;
+        let target = [2.5_f32, 1.8, 0.7, 1.0];
+        let radiance = uniform(n, target);
+        let albedo = uniform(n, [1.0, 1.0, 1.0, 1.0]);
+        let normal = uniform(n, [0.0, 1.0, 0.0, 0.0]);
+        let depth = uniform(n, [1.0, 0.0, 0.0, 1.0]);
+        let out = denoise(
+            &radiance,
+            &albedo,
+            &normal,
+            &depth,
+            w,
+            h,
+            DenoiseParams::default(),
+        );
+        for (i, p) in out.iter().enumerate() {
+            for c in 0..3 {
+                assert!(
+                    (p[c] - target[c]).abs() < 5e-3,
+                    "pixel {i} channel {c}: got {} expected {}",
+                    p[c],
+                    target[c],
+                );
+            }
+        }
+    }
+
+    /// PT-denoise-tonemap halo test: an HDR-bright pixel
+    /// surrounded by dim neighbours should not pull the
+    /// neighbours' radiance up after denoising. Pre-tonemap
+    /// behaviour: dim neighbours got pulled to ~5-10× their
+    /// true value within a ±16 px halo. After: the kernel
+    /// keeps them close to truth because the bright pixel's
+    /// tonemapped distance is bounded.
+    #[test]
+    fn tonemap_kills_hdr_halo_around_bright_pixel() {
+        let w = 32;
+        let h = 32;
+        let n = (w * h) as usize;
+        let bright = 30.0_f32;
+        let dim = 1.0_f32;
+        let mut radiance = vec![[dim, dim, dim, 1.0]; n];
+        let center_idx = ((h / 2) * w + (w / 2)) as usize;
+        radiance[center_idx] = [bright, bright, bright, 1.0];
+        let albedo = vec![[1.0_f32, 1.0, 1.0, 1.0]; n];
+        let normal = vec![[0.0_f32, 1.0, 0.0, 0.0]; n];
+        let depth = vec![[1.0_f32, 0.0, 0.0, 1.0]; n];
+
+        let out = denoise(
+            &radiance,
+            &albedo,
+            &normal,
+            &depth,
+            w,
+            h,
+            DenoiseParams::default(),
+        );
+
+        // Inspect a ring of pixels at radius 8 around the centre.
+        let cx = (w / 2) as i32;
+        let cy = (h / 2) as i32;
+        for dy in -8_i32..=8 {
+            for dx in -8_i32..=8 {
+                if dx.abs().max(dy.abs()) != 8 {
+                    continue;
+                }
+                let px = cx + dx;
+                let py = cy + dy;
+                let idx = (py as usize) * w as usize + (px as usize);
+                let p = out[idx];
+                assert!(
+                    p[0] < dim * 1.5,
+                    "halo ring at (+{dx}, +{dy}): R = {} exceeds 1.5×dim ({})",
+                    p[0],
+                    dim * 1.5,
+                );
+            }
         }
     }
 
