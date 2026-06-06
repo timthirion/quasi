@@ -9,22 +9,22 @@
 <table>
   <tr>
     <td align="center" width="50%">
-      <img src="data/output/cornell_glass_bunny_reference.png" width="360" alt="Green-glass Stanford bunny">
-      <br><sub><b>PT-beer-lambert</b> — Stanford bunny in green glass, Beer-Lambert absorption distance-modulated through the body.</sub>
+      <img src="data/output/outdoor_normal_bunny_reference.png" width="360" alt="Brushed-brass bunny on stone tile under HDR sky">
+      <br><sub><b>PT-env-pbr</b> — Brushed-brass bunny (metallic-roughness map) on a stone-tile normal-mapped floor, lit entirely by an HDR equirectangular sky. Per-texel GGX picks up shimmering sun-glint.</sub>
     </td>
     <td align="center" width="50%">
-      <img src="data/output/cornell_foggy_room_reference.png" width="360" alt="God-rays through fog">
-      <br><sub><b>PT-fog</b> — Cornell room filled with homogeneous fog, light scattering off particles in the room, soft halo around the ceiling light.</sub>
+      <img src="data/output/cornell_glass_bunny_reference.png" width="360" alt="Green-glass Stanford bunny">
+      <br><sub><b>PT-beer-lambert</b> — Stanford bunny in green glass, Beer-Lambert absorption distance-modulated through the body.</sub>
     </td>
   </tr>
   <tr>
     <td align="center">
-      <img src="data/output/cornell_cloud_reference.png" width="360" alt="Procedural cumulus cloud">
-      <br><sub><b>PT-vdb</b> — Procedural cumulus cloud, heterogeneous density sampled from a 3-D grid via delta tracking, anisotropic phase via Henyey-Greenstein at g = 0.4.</sub>
+      <img src="data/output/cornell_foggy_room_reference.png" width="360" alt="God-rays through fog">
+      <br><sub><b>PT-fog</b> — Cornell room filled with homogeneous fog, light scattering off particles in the room, soft halo around the ceiling light.</sub>
     </td>
     <td align="center">
-      <img src="data/output/cornell_glass_sphere_reference.png" width="360" alt="Glass icosphere">
-      <br><sub><b>PT-dielectrics</b> — Glass icosphere with Snell refraction, Fresnel rim, total internal reflection, and a focused caustic on the floor underneath.</sub>
+      <img src="data/output/cornell_cloud_reference.png" width="360" alt="Procedural cumulus cloud">
+      <br><sub><b>PT-vdb</b> — Procedural cumulus cloud, heterogeneous density sampled from a 3-D grid via delta tracking, anisotropic phase via Henyey-Greenstein at g = 0.4.</sub>
     </td>
   </tr>
 </table>

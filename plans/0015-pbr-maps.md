@@ -1,8 +1,8 @@
 # PBR maps — normal / roughness / metallic (PT-pbr-maps)
 
-- **Status:** draft
+- **Status:** completed
 - **Last updated:** 2026-06-06
-- **Last touched on:** planning
+- **Last touched on:** PT-env-pbr outdoor showcase + plan close
 
 ## Goal
 
@@ -223,17 +223,17 @@ self-contained.
       axis-aligned tangent when collinear with the normal.
 
 ### PT-env-pbr — showcase
-- [ ] `outdoor_normal_bunny.gltf`: floor (stone-tile normal map)
-      + brushed brass bunny, no walls. Pairs with the synthetic
+- [x] `outdoor_normal_bunny.gltf`: stone-tile-normal-mapped floor
+      + brushed-brass bunny, no walls. Pairs with the synthetic
       sky from plan 0014.
-- [ ] Reference render at 768²/2048 spp → `data/output/outdoor_normal_bunny_reference.png`.
-      The bunny's brushed streaks read clearly under the env's
-      directional sun lighting; the stone tiles show normal-map
-      relief without baked shadows.
-- [ ] README hero gallery: swap one of the four hero images for
-      the normal-mapped reference (the visual upgrade vs. the
-      existing tile is the whole point).
-- [ ] Plan 0015 status → completed.
+- [x] Reference render at 768²/2048 spp →
+      `data/output/outdoor_normal_bunny_reference.png`. Bunny
+      picks up shimmering sun-glint through the brushed-streak
+      MR map; floor shows clean tile bevels without baked
+      shadows.
+- [x] README hero gallery refreshed with the new
+      brushed-brass + outdoor-normal references.
+- [x] Plan 0015 status → completed.
 
 ## Open questions
 

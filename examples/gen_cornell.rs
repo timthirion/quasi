@@ -417,6 +417,26 @@ fn main() {
         floor_only_quads.len() * 2 + bunny_indices.len() / 3,
     );
 
+    // 7b) Outdoor normal-mapped bunny — the PT-env-pbr showcase.
+    //     Stone-tile-normal-mapped floor + brushed-brass bunny, no
+    //     walls. Both PBR maps under HDR sky illumination.
+    let bytes = build_outdoor_normal_bunny(
+        &room_quads,
+        &room_materials,
+        &bunny_positions,
+        &bunny_normals,
+        &bunny_indices,
+        metal_bunny_mat,
+    );
+    let path = out_dir.join("outdoor_normal_bunny.gltf");
+    fs::write(&path, &bytes).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    println!(
+        "wrote {} ({} bytes, stone-tile floor + brushed-brass bunny → {} triangles)",
+        path.display(),
+        bytes.len(),
+        2 + bunny_indices.len() / 3,
+    );
+
     // 8) Outdoor cumulus — the PT-env × PT-cloud crossover showcase.
     //    Just the cumulus AABB with the cloud material, sitting on
     //    the floor. All lighting comes from the env dome.
@@ -973,6 +993,83 @@ fn build_cornell_brushed_metal_bunny(
     mr_textures[bunny_mat_idx] = Some(0);
 
     let textures: &[&[u8]] = &[include_bytes!("../data/textures/brushed_brass_mr.png")];
+
+    emit_gltf(
+        &palette,
+        &base_textures,
+        &mr_textures,
+        &normal_textures,
+        &batches,
+        textures,
+    )
+}
+
+/// PT-env-pbr: `data/gltf/outdoor_normal_bunny.gltf` — no walls,
+/// just a stone-tile-normal-mapped floor + brushed-brass bunny.
+/// Pairs with `--env-map data/env/synthetic_sky.hdr` to put both
+/// PBR maps under HDR illumination.
+fn build_outdoor_normal_bunny(
+    quads: &[GpuQuad],
+    materials: &[GpuMaterial],
+    bunny_positions: &[[f32; 3]],
+    bunny_normals: &[[f32; 3]],
+    bunny_indices: &[u32],
+    bunny_material: GpuMaterial,
+) -> Vec<u8> {
+    // Keep just the floor quad. The first quad emitted by
+    // `cornell_box` is the floor (per `src/pathtrace/scene.rs`).
+    let floor_quads: Vec<GpuQuad> = quads.iter().take(1).copied().collect();
+    let floor_materials: Vec<GpuMaterial> = materials.iter().take(1).copied().collect();
+    let (mut palette, mut quad_material) = unique_materials(&floor_materials);
+
+    // Stone floor — same recipe as `build_cornell_normal_mapped`.
+    let floor_mat_idx = palette.len();
+    palette.push(GpuMaterial {
+        albedo: [0.55, 0.52, 0.48],
+        roughness: 1.0,
+        emission: [0.0; 3],
+        metallic: 0.0,
+        ior: 0.0,
+        absorption: [0.0; 3],
+        scattering: [0.0; 3],
+        phase_g: 0.0,
+        cloud_center: [0.0; 3],
+        cloud_radius: 0.0,
+    });
+    quad_material[0] = floor_mat_idx;
+
+    let bunny_mat_idx = palette.len();
+    palette.push(bunny_material);
+
+    let mut batches = triangulate(&floor_quads, &quad_material, palette.len(), 1);
+    if let Some(floor_batch) = batches.iter_mut().find(|b| b.material_idx == floor_mat_idx) {
+        for uv in floor_batch.uvs.iter_mut() {
+            uv[0] *= 3.0;
+            uv[1] *= 3.0;
+        }
+    }
+    let bunny_uvs: Vec<[f32; 2]> = bunny_positions
+        .iter()
+        .map(|p| [(p[0] + 0.4) * 2.5, (p[2] + 0.4) * 2.5])
+        .collect();
+    batches.push(PrimitiveBatch {
+        material_idx: bunny_mat_idx,
+        positions: bunny_positions.to_vec(),
+        normals: bunny_normals.to_vec(),
+        uvs: bunny_uvs,
+        indices: bunny_indices.to_vec(),
+    });
+
+    let base_textures: Vec<Option<u32>> = vec![None; palette.len()];
+    let mut mr_textures: Vec<Option<u32>> = vec![None; palette.len()];
+    let mut normal_textures: Vec<Option<u32>> = vec![None; palette.len()];
+    mr_textures[bunny_mat_idx] = Some(0);
+    normal_textures[floor_mat_idx] = Some(1);
+
+    let textures: &[&[u8]] = &[
+        include_bytes!("../data/textures/brushed_brass_mr.png"),
+        include_bytes!("../data/textures/stone_tile_normal.png"),
+    ];
 
     emit_gltf(
         &palette,
