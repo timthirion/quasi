@@ -55,6 +55,16 @@ use crate::pathtrace::bvh::Bvh;
 ///   total:    48 bytes (struct alignment 16 rounds 40 up to 48).
 ///
 /// The `_pad*` fields make the Rust shape match byte-for-byte.
+///
+/// PT-normal-map deliberately does NOT grow `Vertex` by 16 bytes
+/// for a tangent: the WGSL TBN is built from triangle position +
+/// UV deltas at the hit, which is cheap and avoids any CPU-side
+/// `compute_tangents` pass. The tradeoff is non-smooth tangents
+/// across triangle edges; this is fine for the showcase scenes
+/// (the stone-tile floor is 2 triangles — no seam) but would
+/// produce visible artefacts on a smooth-shaded mesh under a
+/// directional normal map. `compute_tangents` is still exposed
+/// as a tested utility for the day a smoother story matters.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable, PartialEq)]
 pub struct Vertex {
@@ -97,8 +107,9 @@ pub const NO_TEXTURE: u32 = u32::MAX;
 ///   base_color_texture_idx:          u32 +
 ///   ior:                             f32 +
 ///   metallic_roughness_texture_idx:  u32 +
-///   _pad:                            u32           → 16 bytes
-///   absorption:                      vec3 + f32 pad → 16 bytes
+///   normal_texture_idx:              u32           → 16 bytes
+///   absorption:                      vec3 +
+///   normal_scale:                    f32           → 16 bytes
 ///   scattering:                      vec3 + f32 pad → 16 bytes
 ///   cloud_center:                    vec3 +
 ///   cloud_radius:                    f32           → 16 bytes
@@ -123,12 +134,20 @@ pub struct Material {
     /// metallic** (glTF 2.0 convention). When `NO_TEXTURE`, the
     /// scalars `roughness` + `metallic` pass through unmodified.
     pub metallic_roughness_texture_idx: u32,
-    pub _pad: u32,
+    /// PT-normal-map: layer index of the glTF normal map (tangent-
+    /// space, +Y up — OpenGL convention as mandated by glTF 2.0).
+    /// When `NO_TEXTURE`, the integrator uses the geometric
+    /// normal directly.
+    pub normal_texture_idx: u32,
     /// Per-channel Beer-Lambert absorption coefficient. Used by
     /// `path_trace` to attenuate throughput across each segment
     /// travelled *inside* a medium volume.
     pub absorption: [f32; 3],
-    pub _pad_absorption: f32,
+    /// PT-normal-map: `normalTexture.scale` from glTF — scales the
+    /// XY components of the tangent-space sample before
+    /// reconstruction. `1.0` = unscaled (the only case in our
+    /// procedural maps); values < 1 soften the perturbation.
+    pub normal_scale: f32,
     /// Per-channel scattering coefficient. When non-zero, a path
     /// inside the medium may *scatter* (change direction) before
     /// hitting a surface. PT-fog uses an isotropic phase function.
@@ -164,9 +183,9 @@ impl Default for Material {
             base_color_texture_idx: NO_TEXTURE,
             ior: 0.0,
             metallic_roughness_texture_idx: NO_TEXTURE,
-            _pad: 0,
+            normal_texture_idx: NO_TEXTURE,
             absorption: [0.0, 0.0, 0.0],
-            _pad_absorption: 0.0,
+            normal_scale: 1.0,
             scattering: [0.0, 0.0, 0.0],
             phase_g: 0.0,
             cloud_center: [0.0, 0.0, 0.0],
@@ -373,6 +392,137 @@ pub fn transform_normal(cols: &[[f32; 3]; 3], n: [f32; 3]) -> [f32; 3] {
     [x / len, y / len, z / len]
 }
 
+/// PT-normal-map: re-expose `upper_3x3_columns` for the tangent
+/// transform path. Tangents transform as plain directions
+/// (M_3x3 · t), not via the cofactor — the cofactor is for normals.
+pub fn upper_3x3_raw(m: &Mat4) -> [[f32; 3]; 3] {
+    upper_3x3_columns(m)
+}
+
+/// Plain 3×3 matrix-vector multiply, columns supplied as
+/// `[col0, col1, col2]`. Used to push tangents into world space.
+pub fn transform_dir(cols: &[[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
+    [
+        cols[0][0] * v[0] + cols[1][0] * v[1] + cols[2][0] * v[2],
+        cols[0][1] * v[0] + cols[1][1] * v[1] + cols[2][1] * v[2],
+        cols[0][2] * v[0] + cols[1][2] * v[1] + cols[2][2] * v[2],
+    ]
+}
+
+/// Returns `v / |v|` when `|v|` is large enough, else `[0, 0, 0]`.
+/// Caller decides what to do with the zero — usually fall through
+/// to a fixed-frame fallback.
+pub fn normalize_or_zero(v: [f32; 3]) -> [f32; 3] {
+    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    if len < 1e-12 {
+        [0.0, 0.0, 0.0]
+    } else {
+        [v[0] / len, v[1] / len, v[2] / len]
+    }
+}
+
+/// Gram-Schmidt: project the supplied tangent onto the plane
+/// perpendicular to `n`, then normalise. When the projection
+/// collapses (tangent ‖ n), returns an arbitrary in-plane
+/// fallback. `n` must already be unit-length.
+pub fn orthonormalize_tangent(t: [f32; 3], n: [f32; 3]) -> [f32; 3] {
+    let nt = n[0] * t[0] + n[1] * t[1] + n[2] * t[2];
+    let proj = [t[0] - n[0] * nt, t[1] - n[1] * nt, t[2] - n[2] * nt];
+    let p = normalize_or_zero(proj);
+    if p == [0.0, 0.0, 0.0] {
+        // Fallback: pick world-axis least aligned with n, then
+        // Gram-Schmidt against that. Keeps the TBN well-defined.
+        let axis = if n[0].abs() < 0.9 {
+            [1.0, 0.0, 0.0]
+        } else {
+            [0.0, 1.0, 0.0]
+        };
+        let dot = n[0] * axis[0] + n[1] * axis[1] + n[2] * axis[2];
+        let proj2 = [
+            axis[0] - n[0] * dot,
+            axis[1] - n[1] * dot,
+            axis[2] - n[2] * dot,
+        ];
+        normalize_or_zero(proj2)
+    } else {
+        p
+    }
+}
+
+/// PT-normal-map: derive a vec4 tangent (xyz = direction,
+/// w = bitangent sign) per vertex from position + UV deltas
+/// across each triangle. Accumulates per-triangle tangents +
+/// bitangents at each touched vertex, then resolves the sign
+/// from `sign((normal × tangent) · bitangent)`. Indices are 3 per
+/// triangle into `positions` / `normals` / `uvs`.
+///
+/// Degenerate triangles (UV determinant near zero) are skipped —
+/// they contribute neither to the tangent nor the bitangent
+/// accumulator. Vertices that end up with no contributions get a
+/// fixed-frame fallback via [`orthonormalize_tangent`].
+pub fn compute_tangents(
+    positions: &[[f32; 3]],
+    normals: &[[f32; 3]],
+    uvs: &[[f32; 2]],
+    indices: &[u32],
+) -> Vec<[f32; 4]> {
+    let n = positions.len();
+    let mut tan_acc = vec![[0.0_f32; 3]; n];
+    let mut bit_acc = vec![[0.0_f32; 3]; n];
+    let tris = indices.len() / 3;
+    for tri in 0..tris {
+        let i0 = indices[tri * 3] as usize;
+        let i1 = indices[tri * 3 + 1] as usize;
+        let i2 = indices[tri * 3 + 2] as usize;
+        if i0 >= n || i1 >= n || i2 >= n {
+            continue;
+        }
+        let p0 = positions[i0];
+        let p1 = positions[i1];
+        let p2 = positions[i2];
+        let uv0 = uvs[i0];
+        let uv1 = uvs[i1];
+        let uv2 = uvs[i2];
+        let e1 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+        let e2 = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
+        let duv1 = [uv1[0] - uv0[0], uv1[1] - uv0[1]];
+        let duv2 = [uv2[0] - uv0[0], uv2[1] - uv0[1]];
+        let det = duv1[0] * duv2[1] - duv2[0] * duv1[1];
+        if det.abs() < 1e-8 {
+            continue;
+        }
+        let inv = 1.0 / det;
+        let t = [
+            inv * (duv2[1] * e1[0] - duv1[1] * e2[0]),
+            inv * (duv2[1] * e1[1] - duv1[1] * e2[1]),
+            inv * (duv2[1] * e1[2] - duv1[1] * e2[2]),
+        ];
+        let b = [
+            inv * (-duv2[0] * e1[0] + duv1[0] * e2[0]),
+            inv * (-duv2[0] * e1[1] + duv1[0] * e2[1]),
+            inv * (-duv2[0] * e1[2] + duv1[0] * e2[2]),
+        ];
+        for &v in &[i0, i1, i2] {
+            tan_acc[v][0] += t[0];
+            tan_acc[v][1] += t[1];
+            tan_acc[v][2] += t[2];
+            bit_acc[v][0] += b[0];
+            bit_acc[v][1] += b[1];
+            bit_acc[v][2] += b[2];
+        }
+    }
+    (0..n)
+        .map(|i| {
+            let norm = normalize_or_zero(normals[i]);
+            let tangent = orthonormalize_tangent(tan_acc[i], norm);
+            let c = cross(norm, tangent);
+            let dot_cb = c[0] * bit_acc[i][0] + c[1] * bit_acc[i][1] + c[2] * bit_acc[i][2];
+            let sign = if dot_cb < 0.0 { -1.0 } else { 1.0 };
+            [tangent[0], tangent[1], tangent[2], sign]
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // glTF loader
 // ---------------------------------------------------------------------------
@@ -430,11 +580,28 @@ fn ingest_referenced_images(
     out: &mut Vec<TextureImage>,
 ) -> Vec<u32> {
     let mut remap: Vec<u32> = vec![NO_TEXTURE; images.len()];
+    // PT-mr-map + PT-normal-map: walk baseColor, metallicRoughness,
+    // **and** normal textures across every material. Pre-collect the
+    // unique image indices so the closure can stay simple.
+    let mut img_indices: Vec<usize> = Vec::new();
     for material in document.materials() {
-        let Some(info) = material.pbr_metallic_roughness().base_color_texture() else {
-            continue;
+        let pbr = material.pbr_metallic_roughness();
+        let push_image = |idx: usize, list: &mut Vec<usize>| {
+            if !list.contains(&idx) {
+                list.push(idx);
+            }
         };
-        let img_idx = info.texture().source().index();
+        if let Some(info) = pbr.base_color_texture() {
+            push_image(info.texture().source().index(), &mut img_indices);
+        }
+        if let Some(info) = pbr.metallic_roughness_texture() {
+            push_image(info.texture().source().index(), &mut img_indices);
+        }
+        if let Some(info) = material.normal_texture() {
+            push_image(info.texture().source().index(), &mut img_indices);
+        }
+    }
+    for img_idx in img_indices {
         if remap[img_idx] != NO_TEXTURE {
             continue;
         }
@@ -503,6 +670,18 @@ fn extract_material(material: &gltf::Material, texture_remap: &[u32]) -> Materia
             texture_remap.get(src).copied()
         })
         .unwrap_or(NO_TEXTURE);
+    // PT-normal-map: glTF 2.0's `normalTexture` lives outside
+    // `pbrMetallicRoughness` proper. Honour `scale` (defaults to
+    // 1.0). Same UV-channel assumption as the other maps.
+    let normal_info = material.normal_texture();
+    let normal_texture_idx = normal_info
+        .as_ref()
+        .and_then(|info| {
+            let src = info.texture().source().index();
+            texture_remap.get(src).copied()
+        })
+        .unwrap_or(NO_TEXTURE);
+    let normal_scale = normal_info.as_ref().map(|info| info.scale()).unwrap_or(1.0);
     Material {
         albedo: [base[0], base[1], base[2]],
         roughness: pbr.roughness_factor(),
@@ -511,9 +690,9 @@ fn extract_material(material: &gltf::Material, texture_remap: &[u32]) -> Materia
         base_color_texture_idx,
         ior: extras.ior,
         metallic_roughness_texture_idx,
-        _pad: 0,
+        normal_texture_idx,
         absorption: extras.absorption,
-        _pad_absorption: 0.0,
+        normal_scale,
         scattering: extras.scattering,
         phase_g: extras.phase_g,
         cloud_center: extras.cloud_center,
@@ -648,6 +827,8 @@ mod tests {
     fn vertex_is_48_bytes() {
         // PT-textures: vec3 position (16) + vec3 normal (16) + vec2 uv (8)
         // + 8 bytes of trailing pad so the struct stride matches std430.
+        // PT-normal-map deliberately does NOT grow this — tangents are
+        // derived per-hit from triangle + UV deltas in WGSL.
         assert_eq!(std::mem::size_of::<Vertex>(), 48);
     }
 
@@ -657,6 +838,10 @@ mod tests {
         // PT-beer-lambert: 64 (+ absorption); PT-fog: 80 (+ scattering);
         // PT-cloud: 96 (+ cloud_center + cloud_radius);
         // PT-hg: still 96 (phase_g reuses the scattering pad).
+        // PT-mr-map: still 96 (metallic_roughness_texture_idx in the
+        // existing post-ior pad).
+        // PT-normal-map: still 96 (normal_texture_idx + normal_scale
+        // replace the last two pad slots).
         assert_eq!(std::mem::size_of::<Material>(), 96);
         assert_eq!(std::mem::offset_of!(Material, base_color_texture_idx), 32,);
         assert_eq!(std::mem::offset_of!(Material, ior), 36);
@@ -664,7 +849,9 @@ mod tests {
             std::mem::offset_of!(Material, metallic_roughness_texture_idx),
             40,
         );
+        assert_eq!(std::mem::offset_of!(Material, normal_texture_idx), 44);
         assert_eq!(std::mem::offset_of!(Material, absorption), 48);
+        assert_eq!(std::mem::offset_of!(Material, normal_scale), 60);
         assert_eq!(std::mem::offset_of!(Material, scattering), 64);
         assert_eq!(std::mem::offset_of!(Material, phase_g), 76);
         assert_eq!(std::mem::offset_of!(Material, cloud_center), 80);
@@ -743,6 +930,91 @@ mod tests {
         };
         let (_, metal) = m.effective_metallic_roughness(Some([0, 200, 200, 255]));
         assert_eq!(metal, 0.0);
+    }
+
+    // ---- PT-normal-map: tangent helpers ----
+
+    #[test]
+    fn orthonormalize_tangent_falls_to_axis_when_parallel_to_normal() {
+        // Tangent parallel to normal → projection collapses, fallback
+        // should pick a stable in-plane axis.
+        let n = [0.0, 1.0, 0.0];
+        let t = [0.0, 5.0, 0.0];
+        let out = orthonormalize_tangent(t, n);
+        // Result should be unit-length and orthogonal to n.
+        let len = (out[0].powi(2) + out[1].powi(2) + out[2].powi(2)).sqrt();
+        assert!(close(len, 1.0));
+        let dot = out[0] * n[0] + out[1] * n[1] + out[2] * n[2];
+        assert!(close(dot, 0.0));
+    }
+
+    #[test]
+    fn orthonormalize_tangent_projects_out_normal_component() {
+        // Tangent = (1, 1, 0); normal = (0, 1, 0). Projection should
+        // be (1, 0, 0) (i.e. the X axis) after Gram-Schmidt + norm.
+        let n = [0.0, 1.0, 0.0];
+        let t = [1.0, 1.0, 0.0];
+        let out = orthonormalize_tangent(t, n);
+        assert!(close(out[0], 1.0));
+        assert!(close(out[1], 0.0));
+        assert!(close(out[2], 0.0));
+    }
+
+    #[test]
+    fn compute_tangents_axis_aligned_quad() {
+        // Two-triangle quad on the XY plane with UVs = (x, y). The
+        // expected tangent is +X for every vertex; bitangent sign +1.
+        let positions = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ];
+        let normals = vec![[0.0, 0.0, 1.0]; 4];
+        let uvs = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        let indices = vec![0, 1, 2, 0, 2, 3];
+        let tangents = compute_tangents(&positions, &normals, &uvs, &indices);
+        for t in tangents {
+            assert!(close(t[0], 1.0));
+            assert!(close(t[1], 0.0));
+            assert!(close(t[2], 0.0));
+            assert!(close(t[3], 1.0));
+        }
+    }
+
+    #[test]
+    fn compute_tangents_flipped_uv_inverts_bitangent_sign() {
+        // Same quad but with V flipped (uv = (x, -y)) — bitangent
+        // sign should flip to -1.
+        let positions = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ];
+        let normals = vec![[0.0, 0.0, 1.0]; 4];
+        let uvs = vec![[0.0, 0.0], [1.0, 0.0], [1.0, -1.0], [0.0, -1.0]];
+        let indices = vec![0, 1, 2, 0, 2, 3];
+        let tangents = compute_tangents(&positions, &normals, &uvs, &indices);
+        for t in tangents {
+            assert!(close(t[3], -1.0), "expected -1 sign, got {}", t[3]);
+        }
+    }
+
+    #[test]
+    fn compute_tangents_skips_degenerate_uv_triangles() {
+        // Triangle with collinear UVs (det = 0) shouldn't contribute;
+        // the lone vertex without contribution should still get a
+        // sensible tangent from the fallback path.
+        let positions = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]];
+        let normals = vec![[0.0, 1.0, 0.0]; 3];
+        let uvs = vec![[0.0, 0.0], [0.5, 0.0], [1.0, 0.0]];
+        let indices = vec![0, 1, 2];
+        let tangents = compute_tangents(&positions, &normals, &uvs, &indices);
+        // No NaN, finite.
+        for t in tangents {
+            assert!(t.iter().all(|v| v.is_finite()));
+        }
     }
 
     // ---- Math ----

@@ -196,31 +196,31 @@ self-contained.
       and respects scalar = 0 sentinels.
 
 ### PT-normal-map
-- [ ] `Vertex` grows the `tangent: vec4` field. Layout test
-      updated. WGSL `Vertex` mirrors.
-- [ ] `Material` grows `normal_texture_idx` + the alignment
-      pad. Layout test updated.
-- [ ] glTF ingest reads `TANGENT` when present; otherwise calls
-      `compute_tangents(positions, uvs, indices)` (CPU mirror,
-      with tests pinning known-good outputs against a unit
-      tetrahedron + a cube).
-- [ ] glTF ingest reads `normalTexture` into the texture array,
-      honours `normalTexture.scale` by folding into the tangent-
-      space sample.
-- [ ] WGSL `apply_normal_map(m, hit, tangent, sign)` computes
-      the world-space shading normal. The integrator routes BSDF
-      evaluation through the shading normal; self-intersection
-      offset uses geometric normal.
-- [ ] `examples/gen_pbr_maps` bakes a stone-tile normal map
-      (256², random tile heights + edge bevels) into
-      `data/textures/stone_tile_normal.png`.
-- [ ] New `cornell_normal_mapped.gltf`: Cornell room with the
-      floor replaced by a stone-tile material (baseColor flat
-      grey + normal map). Brushed brass bunny standing on it.
-- [ ] CPU mirror test: `apply_normal_map` over a flat (0, 1, 0)
-      surface with an identity normal-texture (RGB = 0.5/0.5/1)
-      returns (0, 1, 0); rotated tangent-space samples rotate
-      the world normal as expected.
+- [x] `Vertex` stays at 48 bytes — tangents derived per-hit in
+      WGSL from triangle position + UV deltas instead. CPU
+      `compute_tangents` exposed as a tested utility for the day
+      a smooth-tangent story is needed.
+- [x] `Material` grows `normal_texture_idx` + `normal_scale`,
+      both repurposing existing pad slots — still 96 bytes.
+- [x] glTF ingest reads `normalTexture` into the texture array
+      (the deduplicated `ingest_referenced_images` now walks
+      base/MR/normal). Honours `normalTexture.scale`.
+- [x] WGSL `triangle_tangent_frame` + `apply_normal_map` build
+      a per-hit TBN and perturb `hit.normal` opt-in
+      (`normal_texture_idx != NO_TEXTURE`). Every downstream
+      shading dot product reads the perturbed normal.
+- [x] `examples/gen_pbr_maps` bakes a stone-tile normal map
+      (256², bevelled square cells + per-cell DC height offset)
+      into `data/textures/stone_tile_normal.png`.
+- [x] New `cornell_normal_mapped.gltf`: Cornell room with the
+      floor swapped to a stone-tile-normal-mapped grey
+      Lambertian + brushed-brass bunny. Reference at
+      `data/output/cornell_normal_mapped_reference.png`.
+- [x] CPU mirror tests: `compute_tangents` on an axis-aligned
+      quad, on a flipped-V quad (sign flips to -1), skips
+      degenerate-UV triangles cleanly. `orthonormalize_tangent`
+      projects out the normal component or falls back to an
+      axis-aligned tangent when collinear with the normal.
 
 ### PT-env-pbr — showcase
 - [ ] `outdoor_normal_bunny.gltf`: floor (stone-tile normal map)

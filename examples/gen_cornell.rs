@@ -177,6 +177,26 @@ fn main() {
         room_quads.len() * 2 + bunny_indices.len() / 3,
     );
 
+    // 4b) PT-normal-map showcase: Cornell room with stone-tile
+    //     normal-mapped floor + brushed-brass bunny — both PBR
+    //     maps active in the same scene.
+    let bytes = build_cornell_normal_mapped(
+        &room_quads,
+        &room_materials,
+        &bunny_positions,
+        &bunny_normals,
+        &bunny_indices,
+        metal_bunny_mat,
+    );
+    let path = out_dir.join("cornell_normal_mapped.gltf");
+    fs::write(&path, &bytes).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    println!(
+        "wrote {} ({} bytes, normal-mapped floor + brushed-brass bunny → {} triangles)",
+        path.display(),
+        bytes.len(),
+        room_quads.len() * 2 + bunny_indices.len() / 3,
+    );
+
     // 5a) Cornell with a green-glass Stanford bunny — the
     //     PT-beer-lambert publishable scene. Same geometry as
     //     cornell_bunny, but the bunny material is a green-tinted
@@ -887,14 +907,28 @@ fn build_gltf_with_extra_mesh(
         indices: sphere_indices.to_vec(),
     });
     let no_textures = vec![None; palette.len()];
-    emit_gltf(&palette, &no_textures, &no_textures, &batches, &[])
+    emit_gltf(
+        &palette,
+        &no_textures,
+        &no_textures,
+        &no_textures,
+        &batches,
+        &[],
+    )
 }
 
 fn build_gltf(quads: &[GpuQuad], materials: &[GpuMaterial], subdiv: usize) -> Vec<u8> {
     let (palette, quad_material) = unique_materials(materials);
     let batches = triangulate(quads, &quad_material, palette.len(), subdiv);
     let no_textures = vec![None; palette.len()];
-    emit_gltf(&palette, &no_textures, &no_textures, &batches, &[])
+    emit_gltf(
+        &palette,
+        &no_textures,
+        &no_textures,
+        &no_textures,
+        &batches,
+        &[],
+    )
 }
 
 /// PT-mr-map: `data/gltf/cornell_metal_bunny.gltf` regenerated with the
@@ -933,14 +967,99 @@ fn build_cornell_brushed_metal_bunny(
     // Texture index 0 = brushed brass MR map. The bunny material's
     // base-color slot is empty (uniform brass colour); the MR slot
     // points at layer 0.
-    let mut base_textures: Vec<Option<u32>> = vec![None; palette.len()];
+    let base_textures: Vec<Option<u32>> = vec![None; palette.len()];
     let mut mr_textures: Vec<Option<u32>> = vec![None; palette.len()];
+    let normal_textures: Vec<Option<u32>> = vec![None; palette.len()];
     mr_textures[bunny_mat_idx] = Some(0);
-    let _ = &mut base_textures; // explicit no-op for clarity
 
     let textures: &[&[u8]] = &[include_bytes!("../data/textures/brushed_brass_mr.png")];
 
-    emit_gltf(&palette, &base_textures, &mr_textures, &batches, textures)
+    emit_gltf(
+        &palette,
+        &base_textures,
+        &mr_textures,
+        &normal_textures,
+        &batches,
+        textures,
+    )
+}
+
+/// PT-normal-map: `data/gltf/cornell_normal_mapped.gltf` — Cornell
+/// room with the floor swapped to stone-tile-normal-mapped grey
+/// Lambertian. Brushed-brass bunny sits on it (so the showcase
+/// exercises both maps at once).
+fn build_cornell_normal_mapped(
+    quads: &[GpuQuad],
+    materials: &[GpuMaterial],
+    bunny_positions: &[[f32; 3]],
+    bunny_normals: &[[f32; 3]],
+    bunny_indices: &[u32],
+    bunny_material: GpuMaterial,
+) -> Vec<u8> {
+    let (mut palette, mut quad_material) = unique_materials(materials);
+
+    // Replace floor (quad 0) with a stone Lambertian: medium-grey
+    // albedo, full roughness, no metallic. Normal map is bound on
+    // the material (texture 1 in the embedded array below).
+    let floor_mat_idx = palette.len();
+    palette.push(GpuMaterial {
+        albedo: [0.55, 0.52, 0.48],
+        roughness: 1.0,
+        emission: [0.0; 3],
+        metallic: 0.0,
+        ior: 0.0,
+        absorption: [0.0; 3],
+        scattering: [0.0; 3],
+        phase_g: 0.0,
+        cloud_center: [0.0; 3],
+        cloud_radius: 0.0,
+    });
+    quad_material[0] = floor_mat_idx;
+
+    let bunny_mat_idx = palette.len();
+    palette.push(bunny_material);
+
+    // Floor takes UVs from `triangulate` (cornell floor → 1 tile).
+    // Tile the stone normal map ~3× across the floor footprint.
+    let mut batches = triangulate(quads, &quad_material, palette.len(), 1);
+    if let Some(floor_batch) = batches.iter_mut().find(|b| b.material_idx == floor_mat_idx) {
+        for uv in floor_batch.uvs.iter_mut() {
+            uv[0] *= 3.0;
+            uv[1] *= 3.0;
+        }
+    }
+    let bunny_uvs: Vec<[f32; 2]> = bunny_positions
+        .iter()
+        .map(|p| [(p[0] + 0.4) * 2.5, (p[2] + 0.4) * 2.5])
+        .collect();
+    batches.push(PrimitiveBatch {
+        material_idx: bunny_mat_idx,
+        positions: bunny_positions.to_vec(),
+        normals: bunny_normals.to_vec(),
+        uvs: bunny_uvs,
+        indices: bunny_indices.to_vec(),
+    });
+
+    // Texture array: [0] = brushed brass MR, [1] = stone tile normal.
+    let base_textures: Vec<Option<u32>> = vec![None; palette.len()];
+    let mut mr_textures: Vec<Option<u32>> = vec![None; palette.len()];
+    let mut normal_textures: Vec<Option<u32>> = vec![None; palette.len()];
+    mr_textures[bunny_mat_idx] = Some(0);
+    normal_textures[floor_mat_idx] = Some(1);
+
+    let textures: &[&[u8]] = &[
+        include_bytes!("../data/textures/brushed_brass_mr.png"),
+        include_bytes!("../data/textures/stone_tile_normal.png"),
+    ];
+
+    emit_gltf(
+        &palette,
+        &base_textures,
+        &mr_textures,
+        &normal_textures,
+        &batches,
+        textures,
+    )
 }
 
 /// `data/gltf/cornell_textured_floor.gltf` — same Cornell as
@@ -980,9 +1099,17 @@ fn build_cornell_textured_floor() -> Vec<u8> {
     let mut material_textures: Vec<Option<u32>> = vec![None; palette.len()];
     material_textures[floor_mat_idx] = Some(0);
     let no_mr = vec![None; palette.len()];
+    let no_normal = vec![None; palette.len()];
     let textures: &[&[u8]] = &[include_bytes!("../data/textures/uv_checker_color.png")];
 
-    emit_gltf(&palette, &material_textures, &no_mr, &batches, textures)
+    emit_gltf(
+        &palette,
+        &material_textures,
+        &no_mr,
+        &no_normal,
+        &batches,
+        textures,
+    )
 }
 
 /// `material_textures[i] = Some(layer)` means material `i` uses
@@ -992,11 +1119,13 @@ fn emit_gltf(
     palette: &[GpuMaterial],
     material_base_textures: &[Option<u32>],
     material_mr_textures: &[Option<u32>],
+    material_normal_textures: &[Option<u32>],
     batches: &[PrimitiveBatch],
     textures: &[&[u8]],
 ) -> Vec<u8> {
     assert_eq!(palette.len(), material_base_textures.len());
     assert_eq!(palette.len(), material_mr_textures.len());
+    assert_eq!(palette.len(), material_normal_textures.len());
     // --- Binary buffer + accessors ---
     let mut bin: Vec<u8> = Vec::new();
     let mut accessors_json: Vec<String> = Vec::new();
@@ -1106,14 +1235,19 @@ fn emit_gltf(
         .iter()
         .zip(material_base_textures.iter())
         .zip(material_mr_textures.iter())
+        .zip(material_normal_textures.iter())
         .enumerate()
-        .map(|(i, ((m, base_idx), mr_idx))| {
+        .map(|(i, (((m, base_idx), mr_idx), normal_idx))| {
             let base_color_texture = match base_idx {
                 Some(idx) => format!(r#","baseColorTexture":{{"index":{idx}}}"#),
                 None => String::new(),
             };
             let metallic_roughness_texture = match mr_idx {
                 Some(idx) => format!(r#","metallicRoughnessTexture":{{"index":{idx}}}"#),
+                None => String::new(),
+            };
+            let normal_texture = match normal_idx {
+                Some(idx) => format!(r#","normalTexture":{{"index":{idx}}}"#),
                 None => String::new(),
             };
             // PT-dielectrics / PT-beer-lambert / PT-fog: non-standard
@@ -1156,13 +1290,14 @@ fn emit_gltf(
                 format!(r#","extras":{{{}}}"#, extras_parts.join(","))
             };
             format!(
-                r#"{{"name":"{name}","pbrMetallicRoughness":{{"baseColorFactor":[{ar},{ag},{ab},1.0],"metallicFactor":{met},"roughnessFactor":{rough}{tex}{mrtex}}},"emissiveFactor":[{er},{eg},{eb}]{extras}}}"#,
+                r#"{{"name":"{name}","pbrMetallicRoughness":{{"baseColorFactor":[{ar},{ag},{ab},1.0],"metallicFactor":{met},"roughnessFactor":{rough}{tex}{mrtex}}}{nrmtex},"emissiveFactor":[{er},{eg},{eb}]{extras}}}"#,
                 name = material_label(m, i),
                 ar = m.albedo[0], ag = m.albedo[1], ab = m.albedo[2],
                 met = m.metallic, rough = m.roughness,
                 er = m.emission[0], eg = m.emission[1], eb = m.emission[2],
                 tex = base_color_texture,
                 mrtex = metallic_roughness_texture,
+                nrmtex = normal_texture,
             )
         })
         .collect();

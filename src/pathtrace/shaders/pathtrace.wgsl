@@ -78,12 +78,17 @@ struct Material {
     // roughness, B channel is metallic. NO_TEXTURE = use the
     // scalar `roughness` + `metallic` instead.
     metallic_roughness_texture_idx: u32,
-    _pad0: u32,
+    // PT-normal-map: glTF normal map (tangent-space, +Y up).
+    // NO_TEXTURE = use the geometric normal directly.
+    normal_texture_idx: u32,
     // PT-beer-lambert: per-channel Beer-Lambert absorption coefficient
     // applied to throughput per unit of distance travelled *inside*
     // this material. `(0, 0, 0)` = no participating-media tinting.
     absorption: vec3<f32>,
-    _pad2: f32,
+    // PT-normal-map: scales the tangent-space XY components before
+    // reconstruction. Mirrors glTF `normalTexture.scale`. 1.0 =
+    // unscaled (the procedural maps); <1 softens the perturbation.
+    normal_scale: f32,
     // PT-fog: per-channel scattering coefficient. Together with
     // `absorption` defines the medium's extinction `σ_t = σ_a + σ_s`
     // and scattering albedo `σ_s / σ_t`.
@@ -431,6 +436,89 @@ fn material_albedo(mat: Material, uv: vec2<f32>) -> vec3<f32> {
         0.0,
     );
     return mat.albedo * tex.rgb;
+}
+
+// PT-normal-map: per-triangle TBN. Computes a world-space tangent
+// from triangle position + UV deltas (textbook derivation matches
+// `compute_tangents` in `pathtrace::mesh`). Discontinuous across
+// triangle edges — fine for low-poly mapped surfaces (e.g. our
+// stone-tile floor), problematic on smooth meshes that would need
+// per-vertex tangents. `apply_normal_map` Gram-Schmidts the
+// tangent against the (geometric) normal so the TBN stays
+// orthonormal even when the triangle is non-orthogonal in UV
+// space.
+struct Tbn {
+    tangent: vec3<f32>,
+    bitangent: vec3<f32>,
+    normal: vec3<f32>,
+};
+
+fn triangle_tangent_frame(tri: u32, normal: vec3<f32>) -> Tbn {
+    let i0 = tri_indices[tri * 3u + 0u];
+    let i1 = tri_indices[tri * 3u + 1u];
+    let i2 = tri_indices[tri * 3u + 2u];
+    let p0 = vertices[i0].position;
+    let p1 = vertices[i1].position;
+    let p2 = vertices[i2].position;
+    let uv0 = vertices[i0].uv;
+    let uv1 = vertices[i1].uv;
+    let uv2 = vertices[i2].uv;
+    let e1 = p1 - p0;
+    let e2 = p2 - p0;
+    let duv1 = uv1 - uv0;
+    let duv2 = uv2 - uv0;
+    let det = duv1.x * duv2.y - duv2.x * duv1.y;
+    var tan: vec3<f32>;
+    if (abs(det) < 1e-8) {
+        // Degenerate UV — pick a stable axis-aligned tangent.
+        if (abs(normal.x) < 0.9) {
+            tan = vec3<f32>(1.0, 0.0, 0.0);
+        } else {
+            tan = vec3<f32>(0.0, 1.0, 0.0);
+        }
+    } else {
+        let inv = 1.0 / det;
+        tan = inv * (duv2.y * e1 - duv1.y * e2);
+    }
+    // Gram-Schmidt against the (already unit) normal.
+    let proj = tan - normal * dot(tan, normal);
+    let p_len = length(proj);
+    let t_orth = select(
+        normalize(proj),
+        // Fallback when projection collapses (tangent ‖ normal).
+        normalize(select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), abs(normal.x) >= 0.9)
+                  - normal * dot(select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), abs(normal.x) >= 0.9), normal)),
+        p_len > 1e-6,
+    );
+    var out: Tbn;
+    out.tangent = t_orth;
+    out.bitangent = cross(normal, t_orth);
+    out.normal = normal;
+    return out;
+}
+
+// Tangent-space normal sample → world-space shading normal.
+// Texture stored in OpenGL +Y-up convention (glTF mandated).
+fn apply_normal_map(mat: Material, tri: u32, normal: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
+    if (mat.normal_texture_idx == NO_TEXTURE) {
+        return normal;
+    }
+    let tex = textureSampleLevel(
+        albedo_textures,
+        albedo_sampler,
+        uv,
+        i32(mat.normal_texture_idx),
+        0.0,
+    );
+    // [0, 1] → [-1, 1]. Scale the XY components by `normal_scale`.
+    let ts = vec3<f32>(
+        (tex.r * 2.0 - 1.0) * mat.normal_scale,
+        (tex.g * 2.0 - 1.0) * mat.normal_scale,
+        tex.b * 2.0 - 1.0,
+    );
+    let tbn = triangle_tangent_frame(tri, normal);
+    let world = tbn.tangent * ts.x + tbn.bitangent * ts.y + tbn.normal * ts.z;
+    return normalize(world);
 }
 
 // PT-mr-map: per-texel roughness + metallic, glTF 2.0 convention.
@@ -1725,7 +1813,7 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
             break;
         }
         iter = iter + 1;
-        let hit = trace_scene(ray);
+        var hit = trace_scene(ray);
         if (!hit.hit) {
             // PT-env: a missed ray escapes into the env dome. The
             // BSDF-sample path collects env emission with a MIS
@@ -1867,6 +1955,18 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
         let mr = material_metallic_roughness(m, hit.uv);
         m.roughness = mr.x;
         m.metallic = mr.y;
+
+        // PT-normal-map: perturb the geometric normal in tangent
+        // space. `hit.normal` is overwritten so every downstream
+        // shading dot product (NEE cos, BSDF eval, BSDF sample,
+        // env NEE cos) uses the perturbed shading normal. Self-
+        // intersection offsets later on still compute relative to
+        // the perturbed normal — fine for the showcase scenes
+        // (stone-tile floor, smooth meshes); per-vertex tangents
+        // + a stored geometric normal would tighten this further.
+        if (m.normal_texture_idx != NO_TEXTURE) {
+            hit.normal = apply_normal_map(m, hit.tri, hit.normal, hit.uv);
+        }
 
         if (bounce == 0) {
             result.hit = true;

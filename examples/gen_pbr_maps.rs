@@ -3,16 +3,17 @@
 //!
 //! * `data/textures/brushed_brass_mr.png` — glTF metallic-roughness
 //!   map. R channel unused. **G channel = roughness**; horizontal
-//!   brushed streaks (anisotropic 1-D noise) on a 0.45 mean roughness
+//!   brushed streaks (anisotropic 1-D noise) on a low roughness
 //!   floor, modulated by low-frequency dirt. **B channel = metallic**;
 //!   nearly all 1.0 (full brass) with a few patchy 0.4 zones suggesting
 //!   tarnish.
+//! * `data/textures/stone_tile_normal.png` — glTF normal map.
+//!   Repeating cobble pattern (square cells with bevelled edges +
+//!   per-cell pebble fbm). OpenGL convention: +Y up. Pure xyz →
+//!   stored as (R, G, B) = (nx*0.5+0.5, ny*0.5+0.5, nz*0.5+0.5).
 //!
 //! Output is 256², R8G8B8A8 PNG. Deterministic seed → reproducible
 //! bytes per `cargo run --example gen_pbr_maps`.
-//!
-//! The PT-normal-map milestone extends this same example to bake
-//! `data/textures/stone_tile_normal.png`.
 
 use std::fs;
 use std::path::PathBuf;
@@ -118,6 +119,69 @@ fn brushed_brass_mr(width: u32, height: u32) -> ImageBuffer<Rgba<u8>, Vec<u8>> {
     img
 }
 
+/// Stone-tile normal map. 6 × 6 cells across the texture; each cell
+/// has bevelled edges (height ramps up from the seam, plateaus in
+/// the centre) plus per-cell pebble fbm so adjacent tiles look
+/// distinct. Heights are converted to a tangent-space normal via
+/// finite-difference partials, encoded as (R, G, B) = ((n+1)/2).
+fn stone_tile_normal(width: u32, height: u32) -> ImageBuffer<Rgba<u8>, Vec<u8>> {
+    let seed_tile = 0x4815_1623_u32;
+    let cells_x = 4.0_f32;
+    let cells_y = 4.0_f32;
+    let bevel_width = 0.06_f32;
+    let normal_strength = 3.5_f32;
+
+    let height_at = |fx: f32, fy: f32| -> f32 {
+        let cell_x = fx * cells_x;
+        let cell_y = fy * cells_y;
+        let ux = cell_x.fract();
+        let uy = cell_y.fract();
+        // Distance to nearest seam in this cell (in cell-units).
+        let dx = ux.min(1.0 - ux);
+        let dy = uy.min(1.0 - uy);
+        let d = dx.min(dy);
+        // Bevel ramp 0 at seam → 1 inside.
+        let bevel = (d / bevel_width).min(1.0);
+        // Smoothstep for a softer bevel.
+        let bevel = bevel * bevel * (3.0 - 2.0 * bevel);
+        // Per-cell pebble noise — modulated by a per-cell hash so
+        // adjacent tiles read distinct.
+        let cell_id = cell_x.floor() as u32 ^ (cell_y.floor() as u32).wrapping_mul(0x9E37);
+        // Per-cell DC offset — small bumps in plateau height so
+        // adjacent tiles read as cobbles with slightly different
+        // surface heights. No per-texel noise: at the finite-
+        // difference scale of 1 texel that would just produce
+        // texel-grain in the normal map.
+        let cell_dc = (frand(seed_tile.wrapping_add(cell_id)) - 0.5) * 0.06;
+        bevel * (0.80 + cell_dc)
+    };
+
+    let mut img = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(width, height);
+    let eps = 1.0 / width as f32;
+    for y in 0..height {
+        for x in 0..width {
+            let fx = x as f32 / width as f32;
+            let fy = y as f32 / height as f32;
+            // Finite-difference partials of height with respect to UV.
+            let hx = (height_at(fx + eps, fy) - height_at(fx - eps, fy)) / (2.0 * eps);
+            let hy = (height_at(fx, fy + eps) - height_at(fx, fy - eps)) / (2.0 * eps);
+            // Tangent-space normal: rotate (0, 0, 1) by the partials.
+            let nx = -hx * normal_strength;
+            let ny = -hy * normal_strength;
+            let nz = 1.0;
+            let len = (nx * nx + ny * ny + nz * nz).sqrt();
+            let nx_n = nx / len;
+            let ny_n = ny / len;
+            let nz_n = nz / len;
+            let r = ((nx_n * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0) as u8;
+            let g = ((ny_n * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0) as u8;
+            let b = ((nz_n * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0) as u8;
+            img.put_pixel(x, y, Rgba([r, g, b, 255]));
+        }
+    }
+    img
+}
+
 fn main() {
     let out_dir = PathBuf::from("data/textures");
     fs::create_dir_all(&out_dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", out_dir.display()));
@@ -138,5 +202,22 @@ fn main() {
         mr_img.height(),
         (total_rough as f64 / n as f64) / 255.0,
         (total_metal as f64 / n as f64) / 255.0,
+    );
+
+    let normal_img = stone_tile_normal(256, 256);
+    let path = out_dir.join("stone_tile_normal.png");
+    normal_img
+        .save(&path)
+        .unwrap_or_else(|e| panic!("save {}: {e}", path.display()));
+    // Z channel average — should be close to 255 (most pixels are
+    // near +Z in tangent space, since extreme bevels are a minority).
+    let total_z: u64 = normal_img.pixels().map(|p| p.0[2] as u64).sum();
+    let n = (normal_img.width() * normal_img.height()) as u64;
+    println!(
+        "wrote {} ({}×{}, mean Z channel {:.3})",
+        path.display(),
+        normal_img.width(),
+        normal_img.height(),
+        (total_z as f64 / n as f64) / 255.0,
     );
 }
