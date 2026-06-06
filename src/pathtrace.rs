@@ -408,10 +408,14 @@ fn make_storage_buffer(
     data: &[u8],
     label: &str,
 ) -> wgpu::Buffer {
-    // Storage buffer size must be > 0. Empty scenes (e.g. no emissive
-    // triangles) still need a valid binding; pad to a 4-byte zero so
-    // the bind group is well-formed.
-    let bytes: &[u8] = if data.is_empty() { &[0, 0, 0, 0] } else { data };
+    // Storage buffer size must be ≥ the bound element's std430
+    // stride. PT-many-lights introduced `array<EmissiveLight>`
+    // with stride 16 — empty scenes (no emissive triangles)
+    // need a 16-byte zero pad rather than 4 bytes so the bind
+    // group validates. Other storage buffers with smaller
+    // strides (u32 → 4) are still satisfied.
+    const EMPTY_PAD: [u8; 16] = [0; 16];
+    let bytes: &[u8] = if data.is_empty() { &EMPTY_PAD } else { data };
     let buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
         size: bytes.len() as u64,
