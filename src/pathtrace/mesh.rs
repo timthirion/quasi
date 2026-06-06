@@ -52,19 +52,16 @@ use crate::pathtrace::bvh::Bvh;
 ///   position: vec3 — offset 0,  size 12, align 16
 ///   normal:   vec3 — offset 16, size 12, align 16
 ///   uv:       vec2 — offset 32, size 8,  align 8
-///   total:    48 bytes (struct alignment 16 rounds 40 up to 48).
+///   tangent:  vec4 — offset 48, size 16, align 16
+///   total:    64 bytes.
 ///
-/// The `_pad*` fields make the Rust shape match byte-for-byte.
-///
-/// PT-normal-map deliberately does NOT grow `Vertex` by 16 bytes
-/// for a tangent: the WGSL TBN is built from triangle position +
-/// UV deltas at the hit, which is cheap and avoids any CPU-side
-/// `compute_tangents` pass. The tradeoff is non-smooth tangents
-/// across triangle edges; this is fine for the showcase scenes
-/// (the stone-tile floor is 2 triangles — no seam) but would
-/// produce visible artefacts on a smooth-shaded mesh under a
-/// directional normal map. `compute_tangents` is still exposed
-/// as a tested utility for the day a smoother story matters.
+/// PT-vertex-tangent (plan 0019) grew the vertex by 16 bytes
+/// for the per-vertex tangent. The plan 0015 per-hit tangent
+/// frame was correct for the 2-triangle stone-tile floor but
+/// aliased visibly across smooth-shaded normal-mapped meshes.
+/// `tangent` carries world-space xyz + bitangent sign in `.w`
+/// per the glTF 2.0 convention. Default for a vertex without
+/// a normal-mapped material is `(1, 0, 0, 1)`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable, PartialEq)]
 pub struct Vertex {
@@ -74,6 +71,7 @@ pub struct Vertex {
     pub _pad1: f32,
     pub uv: [f32; 2],
     pub _pad2: [f32; 2],
+    pub tangent: [f32; 4],
 }
 
 /// Sentinel layer index meaning "no `baseColorTexture` for this
@@ -845,11 +843,32 @@ fn process_primitive(
         None => vec![[0.0, 0.0]; positions.len()],
     };
 
+    // PT-vertex-tangent (plan 0019): prefer the glTF `TANGENT`
+    // vec4 attribute when present (mesh-local; .w = bitangent
+    // sign). Otherwise derive via `compute_tangents`. Defaults to
+    // (1, 0, 0, 1) when there are no UVs to anchor a derivation.
+    let tangents_local: Vec<[f32; 4]> = if uvs.iter().any(|uv| *uv != [0.0, 0.0]) {
+        match reader.read_tangents() {
+            Some(read) => read.collect(),
+            None => compute_tangents(&positions, &normals, &uvs, &indices),
+        }
+    } else {
+        vec![[1.0, 0.0, 0.0, 1.0]; positions.len()]
+    };
+    let raw_columns = upper_3x3_raw(world);
+
     let vertex_offset = scene.vertices.len() as u32;
     for i in 0..positions.len() {
         let p = transform_point(world, positions[i]);
         let n = transform_normal(&cols, normals[i]);
         let uv = uvs.get(i).copied().unwrap_or([0.0, 0.0]);
+        let t_local = tangents_local
+            .get(i)
+            .copied()
+            .unwrap_or([1.0, 0.0, 0.0, 1.0]);
+        let t_w = transform_dir(&raw_columns, [t_local[0], t_local[1], t_local[2]]);
+        let n_unit = normalize_or_zero(n);
+        let t_proj = orthonormalize_tangent(t_w, n_unit);
         scene.vertices.push(Vertex {
             position: p,
             _pad0: 0.0,
@@ -857,6 +876,7 @@ fn process_primitive(
             _pad1: 0.0,
             uv,
             _pad2: [0.0, 0.0],
+            tangent: [t_proj[0], t_proj[1], t_proj[2], t_local[3]],
         });
     }
 
@@ -895,12 +915,14 @@ mod tests {
     // ---- Layout ----
 
     #[test]
-    fn vertex_is_48_bytes() {
-        // PT-textures: vec3 position (16) + vec3 normal (16) + vec2 uv (8)
-        // + 8 bytes of trailing pad so the struct stride matches std430.
-        // PT-normal-map deliberately does NOT grow this — tangents are
-        // derived per-hit from triangle + UV deltas in WGSL.
-        assert_eq!(std::mem::size_of::<Vertex>(), 48);
+    fn vertex_is_64_bytes_with_tangent_at_48() {
+        // PT-vertex-tangent (plan 0019): position(16) + normal(16) +
+        // uv(8+8 pad) + tangent vec4(16) = 64 bytes.
+        assert_eq!(std::mem::size_of::<Vertex>(), 64);
+        assert_eq!(std::mem::offset_of!(Vertex, position), 0);
+        assert_eq!(std::mem::offset_of!(Vertex, normal), 16);
+        assert_eq!(std::mem::offset_of!(Vertex, uv), 32);
+        assert_eq!(std::mem::offset_of!(Vertex, tangent), 48);
     }
 
     #[test]
@@ -1193,6 +1215,7 @@ mod tests {
                 _pad1: 0.0,
                 uv: [0.0, 0.0],
                 _pad2: [0.0, 0.0],
+                tangent: [1.0, 0.0, 0.0, 1.0],
             });
         }
         s.vertices[1].position = [1.0, 0.0, 0.0];
@@ -1246,6 +1269,7 @@ mod tests {
                 _pad1: 0.0,
                 uv: [0.0, 0.0],
                 _pad2: [0.0, 0.0],
+                tangent: [1.0, 0.0, 0.0, 1.0],
             })
             .collect();
         s.vertices[1].position = [2.0, 0.0, 0.0];

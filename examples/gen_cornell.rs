@@ -187,6 +187,28 @@ fn main() {
         room_quads.len() * 2 + bunny_indices.len() / 3,
     );
 
+    // 4c) PT-vertex-tangent showcase: Cornell room with the
+    //     brushed-brass bunny wearing a fur normal map. With
+    //     per-vertex tangents the normal-mapped bunny reads
+    //     smoothly across triangle seams.
+    let bytes = build_cornell_fur_bunny(
+        &room_quads,
+        &room_materials,
+        &bunny_positions,
+        &bunny_normals,
+        &bunny_indices,
+        &bunny_raw_uvs,
+        metal_bunny_mat,
+    );
+    let path = out_dir.join("cornell_fur_bunny.gltf");
+    fs::write(&path, &bytes).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    println!(
+        "wrote {} ({} bytes, fur-normal-mapped bunny + brushed brass → {} triangles)",
+        path.display(),
+        bytes.len(),
+        room_quads.len() * 2 + bunny_indices.len() / 3,
+    );
+
     // 4b) PT-normal-map showcase: Cornell room with stone-tile
     //     normal-mapped floor + brushed-brass bunny — both PBR
     //     maps active in the same scene.
@@ -1145,6 +1167,60 @@ fn build_cornell_brushed_metal_bunny(
     mr_textures[bunny_mat_idx] = Some(0);
 
     let textures: &[&[u8]] = &[include_bytes!("../data/textures/brushed_brass_mr.png")];
+
+    emit_gltf(
+        &palette,
+        &base_textures,
+        &mr_textures,
+        &normal_textures,
+        &batches,
+        textures,
+    )
+}
+
+/// PT-vertex-tangent: `data/gltf/cornell_fur_bunny.gltf` — the
+/// brushed-brass bunny with a low-amplitude fur normal map.
+/// Showcases that per-vertex tangents make normal mapping work
+/// smoothly on a triangulated organic mesh.
+fn build_cornell_fur_bunny(
+    quads: &[GpuQuad],
+    materials: &[GpuMaterial],
+    bunny_positions: &[[f32; 3]],
+    bunny_normals: &[[f32; 3]],
+    bunny_indices: &[u32],
+    bunny_uvs_raw: &[[f32; 2]],
+    bunny_material: GpuMaterial,
+) -> Vec<u8> {
+    let (mut palette, quad_material) = unique_materials(materials);
+    let bunny_mat_idx = palette.len();
+    palette.push(bunny_material);
+
+    // Cylindrical UVs ×3 — same tiling as the brushed-brass
+    // scene so the two textures align.
+    let bunny_uvs: Vec<[f32; 2]> = bunny_uvs_raw
+        .iter()
+        .map(|uv| [uv[0] * 3.0, uv[1]])
+        .collect();
+
+    let mut batches = triangulate(quads, &quad_material, palette.len(), 1);
+    batches.push(PrimitiveBatch {
+        material_idx: bunny_mat_idx,
+        positions: bunny_positions.to_vec(),
+        normals: bunny_normals.to_vec(),
+        uvs: bunny_uvs,
+        indices: bunny_indices.to_vec(),
+    });
+
+    let base_textures: Vec<Option<u32>> = vec![None; palette.len()];
+    let mut mr_textures: Vec<Option<u32>> = vec![None; palette.len()];
+    let mut normal_textures: Vec<Option<u32>> = vec![None; palette.len()];
+    mr_textures[bunny_mat_idx] = Some(0);
+    normal_textures[bunny_mat_idx] = Some(1);
+
+    let textures: &[&[u8]] = &[
+        include_bytes!("../data/textures/brushed_brass_mr.png"),
+        include_bytes!("../data/textures/bunny_fur_normal.png"),
+    ];
 
     emit_gltf(
         &palette,

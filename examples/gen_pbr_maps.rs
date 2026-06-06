@@ -182,6 +182,42 @@ fn stone_tile_normal(width: u32, height: u32) -> ImageBuffer<Rgba<u8>, Vec<u8>> 
     img
 }
 
+/// Soft bunny-fur normal map. Multi-octave fbm height (low
+/// amplitude) → finite-difference normal. Tiles seamlessly in
+/// U via low-frequency band synthesis; no per-cell structure,
+/// just organic high-freq noise.
+fn bunny_fur_normal(width: u32, height: u32) -> ImageBuffer<Rgba<u8>, Vec<u8>> {
+    let seed = 0x1234_5678_u32;
+    let normal_strength = 1.6_f32;
+    let height_at = |fx: f32, fy: f32| -> f32 {
+        let h1 = fbm_2d(fx * 28.0, fy * 28.0, 4, seed);
+        let h2 = fbm_2d(fx * 6.0, fy * 6.0, 3, seed.wrapping_add(0xa5a5));
+        h1 * 0.05 + h2 * 0.03
+    };
+    let mut img = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(width, height);
+    let eps = 1.0 / width as f32;
+    for y in 0..height {
+        for x in 0..width {
+            let fx = x as f32 / width as f32;
+            let fy = y as f32 / height as f32;
+            let hx = (height_at(fx + eps, fy) - height_at(fx - eps, fy)) / (2.0 * eps);
+            let hy = (height_at(fx, fy + eps) - height_at(fx, fy - eps)) / (2.0 * eps);
+            let nx = -hx * normal_strength;
+            let ny = -hy * normal_strength;
+            let nz = 1.0_f32;
+            let len = (nx * nx + ny * ny + nz * nz).sqrt();
+            let nx_n = nx / len;
+            let ny_n = ny / len;
+            let nz_n = nz / len;
+            let r = ((nx_n * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0) as u8;
+            let g = ((ny_n * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0) as u8;
+            let b = ((nz_n * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0) as u8;
+            img.put_pixel(x, y, Rgba([r, g, b, 255]));
+        }
+    }
+    img
+}
+
 fn main() {
     let out_dir = PathBuf::from("data/textures");
     fs::create_dir_all(&out_dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", out_dir.display()));
@@ -205,19 +241,35 @@ fn main() {
     );
 
     let normal_img = stone_tile_normal(256, 256);
-    let path = out_dir.join("stone_tile_normal.png");
+    let stone_path = out_dir.join("stone_tile_normal.png");
     normal_img
-        .save(&path)
-        .unwrap_or_else(|e| panic!("save {}: {e}", path.display()));
-    // Z channel average — should be close to 255 (most pixels are
-    // near +Z in tangent space, since extreme bevels are a minority).
-    let total_z: u64 = normal_img.pixels().map(|p| p.0[2] as u64).sum();
-    let n = (normal_img.width() * normal_img.height()) as u64;
+        .save(&stone_path)
+        .unwrap_or_else(|e| panic!("save {}: {e}", stone_path.display()));
+    let stone_total_z: u64 = normal_img.pixels().map(|p| p.0[2] as u64).sum();
+    let stone_n = (normal_img.width() * normal_img.height()) as u64;
     println!(
         "wrote {} ({}×{}, mean Z channel {:.3})",
-        path.display(),
+        stone_path.display(),
         normal_img.width(),
         normal_img.height(),
-        (total_z as f64 / n as f64) / 255.0,
+        (stone_total_z as f64 / stone_n as f64) / 255.0,
+    );
+
+    // PT-vertex-tangent showcase: low-amplitude bunny-fur normal
+    // map. Multi-octave fbm → finite-difference normal. Tiles
+    // cleanly over the bunny's cylindrical UVs.
+    let fur_img = bunny_fur_normal(256, 256);
+    let fur_path = out_dir.join("bunny_fur_normal.png");
+    fur_img
+        .save(&fur_path)
+        .unwrap_or_else(|e| panic!("save {}: {e}", fur_path.display()));
+    let fur_total_z: u64 = fur_img.pixels().map(|p| p.0[2] as u64).sum();
+    let fur_n = (fur_img.width() * fur_img.height()) as u64;
+    println!(
+        "wrote {} ({}×{}, mean Z channel {:.3})",
+        fur_path.display(),
+        fur_img.width(),
+        fur_img.height(),
+        (fur_total_z as f64 / fur_n as f64) / 255.0,
     );
 }

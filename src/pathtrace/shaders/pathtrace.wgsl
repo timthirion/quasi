@@ -63,6 +63,9 @@ struct Vertex {
     _pad1: f32,
     uv: vec2<f32>,
     _pad2: vec2<f32>,
+    // PT-vertex-tangent (plan 0019): world-space tangent xyz +
+    // bitangent sign in .w (glTF 2.0 convention).
+    tangent: vec4<f32>,
 };
 
 struct Material {
@@ -414,6 +417,11 @@ struct Hit {
     // ray for shading convenience — front_face restores that info.
     // 1 = hit front face / entering; 0 = hit back face / exiting.
     front_face: u32,
+    // PT-vertex-tangent (plan 0019): barycentric (u, v) at the
+    // hit. Used to interpolate per-vertex tangents inside
+    // `apply_normal_map`. Costs 8 bytes per Hit; only read by
+    // the normal-map path.
+    bary: vec2<f32>,
 };
 
 /// Barycentric-interpolated UV at a triangle hit. The `(u, v)` come
@@ -447,68 +455,68 @@ fn material_albedo(mat: Material, uv: vec2<f32>) -> vec3<f32> {
     return mat.albedo * tex.rgb;
 }
 
-// PT-normal-map: per-triangle TBN. Computes a world-space tangent
-// from triangle position + UV deltas (textbook derivation matches
-// `compute_tangents` in `pathtrace::mesh`). Discontinuous across
-// triangle edges — fine for low-poly mapped surfaces (e.g. our
-// stone-tile floor), problematic on smooth meshes that would need
-// per-vertex tangents. `apply_normal_map` Gram-Schmidts the
-// tangent against the (geometric) normal so the TBN stays
-// orthonormal even when the triangle is non-orthogonal in UV
-// space.
+// PT-vertex-tangent (plan 0019): build a world-space TBN at the
+// hit by **barycentrically interpolating the three per-vertex
+// tangents** stored on `Vertex`. Gram-Schmidts the interpolated
+// tangent against the (geometric) shading normal so the TBN
+// stays orthonormal even when the per-vertex tangents drift
+// slightly off-plane. Smooth across triangle edges — the prior
+// per-hit `triangle_tangent_frame` derivation lives in commit
+// history.
 struct Tbn {
     tangent: vec3<f32>,
     bitangent: vec3<f32>,
     normal: vec3<f32>,
 };
 
-fn triangle_tangent_frame(tri: u32, normal: vec3<f32>) -> Tbn {
+fn vertex_tangent(tri: u32, bary: vec2<f32>) -> vec4<f32> {
     let i0 = tri_indices[tri * 3u + 0u];
     let i1 = tri_indices[tri * 3u + 1u];
     let i2 = tri_indices[tri * 3u + 2u];
-    let p0 = vertices[i0].position;
-    let p1 = vertices[i1].position;
-    let p2 = vertices[i2].position;
-    let uv0 = vertices[i0].uv;
-    let uv1 = vertices[i1].uv;
-    let uv2 = vertices[i2].uv;
-    let e1 = p1 - p0;
-    let e2 = p2 - p0;
-    let duv1 = uv1 - uv0;
-    let duv2 = uv2 - uv0;
-    let det = duv1.x * duv2.y - duv2.x * duv1.y;
-    var tan: vec3<f32>;
-    if (abs(det) < 1e-8) {
-        // Degenerate UV — pick a stable axis-aligned tangent.
-        if (abs(normal.x) < 0.9) {
-            tan = vec3<f32>(1.0, 0.0, 0.0);
-        } else {
-            tan = vec3<f32>(0.0, 1.0, 0.0);
-        }
+    let w0 = 1.0 - bary.x - bary.y;
+    let t0 = vertices[i0].tangent;
+    let t1 = vertices[i1].tangent;
+    let t2 = vertices[i2].tangent;
+    let blended = t0 * w0 + t1 * bary.x + t2 * bary.y;
+    // Pick the dominant per-vertex bitangent sign (in practice
+    // they're all equal across a triangle's three vertices).
+    var sign = blended.w;
+    if (sign == 0.0) {
+        sign = 1.0;
     } else {
-        let inv = 1.0 / det;
-        tan = inv * (duv2.y * e1 - duv1.y * e2);
+        sign = sign / abs(sign);
     }
-    // Gram-Schmidt against the (already unit) normal.
-    let proj = tan - normal * dot(tan, normal);
+    return vec4<f32>(blended.xyz, sign);
+}
+
+fn interpolated_tbn(tri: u32, bary: vec2<f32>, normal: vec3<f32>) -> Tbn {
+    let raw = vertex_tangent(tri, bary);
+    // Gram-Schmidt against the (already unit) normal — keeps the
+    // TBN orthonormal under the barycentric blend's drift.
+    let proj = raw.xyz - normal * dot(raw.xyz, normal);
     let p_len = length(proj);
     let t_orth = select(
         normalize(proj),
         // Fallback when projection collapses (tangent ‖ normal).
-        normalize(select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), abs(normal.x) >= 0.9)
-                  - normal * dot(select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), abs(normal.x) >= 0.9), normal)),
+        normalize(
+            select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), abs(normal.x) >= 0.9)
+            - normal * dot(
+                select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), abs(normal.x) >= 0.9),
+                normal,
+            )
+        ),
         p_len > 1e-6,
     );
     var out: Tbn;
     out.tangent = t_orth;
-    out.bitangent = cross(normal, t_orth);
+    out.bitangent = cross(normal, t_orth) * raw.w;
     out.normal = normal;
     return out;
 }
 
 // Tangent-space normal sample → world-space shading normal.
 // Texture stored in OpenGL +Y-up convention (glTF mandated).
-fn apply_normal_map(mat: Material, tri: u32, normal: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
+fn apply_normal_map(mat: Material, tri: u32, bary: vec2<f32>, normal: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
     if (mat.normal_texture_idx == NO_TEXTURE) {
         return normal;
     }
@@ -525,7 +533,7 @@ fn apply_normal_map(mat: Material, tri: u32, normal: vec3<f32>, uv: vec2<f32>) -
         (tex.g * 2.0 - 1.0) * mat.normal_scale,
         tex.b * 2.0 - 1.0,
     );
-    let tbn = triangle_tangent_frame(tri, normal);
+    let tbn = interpolated_tbn(tri, bary, normal);
     let world = tbn.tangent * ts.x + tbn.bitangent * ts.y + tbn.normal * ts.z;
     return normalize(world);
 }
@@ -572,6 +580,7 @@ fn record_hit(
     (*closest).tri = tri;
     (*closest).mat = tri_materials[tri];
     (*closest).uv = triangle_uv(tri, bary_uv.x, bary_uv.y);
+    (*closest).bary = bary_uv;
     let geom_n = normalize(cross(verts.v1 - verts.v0, verts.v2 - verts.v0));
     let front = dot(geom_n, ray.dir) < 0.0;
     var n = geom_n;
@@ -2035,7 +2044,7 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
         // (stone-tile floor, smooth meshes); per-vertex tangents
         // + a stored geometric normal would tighten this further.
         if (m.normal_texture_idx != NO_TEXTURE) {
-            hit.normal = apply_normal_map(m, hit.tri, hit.normal, hit.uv);
+            hit.normal = apply_normal_map(m, hit.tri, hit.bary, hit.normal, hit.uv);
         }
 
         if (bounce == 0) {
