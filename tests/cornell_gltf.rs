@@ -33,7 +33,7 @@ fn cornell_quads_has_expected_topology() {
     let emissive_materials: Vec<_> = scene.materials.iter().filter(|m| m.is_emissive()).collect();
     assert_eq!(emissive_materials.len(), 1);
     // Light is one quad → 2 triangles.
-    assert_eq!(scene.emissive_triangles.len(), 2);
+    assert_eq!(scene.emissive_lights.len(), 2);
 }
 
 #[test]
@@ -43,7 +43,7 @@ fn cornell_tris_has_expected_topology() {
     assert_eq!(scene.triangle_count(), 512);
     assert_eq!(scene.materials.len(), 5);
     // Light: 1 quad × 4×4 × 2 = 32 emissive triangles.
-    assert_eq!(scene.emissive_triangles.len(), 32);
+    assert_eq!(scene.emissive_lights.len(), 32);
 }
 
 #[test]
@@ -54,7 +54,7 @@ fn cornell_sphere_has_expected_topology() {
     // 1 default + 4 room (white, red, green, light) + 1 sphere material.
     assert_eq!(scene.materials.len(), 6);
     // Only the light quad is emissive — 1 quad × 2 triangles.
-    assert_eq!(scene.emissive_triangles.len(), 2);
+    assert_eq!(scene.emissive_lights.len(), 2);
     // BVH built at load time — non-empty.
     assert!(
         scene.bvh.nodes.len() > 1,
@@ -71,7 +71,7 @@ fn cornell_bunny_has_expected_topology() {
     assert_eq!(scene.triangle_count(), 6 * 2 + 4968);
     // 1 default + 4 room (white/red/green/light) + 1 bunny material.
     assert_eq!(scene.materials.len(), 6);
-    assert_eq!(scene.emissive_triangles.len(), 2);
+    assert_eq!(scene.emissive_lights.len(), 2);
     // BVH must exist for the renderer.
     assert!(scene.bvh.nodes.len() > 1);
 }
@@ -84,10 +84,7 @@ fn cornell_metal_bunny_topology_matches_clay_bunny_but_material_is_metallic() {
     // Same geometry as the clay bunny — only the bunny material differs.
     assert_eq!(metal.triangle_count(), clay.triangle_count());
     assert_eq!(metal.materials.len(), clay.materials.len());
-    assert_eq!(
-        metal.emissive_triangles.len(),
-        clay.emissive_triangles.len()
-    );
+    assert_eq!(metal.emissive_lights.len(), clay.emissive_lights.len());
 
     // The new scene must carry at least one fully metallic (metallic=1)
     // material — anything less and the WGSL `metallic > 0.5` dispatch
@@ -117,8 +114,8 @@ fn cornell_glass_sphere_topology_matches_lambertian_sphere_but_carries_ior() {
     assert_eq!(glass.triangle_count(), lambertian.triangle_count());
     assert_eq!(glass.materials.len(), lambertian.materials.len());
     assert_eq!(
-        glass.emissive_triangles.len(),
-        lambertian.emissive_triangles.len()
+        glass.emissive_lights.len(),
+        lambertian.emissive_lights.len()
     );
 
     // Round-trip the ior through `extras` and out — the glass
@@ -274,7 +271,7 @@ fn cornell_textured_floor_has_the_embedded_uv_checker() {
     assert_eq!(scene.textures[0].height, 1024);
     assert_eq!(scene.textures[0].rgba.len(), 1024 * 1024 * 4);
     // The light quad's 2 emissive triangles still get picked up.
-    assert_eq!(scene.emissive_triangles.len(), 2);
+    assert_eq!(scene.emissive_lights.len(), 2);
 }
 
 #[test]

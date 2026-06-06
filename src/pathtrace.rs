@@ -505,7 +505,7 @@ fn build_scene_buffers_full(
     let emissive_triangle = make_storage_buffer(
         device,
         queue,
-        bytemuck::cast_slice(&scene_data.emissive_triangles),
+        bytemuck::cast_slice(&scene_data.emissive_lights),
         "emissive-triangles",
     );
     let bvh_nodes = make_storage_buffer(
@@ -1160,7 +1160,7 @@ impl State {
         let triangle_scene = default_triangle_scene();
         let mut uniforms = scene::Uniforms::zeroed();
         uniforms.triangle_count = triangle_scene.triangle_count() as u32;
-        uniforms.emissive_count = triangle_scene.emissive_triangles.len() as u32;
+        uniforms.emissive_count = triangle_scene.emissive_lights.len() as u32;
         uniforms.sampler_kind = SamplerKind::default().as_u32();
         uniforms.integrator_kind = IntegratorKind::default().as_u32();
         uniforms.use_bvh = 1;

@@ -217,7 +217,7 @@ async fn render_offscreen_async(
     // --- Scene + uniforms ---
     let mut uniforms = scene::Uniforms::zeroed();
     uniforms.triangle_count = scene_data.triangle_count() as u32;
-    uniforms.emissive_count = scene_data.emissive_triangles.len() as u32;
+    uniforms.emissive_count = scene_data.emissive_lights.len() as u32;
     uniforms.camera.position = cfg.camera_pos;
     uniforms.camera.direction = cfg.camera_dir;
     uniforms.camera.up = cfg.camera_up;

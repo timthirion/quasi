@@ -220,7 +220,7 @@ fn run_render(args: &[String]) {
     log::info!(
         "scene: {} triangles, {} emissive",
         scene.triangle_count(),
-        scene.emissive_triangles.len(),
+        scene.emissive_lights.len(),
     );
     let cloud_grid = cli.cloud_grid.as_deref().map(|p| {
         quasi::pathtrace::grid::Grid3D::load_from_path(p).unwrap_or_else(|e| {

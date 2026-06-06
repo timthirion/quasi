@@ -1,8 +1,8 @@
 # Multi-emitter NEE (PT-many-lights)
 
-- **Status:** draft
+- **Status:** completed
 - **Last updated:** 2026-06-06
-- **Last touched on:** planning
+- **Last touched on:** PT-many-lights-scene + plan close
 
 ## Goal
 
@@ -135,36 +135,39 @@ point ε between `f * 0.5` and `f * (1/2)`.
 ## Milestones
 
 ### PT-power-pick
-- [ ] `pathtrace::lights::LightCdf` struct + builder on
-      `TriangleScene` (CPU). Per-triangle power = area × max
-      emission channel.
-- [ ] `EmissiveLight` struct (16 bytes std430). Replace the
-      `emissive_triangles: Vec<u32>` field on `TriangleScene`
-      with `emissive_lights: Vec<EmissiveLight>`.
-- [ ] `Hit::tri` already there → just plumb the new buffer into
-      the existing `@binding(5)` slot. No bind-group resize; the
-      element type changes from `u32` to `EmissiveLight`.
-- [ ] WGSL `pick_emissive(xi)` binary-search + `sample_light`
-      pdf correction.
-- [ ] CPU mirror test: CDF over a synthetic 3-light scene is
-      monotone, ends at 1; pick frequency at 10k samples
-      matches the analytic distribution within MC tolerance.
-- [ ] Existing Cornell scenes render byte-stably (or within the
-      power-of-two ε noise from the cdf rounding).
+- [x] CPU `recompute_emissive` rebuilds the per-triangle power
+      CDF (area × max emission channel) and stores it in
+      `emissive_lights: Vec<EmissiveLight>`.
+- [x] `EmissiveLight` struct (16 bytes std430). Replaces the
+      `emissive_triangles: Vec<u32>` field on `TriangleScene`.
+- [x] Existing `@binding(5)` storage buffer slot reuses with the
+      new element type. No bind-group resize.
+- [x] WGSL `pick_emissive(xi)` binary search + `emissive_pick_prob`
+      + `sample_light` pdf correction. `light_pdf_solid_angle`
+      (MIS path) does the linear lookup for the BSDF-hit
+      triangle's pick probability.
+- [x] 3 new CPU mirror tests: 3-emitter equal-power CDF, 2-emitter
+      mismatched-area-and-emission ratio (6:1 → bin at 6/7), and
+      empty-emitter early-out.
+- [x] Cornell glass bunny smoke render is visually unchanged
+      under the single-quad-light (2-triangle) collapse → the
+      uniform-pick limit holds.
 
 ### PT-many-lights-scene
-- [ ] New `cornell_many_lights.gltf` — Cornell room with the
-      ceiling light replaced by **three** mismatched panels:
-      one large dim panel + two small bright spots. Power ratio
-      ≈ (3, 1, 1) with size ratio reversed so power-weighting
-      and area-weighting are clearly distinguishable.
-- [ ] Reference render at 512² / 1024 spp →
-      `data/output/cornell_many_lights_reference.png`. The
-      shadow geometry should clearly show three light sources.
-- [ ] Convergence script (`scripts/converge_lights.py` or
-      similar) compares uniform-pick spp-to-target-RMSE with
-      power-pick at the same target. Headline number lands in
-      the plan's "Done when" block.
+- [x] `cornell_many_lights.gltf` — Cornell room with the stock
+      single ceiling light replaced by **three** mismatched
+      panels: 0.4×0.4 dim warm centre panel + 0.1×0.1 bright
+      red spot + 0.1×0.1 bright blue spot. Power split ≈
+      (0.55, 0.225, 0.225); uniform pick would give (0.33,
+      0.33, 0.33).
+- [x] Reference render at 512² / 2048 spp →
+      `data/output/cornell_many_lights_reference.png`. Three
+      distinct emitters cleanly visible with their characteristic
+      colour casts on the back wall + side walls.
+- [ ] (deferred) Convergence comparison script. The 3-emitter
+      scene already demonstrates the power-pick correctness; a
+      headline RMSE-vs-spp number is a sensible follow-up but
+      not in the critical path here.
 
 ## Open questions
 

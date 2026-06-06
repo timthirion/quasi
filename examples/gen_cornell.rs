@@ -392,6 +392,19 @@ fn main() {
         bytes.len(),
     );
 
+    // 6b) PT-many-lights showcase: Cornell room with **three**
+    //     mismatched-intensity ceiling panels. Power ratio ≈
+    //     (3, 1, 1) with size ratio reversed so the uniform pick
+    //     and the power-weighted pick disagree noticeably.
+    let bytes = build_cornell_many_lights(&quads, &materials);
+    let path = out_dir.join("cornell_many_lights.gltf");
+    fs::write(&path, &bytes).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    println!(
+        "wrote {} ({} bytes, 5 walls + 3 mismatched lights)",
+        path.display(),
+        bytes.len(),
+    );
+
     // 7) Outdoor bunny — the PT-env publishable scene. No walls, no
     //    ceiling, no triangle light: just a ground plane plus the
     //    Stanford bunny. All illumination comes from `--env-map`.
@@ -926,6 +939,86 @@ fn build_gltf_with_extra_mesh(
         uvs: vec![[0.0, 0.0]; sphere_positions.len()],
         indices: sphere_indices.to_vec(),
     });
+    let no_textures = vec![None; palette.len()];
+    emit_gltf(
+        &palette,
+        &no_textures,
+        &no_textures,
+        &no_textures,
+        &batches,
+        &[],
+    )
+}
+
+/// PT-many-lights: Cornell walls + three mismatched-intensity
+/// ceiling panels (one large dim, two small bright). Built from
+/// the existing `quads` slice (5 walls + 1 light) — we drop the
+/// stock single ceiling light and replace it with the three new
+/// quads + their materials.
+fn build_cornell_many_lights(quads: &[GpuQuad], materials: &[GpuMaterial]) -> Vec<u8> {
+    // Walls only — drop the stock ceiling light (last quad +
+    // material in `cornell_box`).
+    let mut quads_out: Vec<GpuQuad> = quads.iter().take(5).copied().collect();
+    let mut materials_out: Vec<GpuMaterial> = materials.iter().take(5).copied().collect();
+
+    let dim_panel_mat = GpuMaterial {
+        albedo: [0.0, 0.0, 0.0],
+        roughness: 1.0,
+        emission: [10.0, 9.0, 7.5],
+        metallic: 0.0,
+        ior: 0.0,
+        absorption: [0.0; 3],
+        scattering: [0.0; 3],
+        phase_g: 0.0,
+        cloud_center: [0.0; 3],
+        cloud_radius: 0.0,
+    };
+    let bright_red_mat = GpuMaterial {
+        emission: [60.0, 8.0, 8.0],
+        ..dim_panel_mat
+    };
+    let bright_blue_mat = GpuMaterial {
+        emission: [8.0, 12.0, 60.0],
+        ..dim_panel_mat
+    };
+
+    let make_quad = |origin: [f32; 3], u: [f32; 3], v: [f32; 3]| GpuQuad {
+        origin,
+        _p0: 0.0,
+        u,
+        _p1: 0.0,
+        v,
+        _p2: 0.0,
+    };
+    // Panel A: large dim warm panel above centre (0.4 × 0.4).
+    //   power = 0.16 · max(6, 5.5, 5)  ≈ 0.96
+    // Panel B: small bright red spot (0.1 × 0.1).
+    //   power = 0.01 · 40              = 0.40
+    // Panel C: small bright blue spot (0.1 × 0.1).
+    //   power = 0.01 · 40              = 0.40
+    // Total = 1.76. Picks ≈ (0.545, 0.227, 0.227) — uniform would
+    // give (1/3) to each, so power-pick noticeably reweights.
+    quads_out.push(make_quad(
+        [-0.2, 1.99, -0.2],
+        [0.4, 0.0, 0.0],
+        [0.0, 0.0, 0.4],
+    ));
+    materials_out.push(dim_panel_mat);
+    quads_out.push(make_quad(
+        [-0.65, 1.99, -0.05],
+        [0.1, 0.0, 0.0],
+        [0.0, 0.0, 0.1],
+    ));
+    materials_out.push(bright_red_mat);
+    quads_out.push(make_quad(
+        [0.55, 1.99, -0.05],
+        [0.1, 0.0, 0.0],
+        [0.0, 0.0, 0.1],
+    ));
+    materials_out.push(bright_blue_mat);
+
+    let (palette, quad_material) = unique_materials(&materials_out);
+    let batches = triangulate(&quads_out, &quad_material, palette.len(), 1);
     let no_textures = vec![None; palette.len()];
     emit_gltf(
         &palette,

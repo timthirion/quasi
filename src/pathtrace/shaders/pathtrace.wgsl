@@ -136,7 +136,16 @@ struct BvhNode {
 @group(0) @binding(2) var<storage, read> tri_indices: array<u32>;
 @group(0) @binding(3) var<storage, read> materials: array<Material>;
 @group(0) @binding(4) var<storage, read> tri_materials: array<u32>;
-@group(0) @binding(5) var<storage, read> emissive_triangles: array<u32>;
+// PT-many-lights: each entry is `{ tri, _pad, cdf, _pad2 }`.
+// `cdf` is the cumulative-power fraction; the WGSL inverse-CDF
+// pick binary-searches this array.
+struct EmissiveLight {
+    tri: u32,
+    _pad: u32,
+    cdf: f32,
+    _pad2: f32,
+};
+@group(0) @binding(5) var<storage, read> emissive_lights: array<EmissiveLight>;
 @group(0) @binding(6) var<storage, read> bvh_nodes: array<BvhNode>;
 @group(0) @binding(7) var<storage, read> bvh_tri_indices: array<u32>;
 // PT-textures: scene base-color textures + a single shared linear-repeat
@@ -880,6 +889,40 @@ struct LightSample {
     valid: bool,
 };
 
+// PT-many-lights: inverse-CDF emitter pick. Returns the index into
+// `emissive_lights` whose CDF bin contains `xi`. Binary-search;
+// O(log N). Caller is responsible for the early-out when
+// `emissive_count == 0`.
+fn pick_emissive(xi: f32) -> u32 {
+    if (U.emissive_count <= 1u) {
+        return 0u;
+    }
+    var lo: u32 = 0u;
+    var hi: u32 = U.emissive_count - 1u;
+    loop {
+        if (hi <= lo + 1u) { break; }
+        let mid = (lo + hi) >> 1u;
+        if (emissive_lights[mid].cdf <= xi) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    if (emissive_lights[lo].cdf <= xi) {
+        return lo + 1u;
+    }
+    return lo;
+}
+
+// PT-many-lights: power-fraction for the picked bin. Equivalent to
+// `cdf[i] - cdf[i-1]` (or `cdf[0]` when `i == 0`).
+fn emissive_pick_prob(i: u32) -> f32 {
+    if (i == 0u) {
+        return emissive_lights[0].cdf;
+    }
+    return emissive_lights[i].cdf - emissive_lights[i - 1u].cdf;
+}
+
 fn sample_light(p: vec3<f32>, s: ptr<function, SamplerState>) -> LightSample {
     var ls: LightSample;
     ls.valid = false;
@@ -887,12 +930,13 @@ fn sample_light(p: vec3<f32>, s: ptr<function, SamplerState>) -> LightSample {
         return ls;
     }
 
-    let pick = next_1d(s);
-    var picked = u32(pick * f32(U.emissive_count));
-    if (picked >= U.emissive_count) {
-        picked = U.emissive_count - 1u;
+    let xi = next_1d(s);
+    let picked = pick_emissive(xi);
+    let tri = emissive_lights[picked].tri;
+    let pick_prob = emissive_pick_prob(picked);
+    if (pick_prob <= 0.0) {
+        return ls;
     }
-    let tri = emissive_triangles[picked];
 
     let verts = triangle_vertices(tri);
     let bary = next_2d(s);
@@ -930,13 +974,31 @@ fn sample_light(p: vec3<f32>, s: ptr<function, SamplerState>) -> LightSample {
 
     ls.wi = wi;
     ls.dist = dist;
-    // Solid-angle pdf for sampling THIS triangle THIS barycentric point:
-    //   pdf_w = dist^2 / (cos_l * area * N_emitters)
-    // where 1/N_emitters comes from uniformly picking among emitters.
-    ls.pdf_w = (dist * dist) / (cos_l * area * f32(U.emissive_count));
+    // PT-many-lights solid-angle pdf:
+    //   pdf_w = dist^2 / (cos_l * area * pick_prob)
+    // `pick_prob` is the power-weighted probability of picking
+    // this triangle. Reduces to `1 / N_emitters` when all
+    // triangles share equal power (the uniform-pick limit).
+    ls.pdf_w = (dist * dist) / (cos_l * area * pick_prob);
     ls.le = materials[tri_materials[tri]].emission;
     ls.valid = true;
     return ls;
+}
+
+// PT-many-lights: linear search for the emissive_lights entry
+// whose `tri` matches `tri`. O(N) but N is small (single-digit
+// emitters in our scenes) and this only fires on the MIS path
+// when a BSDF ray hits an emissive triangle.
+fn find_emissive_index(tri: u32) -> u32 {
+    for (var i = 0u; i < U.emissive_count; i = i + 1u) {
+        if (emissive_lights[i].tri == tri) {
+            return i;
+        }
+    }
+    // Not found — sentinel. Caller treats this as pick_prob = 0
+    // (i.e. the triangle isn't in the emissive list, so the MIS
+    // weight collapses to the BSDF branch).
+    return 0xFFFFFFFFu;
 }
 
 fn light_pdf_solid_angle(p0: vec3<f32>, hit_point: vec3<f32>, hit_normal: vec3<f32>, tri: u32) -> f32 {
@@ -956,7 +1018,15 @@ fn light_pdf_solid_angle(p0: vec3<f32>, hit_point: vec3<f32>, hit_normal: vec3<f
     if (cos_l < 1e-6) {
         return 0.0;
     }
-    return dist2 / (cos_l * area * f32(U.emissive_count));
+    let idx = find_emissive_index(tri);
+    if (idx == 0xFFFFFFFFu) {
+        return 0.0;
+    }
+    let pick_prob = emissive_pick_prob(idx);
+    if (pick_prob <= 0.0) {
+        return 0.0;
+    }
+    return dist2 / (cos_l * area * pick_prob);
 }
 
 fn cosine_sample_hemisphere(normal: vec3<f32>, s: ptr<function, SamplerState>) -> vec3<f32> {

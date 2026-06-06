@@ -245,9 +245,13 @@ pub struct TriangleScene {
     /// Per-triangle index into `materials`. `triangle_materials.len()
     /// == indices.len() / 3`.
     pub triangle_materials: Vec<u32>,
-    /// Triangle indices (not vertex indices) whose material has
-    /// non-zero emission. Populated by [`Self::recompute_emissive`].
-    pub emissive_triangles: Vec<u32>,
+    /// PT-many-lights: emissive triangles **with** their power-CDF
+    /// thresholds for the WGSL inverse-CDF pick. Each entry carries
+    /// the triangle index + a cumulative-power fraction in `[0, 1]`,
+    /// monotone non-decreasing, terminating at 1.0. Replaces the
+    /// uniform-pick `Vec<u32>` field. Populated by
+    /// [`Self::recompute_emissive`].
+    pub emissive_lights: Vec<EmissiveLight>,
     /// SAH BVH over the triangles in `indices`. Built at glTF load
     /// time. The WGSL fragment shader walks this via stack-based
     /// traversal; the linear-scan path also remains, gated behind
@@ -265,17 +269,84 @@ impl TriangleScene {
         self.indices.len() / 3
     }
 
-    /// Rebuilds [`Self::emissive_triangles`] from the current materials.
-    /// Callers don't normally invoke this — the loader does it before
-    /// returning.
+    /// PT-many-lights: rebuilds [`Self::emissive_lights`] with
+    /// per-triangle power-CDF thresholds. Power = `area · max
+    /// emission channel` (Rec. 709 luminance is within ~5% for
+    /// our scenes — see plan 0016 for the rationale).
+    ///
+    /// When the total power is zero (no emitters or all-zero
+    /// emission), the list is left empty and NEE skips the light
+    /// pick entirely. When a single emitter is present, the CDF
+    /// collapses to a single bin terminating at 1.0 — the
+    /// previous uniform-pick behaviour for `N == 1`.
     pub fn recompute_emissive(&mut self) {
-        self.emissive_triangles.clear();
+        self.emissive_lights.clear();
+        // First pass: collect (tri, power) pairs.
+        let mut entries: Vec<(u32, f32)> = Vec::new();
         for (tri_idx, &mat_idx) in self.triangle_materials.iter().enumerate() {
-            if self.materials[mat_idx as usize].is_emissive() {
-                self.emissive_triangles.push(tri_idx as u32);
+            let mat = &self.materials[mat_idx as usize];
+            if !mat.is_emissive() {
+                continue;
             }
+            let area = self.triangle_area(tri_idx as u32);
+            let lum_max = mat.emission.iter().fold(0.0_f32, |acc, &c| acc.max(c));
+            let power = area * lum_max;
+            entries.push((tri_idx as u32, power));
+        }
+        let total_power: f32 = entries.iter().map(|(_, p)| *p).sum();
+        if total_power <= 0.0 {
+            return;
+        }
+        let mut acc = 0.0_f32;
+        for (tri, power) in entries {
+            acc += power;
+            self.emissive_lights.push(EmissiveLight {
+                tri,
+                _pad: 0,
+                cdf: (acc / total_power).min(1.0),
+                _pad2: 0.0,
+            });
+        }
+        // Numerical safety: explicitly clamp the last entry to 1.0
+        // — accumulator + division may land at 1 - ε.
+        if let Some(last) = self.emissive_lights.last_mut() {
+            last.cdf = 1.0;
         }
     }
+
+    /// PT-many-lights: world-space area of triangle `tri`. Mirrors
+    /// the WGSL `triangle_area` so the CPU-side CDF builder lines
+    /// up with what the integrator sees.
+    pub fn triangle_area(&self, tri: u32) -> f32 {
+        let i = tri as usize * 3;
+        let i0 = self.indices[i] as usize;
+        let i1 = self.indices[i + 1] as usize;
+        let i2 = self.indices[i + 2] as usize;
+        let p0 = self.vertices[i0].position;
+        let p1 = self.vertices[i1].position;
+        let p2 = self.vertices[i2].position;
+        let e1 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+        let e2 = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
+        let cx = e1[1] * e2[2] - e1[2] * e2[1];
+        let cy = e1[2] * e2[0] - e1[0] * e2[2];
+        let cz = e1[0] * e2[1] - e1[1] * e2[0];
+        0.5 * (cx * cx + cy * cy + cz * cz).sqrt()
+    }
+}
+
+/// PT-many-lights: one entry of the per-triangle power CDF. Lives
+/// 16 bytes std430-aligned so WGSL's `array<EmissiveLight>` can
+/// stride-of-16 over it without device-capability checks.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable, PartialEq)]
+pub struct EmissiveLight {
+    pub tri: u32,
+    pub _pad: u32,
+    /// Cumulative-power threshold in `[0, 1]`. The inverse-CDF
+    /// pick returns this index when the random `ξ ∈ [0, 1)`
+    /// satisfies `cdf[i-1] ≤ ξ < cdf[i]`.
+    pub cdf: f32,
+    pub _pad2: f32,
 }
 
 #[derive(Debug)]
@@ -1110,8 +1181,96 @@ mod tests {
             ..Material::default()
         }); // 1 — emissive
         s.triangle_materials = vec![0, 1, 0, 1, 1];
+        // Five trivial triangles — three of them share a (0, 0, 0)
+        // vertex with two others to make every triangle have area 0.5.
+        // The actual area isn't critical; we just need
+        // `triangle_area` to not panic on missing data.
+        for _ in 0..6 {
+            s.vertices.push(Vertex {
+                position: [0.0, 0.0, 0.0],
+                _pad0: 0.0,
+                normal: [0.0, 1.0, 0.0],
+                _pad1: 0.0,
+                uv: [0.0, 0.0],
+                _pad2: [0.0, 0.0],
+            });
+        }
+        s.vertices[1].position = [1.0, 0.0, 0.0];
+        s.vertices[2].position = [0.0, 0.0, 1.0];
+        s.indices = (0..15).map(|i| (i % 3) as u32).collect();
+        // Override to give all 5 triangles the same valid geometry.
+        for tri in 0..5 {
+            s.indices[tri * 3] = 0;
+            s.indices[tri * 3 + 1] = 1;
+            s.indices[tri * 3 + 2] = 2;
+        }
         s.recompute_emissive();
-        assert_eq!(s.emissive_triangles, vec![1, 3, 4]);
+        // Emissive triangle indices, in order: 1, 3, 4.
+        let tris: Vec<u32> = s.emissive_lights.iter().map(|e| e.tri).collect();
+        assert_eq!(tris, vec![1, 3, 4]);
+        // Equal area + equal emission → uniform power split. CDF
+        // ends at 1.0 exactly.
+        let n = s.emissive_lights.len() as f32;
+        for (i, e) in s.emissive_lights.iter().enumerate() {
+            let expected = (i as f32 + 1.0) / n;
+            assert!(
+                (e.cdf - expected).abs() < 1e-5,
+                "cdf[{i}] = {} (expected {expected})",
+                e.cdf,
+            );
+        }
+    }
+
+    #[test]
+    fn recompute_emissive_power_weights_match_size_and_emission() {
+        // Two emitters at 2:1 area ratio AND 3:1 emission ratio →
+        // power ratio is 6:1. CDF should put the first bin at 6/7.
+        let mut s = TriangleScene::default();
+        s.materials.push(Material::default());
+        s.materials.push(Material {
+            emission: [3.0, 3.0, 3.0],
+            ..Material::default()
+        });
+        s.materials.push(Material {
+            emission: [1.0, 1.0, 1.0],
+            ..Material::default()
+        });
+        s.triangle_materials = vec![1, 2];
+        // Triangle 0: vertices (0,0,0), (2,0,0), (0,0,1) → area 1.0.
+        // Triangle 1: vertices (0,0,0), (1,0,0), (0,0,1) → area 0.5.
+        s.vertices = (0..6)
+            .map(|_| Vertex {
+                position: [0.0, 0.0, 0.0],
+                _pad0: 0.0,
+                normal: [0.0, 1.0, 0.0],
+                _pad1: 0.0,
+                uv: [0.0, 0.0],
+                _pad2: [0.0, 0.0],
+            })
+            .collect();
+        s.vertices[1].position = [2.0, 0.0, 0.0];
+        s.vertices[2].position = [0.0, 0.0, 1.0];
+        s.vertices[4].position = [1.0, 0.0, 0.0];
+        s.vertices[5].position = [0.0, 0.0, 1.0];
+        s.indices = vec![0, 1, 2, 3, 4, 5];
+        s.recompute_emissive();
+        assert_eq!(s.emissive_lights.len(), 2);
+        // First bin = 6/7 ≈ 0.857.
+        assert!(
+            (s.emissive_lights[0].cdf - 6.0 / 7.0).abs() < 1e-5,
+            "bin 0 cdf = {}",
+            s.emissive_lights[0].cdf,
+        );
+        assert!((s.emissive_lights[1].cdf - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn recompute_emissive_empty_when_no_emitters() {
+        let mut s = TriangleScene::default();
+        s.materials.push(Material::default());
+        s.triangle_materials = vec![0, 0, 0];
+        s.recompute_emissive();
+        assert!(s.emissive_lights.is_empty());
     }
 
     // ---- glTF round-trip ----
@@ -1260,7 +1419,9 @@ mod tests {
         assert_eq!(scene.triangle_materials, vec![1, 2]);
 
         // Triangle 1 is the emissive one.
-        assert_eq!(scene.emissive_triangles, vec![1]);
+        assert_eq!(scene.emissive_lights.len(), 1);
+        assert_eq!(scene.emissive_lights[0].tri, 1);
+        assert!((scene.emissive_lights[0].cdf - 1.0).abs() < 1e-6);
 
         // Both primitives reference the *same* POSITION/NORMAL accessors,
         // so both copies of the vertex buffer contain the same 6 normals:
