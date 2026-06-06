@@ -78,6 +78,11 @@ struct RenderArgs {
     /// scene return the sky radiance, and NEE samples the dome via
     /// the luminance × sin θ importance tables.
     env_map: Option<PathBuf>,
+    /// `--denoise` (PT-denoise) runs the analytic edge-aware
+    /// à-trous wavelet denoiser as a post-process and writes
+    /// `<basename>_denoised.png` alongside the raw output. The
+    /// EXR write always carries the raw radiance.
+    denoise: bool,
     /// `--brute-force` switches the WGSL fragment shader to a linear
     /// triangle scan; the default walks the BVH.
     brute_force: bool,
@@ -96,6 +101,7 @@ impl Default for RenderArgs {
             scene: None,
             cloud_grid: None,
             env_map: None,
+            denoise: false,
             brute_force: false,
         }
     }
@@ -161,6 +167,9 @@ fn parse_render_args(args: &[String]) -> Result<RenderArgs, String> {
                     .ok_or_else(|| "--env-map needs a path".to_string())?;
                 r.env_map = Some(PathBuf::from(v));
             }
+            "--denoise" => {
+                r.denoise = true;
+            }
             "--brute-force" => {
                 r.brute_force = true;
             }
@@ -177,6 +186,8 @@ fn parse_render_args(args: &[String]) -> Result<RenderArgs, String> {
                      \t--cloud-grid PATH   load a runtime .qvg cloud density grid\n\
                      \t                    (default: embedded procedural cumulus)\n\
                      \t--env-map PATH      attach a Radiance .hdr environment map\n\
+                     \t--denoise           run the PT-denoise à-trous post-process; writes\n\
+                     \t                    <out>_denoised.png alongside the raw PNG\n\
                      \t--brute-force       skip the BVH and linear-scan triangles (verification)"
                 );
                 std::process::exit(0);
@@ -263,6 +274,44 @@ fn run_render(args: &[String]) {
     );
     println!("wrote {}", paths.png.display());
     println!("wrote {}", paths.exr.display());
+
+    if cli.denoise {
+        let denoise_start = std::time::Instant::now();
+        let denoised = quasi::pathtrace::denoise::denoise(
+            &aovs.radiance,
+            &aovs.albedo,
+            &aovs.normal,
+            &aovs.depth,
+            aovs.width,
+            aovs.height,
+            quasi::pathtrace::denoise::DenoiseParams::default(),
+        );
+        let denoised_aovs = quasi::pathtrace::offscreen::Aovs {
+            width: aovs.width,
+            height: aovs.height,
+            radiance: denoised,
+            albedo: aovs.albedo.clone(),
+            normal: aovs.normal.clone(),
+            depth: aovs.depth.clone(),
+        };
+        let mut denoise_out = cli.out.clone();
+        let basename = denoise_out
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "frame".to_string());
+        denoise_out.set_file_name(format!("{basename}_denoised"));
+        let denoise_path = denoise_out.with_extension("png");
+        quasi::pathtrace::output::write_tonemapped_png(&denoised_aovs, &denoise_path)
+            .unwrap_or_else(|e| {
+                eprintln!("denoise output error: {e}");
+                std::process::exit(1);
+            });
+        log::info!(
+            "denoise + encode in {:.2}s",
+            denoise_start.elapsed().as_secs_f64()
+        );
+        println!("wrote {}", denoise_path.display());
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -37,6 +37,9 @@ pub mod scene;
 pub mod env;
 
 #[cfg(not(target_arch = "wasm32"))]
+pub mod denoise;
+
+#[cfg(not(target_arch = "wasm32"))]
 pub mod converge;
 
 #[cfg(not(target_arch = "wasm32"))]

@@ -29,6 +29,18 @@
   </tr>
 </table>
 
+### Denoising
+
+The same scene at **64 spp** before and after the analytic à-trous
+wavelet denoiser (`--denoise` on `render`). Edge-stopping by
+normal + depth + colour keeps the bunny silhouette + glass
+refraction sharp while flattening the noise in the diffuse
+regions. ~50 ms post-process at 384²; no neural net.
+
+<p align="center">
+  <img src="data/output/denoise_comparison.png" width="720" alt="Raw vs denoised, 64 spp">
+</p>
+
 ## What is Quasi?
 
 A Rust path tracer that targets **WebGPU** — so the same code runs

@@ -1,8 +1,8 @@
 # Edge-aware denoiser (PT-denoise)
 
-- **Status:** draft
+- **Status:** completed
 - **Last updated:** 2026-06-06
-- **Last touched on:** planning
+- **Last touched on:** module + CLI flag + comparison showcase
 
 ## Goal
 
@@ -127,23 +127,26 @@ behaviour.
 ## Milestones
 
 ### PT-denoise
-- [ ] `pathtrace::denoise` module with `atrous_pass(...)` (one
+- [x] `pathtrace::denoise` module with `atrous_pass(...)` (one
       iteration at step `k`) and `denoise(...)` (5-pass
       demodulate-denoise-remodulate). Pure CPU; pure
-      `Vec<f32>`.
-- [ ] `--denoise` flag on `render`. Writes
+      `Vec<[f32; 4]>` over the existing AOV pixel layout.
+- [x] `--denoise` flag on `render`. Writes
       `<basename>_denoised.png` alongside `<basename>.png` +
       `<basename>.exr`. Without the flag, no behaviour change.
-- [ ] CPU mirror tests:
-  - uniform input returns uniform (degenerate case);
-  - edge with normal discontinuity preserves the edge (no
-    blur across the seam);
-  - flat patch with synthetic radiance noise has lower RMSE
-    after the denoiser than before.
-- [ ] Showcase: re-render `outdoor_normal_bunny.gltf` at 256
-      spp **with** and **without** denoise. Output the side-
-      by-side as `data/output/denoise_comparison_outdoor.png`
-      (a 2×1 strip composed by the example).
+- [x] 4 CPU mirror tests:
+  - B3-spline kernel sums to 1 (normalisation check).
+  - Uniform input → uniform output (degenerate case).
+  - Normal discontinuity preserved across pixels well into
+    each half (no bleed at the seam).
+  - White-Gaussian noise on a flat patch → RMSE drops by >2×
+    after the filter.
+- [x] Showcase: `examples/gen_denoise_comparison` renders
+      `cornell_glass_bunny.gltf` at 384²/64 spp twice (raw +
+      denoised) and stitches them into
+      `data/output/denoise_comparison.png` (2×1 strip with
+      4-px divider). README gets a "Denoising" section
+      embedding the strip beneath the hero gallery.
 
 ## Open questions
 
