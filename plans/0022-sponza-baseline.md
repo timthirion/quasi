@@ -422,3 +422,38 @@ target (Bistro-class).
 * **PT-profile-instrumentation** — when a perf optimisation
   needs structured per-stage timings. The eyeballed
   `RUST_LOG=info` approach sufficed here.
+
+### Deferred structural plays (the megakernel ceiling)
+
+This plan's biggest empirical observation — that 1024²/2048 spp
+on M4 IGPU completes in ~6-10 s — is *relative to the megakernel
+fragment-shader architecture and the integrated GPU we have*.
+That throughput is in the right ballpark for software ray
+tracing on an IGPU (~100-150 MPaths/s), and Sponza-scale
+geometry doesn't pinch it. But two structural plans wait
+above the entire optimisation list, because all the listed
+incremental plays (instancing, vertex compression, BVH-scale,
+TLAS/BLAS, texture LOD) have a ceiling that the structural
+plays move:
+
+* **PT-wavefront** — restructure the megakernel into separate
+  **generate / intersect / shade** compute kernels (Aila/Laine
+  wavefront design). Cuts shader divergence and register
+  pressure — both currently load-bearing on M4. Single
+  highest-leverage performance plan available. Scope:
+  substantial. **Trigger condition:** when Sponza-scale stops
+  being interactive *or* when we target Bistro / San Miguel /
+  the live embed widget on a phone, where current MPaths/s
+  isn't enough. The trap to avoid: incrementally landing the
+  five plans above without ever taking the wavefront step —
+  megakernel optimisations have a ceiling; wavefront moves
+  the ceiling.
+* **PT-hardware-rt** — `wgpu::Features::EXPERIMENTAL_RAY_TRACING_*`
+  for backends that have it. Order-of-magnitude speedup on
+  equipped hardware. Sequencing note: do PT-wavefront first,
+  then PT-hardware-rt substitutes for the intersect kernel.
+  The reverse order tangles the cross-backend story.
+
+Both are explicitly tracked in
+`~/.claude/projects/-Users-tt-src-quasi/memory/project_active_plans.md`
+under "Likely next plans → deferred large structural plays."
