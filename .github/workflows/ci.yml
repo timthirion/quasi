@@ -49,6 +49,22 @@ jobs:
         # artifact from CI — we just need to know it still compiles.
         run: cargo check --target wasm32-unknown-unknown --lib
 
+      - name: No oversized files in HEAD
+        # Catches a regression where someone re-commits a chunky
+        # binary (the most common offender is reference-render
+        # EXRs). 5 MB ceiling — anything legitimately above that
+        # should be either gitignored or have a written
+        # justification (see `data/output/README.md`).
+        run: |
+          set -e
+          ceiling=$((5 * 1024 * 1024))
+          oversized=$(git ls-tree -r -l HEAD | awk -v c=$ceiling '$4 > c {print $4, $5}')
+          if [ -n "$oversized" ]; then
+            echo "::error::Files above 5 MB checked in:"
+            echo "$oversized"
+            exit 1
+          fi
+
   python:
     name: Python (.qvg writer tests)
     runs-on: ubuntu-latest

@@ -37,9 +37,15 @@ scripts/vdb_to_qvg
 # but the Disney Cloud Data Set is CC BY-SA 3.0, so anything derived from
 # it has to live outside the repo or be explicitly relicensed (we don't).
 # Render it locally per the scripts/README.md workflow; the procedurally-
-# baked `cumulus_64.qvg` + `cornell_cloud_reference.*` ARE committed
-# since they're ours.
+# baked `cumulus_64.qvg` IS committed since it's ours.
 data/grids/disney_*.qvg
 data/grids/wdas_*.qvg
 data/output/cornell_disney_*.png
-data/output/cornell_disney_*.exr
+
+# Reference render EXRs. Generated from `.gltf` + the renderer at HEAD
+# (see `data/output/README.md`). Keeping them in git was costing ~190 MB
+# of clone weight that almost no consumer reads — the PNGs carry the
+# visual gallery story, and RMSE-against-EXR analyses prefer freshly
+# rendered ground truth over committed bytes. Re-render locally with
+# `cargo run -- render --scene <gltf> ...` when needed.
+data/output/*.exr
