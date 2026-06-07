@@ -1152,9 +1152,16 @@ fn cloud_hash3(p: vec3<i32>) -> u32 {
     let ux = u32(p.x + 73856093);
     let uy = u32(p.y + 19349663);
     let uz = u32(p.z + 83492791);
-    var h: u32 = ux * 0x9e3779b1u
-              ^ uy * 0x85ebca6bu
-              ^ uz * 0xc2b2ae35u;
+    // Dawn's WGSL parser (Chrome) rejects unparenthesised `a * b ^ c
+    // * d` per the latest spec: mixing `*` (multiplicative) and `^`
+    // (bitwise XOR) requires explicit grouping. naga (wgpu's
+    // CPU-side parser) accepts the unparenthesised form, so the
+    // native + wasm32 builds were green while the browser silently
+    // failed shader compile — landed the three PT panels at
+    // `timthirion.github.io/quasi` as solid black canvases.
+    var h: u32 = (ux * 0x9e3779b1u)
+               ^ (uy * 0x85ebca6bu)
+               ^ (uz * 0xc2b2ae35u);
     h ^= h >> 16u;
     h *= 0x85ebca6bu;
     h ^= h >> 13u;
