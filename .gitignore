@@ -62,3 +62,4 @@ data/gltf/sponza/
 # `python3 scripts/fetch_khronos_scene.py <ModelName>`. Source +
 # licence: https://github.com/KhronosGroup/glTF-Sample-Assets.
 data/gltf/abeautifulgame/
+.claude/scheduled_tasks.lock
