@@ -2091,6 +2091,26 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
         let geom_normal = hit.normal;
         if (m.normal_texture_idx != NO_TEXTURE) {
             hit.normal = apply_normal_map(m, hit.tri, hit.bary, hit.normal, hit.uv);
+            // Plan 0024: clamp the perturbed shading normal to the
+            // hemisphere of the geometric normal. At UV seams in
+            // cylindrical-mapped assets (chess-piece bodies), the
+            // per-vertex tangent direction flips across the seam.
+            // The normal-map perturbation then rotates the shading
+            // normal past `geom_normal`, the shading cos goes
+            // negative, and NEE drops the contribution to zero —
+            // visible as a vertical dark band down each piece. The
+            // proper fix is mikktspace per-face tangents
+            // (PT-mikktspace, deferred); until then, lift the
+            // shading normal back into the surface hemisphere so
+            // cos(shading, geom) is at least `min_cos`. Linear lift
+            // toward geom_normal then re-normalise — preserves the
+            // direction of perturbation as much as possible while
+            // killing the hemisphere-flip artifact.
+            let min_cos: f32 = 0.1;
+            let cos_g = dot(hit.normal, geom_normal);
+            if (cos_g < min_cos) {
+                hit.normal = normalize(hit.normal + geom_normal * (min_cos - cos_g));
+            }
         }
 
         if (bounce == 0) {
