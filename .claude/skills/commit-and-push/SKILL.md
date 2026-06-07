@@ -1,6 +1,7 @@
 ---
 name: commit-and-push
 description: Run pre-flight, construct a project-convention commit message, commit, push to origin, watch CI on the just-pushed run, refuse to consider the push "done" until CI is green. Codifies [[feedback_verify_ci_after_push]] and the autonomy bargain from [[feedback_autonomy]].
+version: 0.1.0
 ---
 
 # Commit + push

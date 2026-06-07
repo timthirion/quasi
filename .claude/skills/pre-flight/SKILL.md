@@ -1,6 +1,7 @@
 ---
 name: pre-flight
 description: Run the full quality-gate sequence (fmt-check, clippy -D warnings, wasm32 check, all-targets tests, Python tests if scripts/ touched). Auto-fix fmt drift once; surface other failures verbatim.
+version: 0.1.0
 ---
 
 # Pre-flight quality gates

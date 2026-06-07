@@ -1,6 +1,7 @@
 ---
 name: close-plan
 description: Close an implementation plan (plans/NNNN-*.md) by orchestrating the review agents, refusing to close on unaddressed P0 attacks, ticking all milestones, and committing+pushing the closure. Composes pre-flight + commit-and-push + plan-skeptic + code-attacker/defender + render-attacker/defender. Research plans (RNNNN-*.md) have a separate closure path.
+version: 0.1.0
 ---
 
 # Close plan

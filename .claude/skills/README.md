@@ -12,40 +12,54 @@ X," it doesn't earn its place here. The bar is: skills bundle
 
 ## Layout
 
+Skills are **always** directory-based, even when they have
+no supporting assets:
+
 ```
 .claude/skills/
 ├── README.md              ← this file (convention)
-└── <skill-name>.md        ← one file per skill, kebab-case name
+└── <skill-name>/
+    └── SKILL.md           ← the procedural recipe (required)
 ```
 
+The flat-file form (`.claude/skills/<name>.md`) does **not
+register** with the Claude Code harness — we tried it and the
+skills were invisible to the `Skill` tool until restructured
+into `<name>/SKILL.md`. Agents (under `.claude/agents/`) use
+flat files; skills don't. Asymmetric convention; both are real.
+
 A skill that grows supporting assets (templates, scripts,
-prompt fragments) graduates to a subdirectory:
+prompt fragments) co-locates them in the same directory:
 
 ```
 .claude/skills/<skill-name>/
 ├── SKILL.md               ← the procedural recipe
-└── ...                    ← templates, fixtures, etc.
+├── references/            ← supplementary docs the skill cites
+└── templates/             ← reusable fragments the recipe references
 ```
 
-Don't pre-create subdirectories. Flat-file skills are fine
-until they aren't.
+Start with just `SKILL.md`. Add the auxiliary directories only
+when the recipe genuinely needs to reach for one.
 
 ## Frontmatter
 
-Every skill file starts with YAML frontmatter:
+Every `SKILL.md` starts with YAML frontmatter:
 
 ```yaml
 ---
 name: skill-name
-description: one-line summary, used at selection time
+description: one-line summary used at selection time
+version: 0.1.0
 ---
 ```
 
-`name` is the identifier the agent invokes (`Skill(name:
+`name` is the identifier the agent invokes (`Skill(skill:
 "skill-name")`). `description` is what the agent reads to
 decide whether the skill applies — make it concrete enough
 that the matching call is unambiguous. ("Run pre-flight quality
-gates" beats "Check the project.")
+gates" beats "Check the project.") `version` follows semver;
+bump when the procedural recipe changes shape (not on every
+typo fix).
 
 ## When a skill earns its file
 
@@ -79,15 +93,15 @@ recipe.
 
 ## Currently scaffolded
 
-- [`pre-flight.md`](pre-flight.md) — full quality-gate
+- [`pre-flight/`](pre-flight/SKILL.md) — full quality-gate
   sequence required before any commit + push. Codifies
   [[feedback_verify_ci_after_push]].
-- [`commit-and-push.md`](commit-and-push.md) — pre-flight,
+- [`commit-and-push/`](commit-and-push/SKILL.md) — pre-flight,
   then commit with project-convention message, push, watch
   CI on the just-pushed run, refuse to consider the push
   "done" until CI is green. Codifies the green-CI half of
   [[feedback_autonomy]].
-- [`close-plan.md`](close-plan.md) — orchestrator for
+- [`close-plan/`](close-plan/SKILL.md) — orchestrator for
   closing an implementation plan. Invokes `plan-skeptic`,
   conditionally invokes `code-attacker/defender` (on code
   diffs) and `render-attacker/defender` (on hero-gallery
