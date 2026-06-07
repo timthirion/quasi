@@ -2080,13 +2080,15 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
         m.metallic = mr.y;
 
         // PT-normal-map: perturb the geometric normal in tangent
-        // space. `hit.normal` is overwritten so every downstream
-        // shading dot product (NEE cos, BSDF eval, BSDF sample,
-        // env NEE cos) uses the perturbed shading normal. Self-
-        // intersection offsets later on still compute relative to
-        // the perturbed normal — fine for the showcase scenes
-        // (stone-tile floor, smooth meshes); per-vertex tangents
-        // + a stored geometric normal would tighten this further.
+        // space. Keep BOTH normals: `geom_normal` for ray offsets
+        // (self-intersection prevention needs a direction
+        // guaranteed-perpendicular to the actual surface, not a
+        // perturbation that can rotate up to ~90° away and land
+        // the offset inside the geometry — diagnosed as the
+        // plan 0024 chess-pawn dark patch). `hit.normal` becomes
+        // the shading normal: NEE cos, BSDF eval / sample,
+        // env-NEE cos all use the perturbed value.
+        let geom_normal = hit.normal;
         if (m.normal_texture_idx != NO_TEXTURE) {
             hit.normal = apply_normal_map(m, hit.tri, hit.bary, hit.normal, hit.uv);
         }
@@ -2147,7 +2149,7 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
                     if (es.valid) {
                         let cos_env = dot(hit.normal, es.dir);
                         if (cos_env > 0.0) {
-                            let shadow_o = hit.point + hit.normal * 0.001;
+                            let shadow_o = hit.point + geom_normal * 0.001;
                             let trans = shadow_transmittance(
                                 shadow_o, es.dir, 1e10, current_medium, s);
                             let trans_sum = trans.x + trans.y + trans.z;
@@ -2171,7 +2173,7 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
                     if (ls.valid) {
                         let cos_surf = dot(hit.normal, ls.wi);
                         if (cos_surf > 0.0) {
-                            let shadow_o = hit.point + hit.normal * 0.001;
+                            let shadow_o = hit.point + geom_normal * 0.001;
                             let trans = shadow_transmittance(
                                 shadow_o, ls.wi, ls.dist, current_medium, s);
                             let trans_sum = trans.x + trans.y + trans.z;
@@ -2201,7 +2203,7 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
             let sun_wi = U.sun_dir.xyz;
             let cos_sun = dot(hit.normal, sun_wi);
             if (cos_sun > 0.0) {
-                let shadow_o = hit.point + hit.normal * 0.001;
+                let shadow_o = hit.point + geom_normal * 0.001;
                 let trans = shadow_transmittance(
                     shadow_o, sun_wi, 1e10, current_medium, s);
                 let trans_sum = trans.x + trans.y + trans.z;
@@ -2239,14 +2241,16 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
             throughput = throughput / pr;
         }
 
-        // Offset along the *outgoing* hemisphere — `hit.normal`
-        // faces wo, so a reflected wi sits on the same side and the
-        // offset prevents self-intersection. For dielectric
-        // transmission, wi is on the *opposite* side, so flip the
-        // offset to land inside the medium instead of grazing the
-        // surface from outside.
-        let transmitted = dot(hit.normal, bs.wi) < 0.0;
-        let offset_n = select(hit.normal, -hit.normal, transmitted);
+        // Offset along the *outgoing* hemisphere — `geom_normal`
+        // is the true triangle normal so the offset is guaranteed
+        // perpendicular to the actual surface. Using the perturbed
+        // shading normal here would let strong normal-map tilts
+        // shift the ray origin into the surface and cause a
+        // self-intersection (the plan-0024 chess-pawn artifact
+        // origin). The transmitted/reflected logic still uses the
+        // BSDF-sampled `wi`'s dot against the geometric normal.
+        let transmitted = dot(geom_normal, bs.wi) < 0.0;
+        let offset_n = select(geom_normal, -geom_normal, transmitted);
         ray.origin = hit.point + offset_n * 0.001;
         ray.dir = bs.wi;
 

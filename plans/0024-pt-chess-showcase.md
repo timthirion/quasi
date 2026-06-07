@@ -100,7 +100,73 @@ Framing chosen from a 4-variation smoke pass at 384²/128 spp:
 
 ## Findings
 
-### UV-pole tangent-space collapse (post-ship bug)
+### Shading-vs-geometric normal split (the real post-ship bug)
+
+After a wrong-target first-pass fix (the UV-pole tangent
+sentinel + smoothstep below), the user reported the same
+dark patches were still visible. A wider diagnostic sweep
+isolated the **actual** root cause: shadow-ray and bounce-
+ray origin offsets were computed along `hit.normal`, which
+had been overwritten in-place by `apply_normal_map`. At
+regions where JPEG-compressed normal-map textures encode
+strong perturbation (UV-island borders, bake artefacts),
+the perturbed shading normal could tilt > 90° from the true
+triangle normal. The `0.001 * hit.normal` offset then
+landed the ray origin **inside** the geometry, causing the
+shadow ray's very first triangle intersection to be the
+back-face of the same triangle: reported as occluded,
+contribution zero, dark patch at the same UV pixel on every
+instance of a shared mesh.
+
+The fix is the textbook geometric-vs-shading normal split:
+
+* In the integrator (`pathtrace.wgsl`'s main loop), capture
+  `let geom_normal = hit.normal;` before calling
+  `apply_normal_map`. `hit.normal` is then overwritten with
+  the perturbed *shading* normal for cos calculations, BSDF
+  eval / sample, NEE, env-NEE, sun-NEE — all the
+  light-transport math.
+* **All ray-origin offsets** (env-NEE shadow ray, triangle-
+  NEE shadow ray, sun-NEE shadow ray, BSDF bounce ray) use
+  `geom_normal * 0.001` instead. The geometric normal is by
+  construction perpendicular to the actual triangle, so the
+  offset always lifts the ray off the surface and never
+  into it.
+
+This is a one-line conceptual change with surgical edits at
+the four offset sites. The visible result is that pawn ball
+tops, bishop crowns, and any other shared-mesh region whose
+normal-map texture pushes the perturbation past the
+hemisphere boundary now shade correctly. The dark patches
+are gone.
+
+### UV-pole tangent-space collapse (defensive secondary fix)
+
+The first-pass diagnosis turned out to address a different
+real bug — at UV-sphere poles where many radial triangles
+converge, `compute_tangents` accumulators cancel to zero
+and the old `orthonormalize_tangent` fallback inflated the
+zero to an arbitrary unit-length axis. The bad TBN then
+fed `apply_normal_map` a UV-meaningless tangent, producing
+weird cos values at pole pixels. Even with the geometric-
+normal offset fix above, this would leave subtle
+mis-shading at poles, so the fix stays:
+
+* `pathtrace::mesh::compute_tangents` writes a zero-length
+  sentinel `[0,0,0,0]` when the projected accumulator
+  collapses (length² < 1e-12).
+* WGSL `apply_normal_map` smoothstep-fades the perturbed
+  normal back to the geometric normal over
+  `t_len ∈ [0.005, 0.04]` of the interpolated raw tangent
+  magnitude. Sub-pixel pinhole at the pole; no impact
+  elsewhere.
+* glTF-`TANGENT` ingest also propagates the sentinel when
+  the supplied tangent is itself near-zero.
+* Regression test
+  `compute_tangents_emits_sentinel_at_uv_sphere_pole`
+  pins the behaviour with a UV-sphere-cap test geometry.
+
+### UV-pole tangent-space collapse (original misdiagnosis — kept for context)
 
 The chess hero shipped without an adversarial render review,
 and the user caught a same-location dark patch on every white
