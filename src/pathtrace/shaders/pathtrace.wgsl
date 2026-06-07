@@ -485,55 +485,65 @@ struct Tbn {
     normal: vec3<f32>,
 };
 
-fn vertex_tangent(tri: u32, bary: vec2<f32>) -> vec4<f32> {
+// PT-mikktspace (plan 0027): per-face tangent computed on-the-fly
+// from this triangle's own position + UV gradient. No averaging
+// across UV seams — each triangle owns its tangent, so the
+// per-tile UV-seam stripes that the per-vertex accumulator
+// produced on brick / ashlar / door-trim assets are gone.
+//
+// Returns `(t.xyz, sign)` where `t` is the orthonormalised
+// tangent in the surface plane and `sign` is the bitangent
+// handedness. Returns `vec4<f32>(0.0)` as the
+// degenerate-UV-gradient sentinel — `apply_normal_map`
+// detects it and falls back to the geometric normal.
+fn triangle_tangent(tri: u32, n: vec3<f32>) -> vec4<f32> {
     let i0 = tri_indices[tri * 3u + 0u];
     let i1 = tri_indices[tri * 3u + 1u];
     let i2 = tri_indices[tri * 3u + 2u];
-    let w0 = 1.0 - bary.x - bary.y;
-    let t0 = vertices[i0].tangent;
-    let t1 = vertices[i1].tangent;
-    let t2 = vertices[i2].tangent;
-    let blended = t0 * w0 + t1 * bary.x + t2 * bary.y;
-    // Pick the dominant per-vertex bitangent sign (in practice
-    // they're all equal across a triangle's three vertices).
-    var sign = blended.w;
-    if (sign == 0.0) {
-        sign = 1.0;
-    } else {
-        sign = sign / abs(sign);
+    let p0 = vertices[i0].position;
+    let p1 = vertices[i1].position;
+    let p2 = vertices[i2].position;
+    let uv0 = vertices[i0].uv;
+    let uv1 = vertices[i1].uv;
+    let uv2 = vertices[i2].uv;
+    let e1 = p1 - p0;
+    let e2 = p2 - p0;
+    let duv1 = uv1 - uv0;
+    let duv2 = uv2 - uv0;
+    let det = duv1.x * duv2.y - duv2.x * duv1.y;
+    if (abs(det) < 1e-8) {
+        return vec4<f32>(0.0);
     }
-    return vec4<f32>(blended.xyz, sign);
-}
-
-fn interpolated_tbn(tri: u32, bary: vec2<f32>, normal: vec3<f32>) -> Tbn {
-    let raw = vertex_tangent(tri, bary);
-    // Gram-Schmidt against the (already unit) normal — keeps the
-    // TBN orthonormal under the barycentric blend's drift.
-    let proj = raw.xyz - normal * dot(raw.xyz, normal);
+    let inv = 1.0 / det;
+    let t_raw = inv * (duv2.y * e1 - duv1.y * e2);
+    let b_raw = inv * (-duv2.x * e1 + duv1.x * e2);
+    // Gram-Schmidt the tangent against the shading normal so the
+    // TBN is orthonormal in the surface plane.
+    let proj = t_raw - n * dot(t_raw, n);
     let p_len = length(proj);
-    let t_orth = select(
-        normalize(proj),
-        // Fallback when projection collapses (tangent ‖ normal).
-        normalize(
-            select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), abs(normal.x) >= 0.9)
-            - normal * dot(
-                select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), abs(normal.x) >= 0.9),
-                normal,
-            )
-        ),
-        p_len > 1e-6,
-    );
-    var out: Tbn;
-    out.tangent = t_orth;
-    out.bitangent = cross(normal, t_orth) * raw.w;
-    out.normal = normal;
-    return out;
+    if (p_len < 1e-6) {
+        return vec4<f32>(0.0);
+    }
+    let t_orth = proj / p_len;
+    // Bitangent handedness: + if (n × t_orth) lies on the same
+    // side as the UV-derived b_raw, − otherwise.
+    let sign = select(-1.0, 1.0, dot(cross(n, t_orth), b_raw) >= 0.0);
+    return vec4<f32>(t_orth, sign);
 }
 
 // Tangent-space normal sample → world-space shading normal.
 // Texture stored in OpenGL +Y-up convention (glTF mandated).
 fn apply_normal_map(mat: Material, tri: u32, bary: vec2<f32>, normal: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
     if (mat.normal_texture_idx == NO_TEXTURE) {
+        return normal;
+    }
+    // PT-mikktspace: per-face tangent from this triangle's own UV
+    // gradient. The zero-tangent sentinel still means "degenerate
+    // UV — skip perturbation"; the smoothstep fade from plan 0024
+    // that handled per-vertex UV-pole collapse is gone, since
+    // per-face tangents handle poles + seams cleanly.
+    let t = triangle_tangent(tri, normal);
+    if (dot(t.xyz, t.xyz) < 1e-12) {
         return normal;
     }
     let tex = textureSampleLevel(
@@ -549,21 +559,9 @@ fn apply_normal_map(mat: Material, tri: u32, bary: vec2<f32>, normal: vec3<f32>,
         (tex.g * 2.0 - 1.0) * mat.normal_scale,
         tex.b * 2.0 - 1.0,
     );
-    let tbn = interpolated_tbn(tri, bary, normal);
-    let world = tbn.tangent * ts.x + tbn.bitangent * ts.y + tbn.normal * ts.z;
-    let perturbed = normalize(world);
-    // Plan 0024 fix: `compute_tangents` writes a zero-length tangent
-    // sentinel at UV poles where the radial tangent sum cancels.
-    // Smooth-fade the perturbed normal back to the geometric normal
-    // as the interpolated tangent magnitude collapses toward the
-    // pole. Hard threshold either pinholes (too tight — visible
-    // dark spot at the pole) or flattens whole pole-fan triangles
-    // (too loose — pawn marble looks like low-poly plastic). The
-    // smoothstep handles a wide range of fan triangle geometries.
-    let raw_t = vertex_tangent(tri, bary);
-    let t_len = length(raw_t.xyz);
-    let blend = smoothstep(0.005, 0.04, t_len);
-    return normalize(mix(normal, perturbed, blend));
+    let bitangent = cross(normal, t.xyz) * t.w;
+    let world = t.xyz * ts.x + bitangent * ts.y + normal * ts.z;
+    return normalize(world);
 }
 
 // PT-mr-map: per-texel roughness + metallic, glTF 2.0 convention.
