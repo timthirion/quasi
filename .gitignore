@@ -49,3 +49,9 @@ data/output/cornell_disney_*.png
 # rendered ground truth over committed bytes. Re-render locally with
 # `cargo run -- render --scene <gltf> ...` when needed.
 data/output/*.exr
+
+# Plan 0022 PT-sponza-baseline: Sponza glTF asset (~53 MB across 71
+# files) lives on contributor disk only. Re-fetch with
+# `python3 scripts/fetch_sponza.py`. Source + licence:
+# https://github.com/KhronosGroup/glTF-Sample-Models 2.0/Sponza.
+data/gltf/sponza/

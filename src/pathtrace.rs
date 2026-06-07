@@ -820,26 +820,96 @@ pub(crate) fn build_cloud_grid_texture_from(
 /// textures, layer 0 is a 1×1 white pixel so the binding stays valid.
 /// Mixed-size inputs are not supported in `PT-textures`; the loader
 /// asserts uniform dimensions for now.
+/// Native: per-layer resize to a common target size using
+/// `image::imageops::resize` with the Triangle filter. Cap at
+/// 2048 on each axis — most PBR textures top out there, and
+/// downscaling rare 4K textures keeps GPU memory + upload time
+/// bounded at this first-render stage. Refining mip selection is
+/// a follow-up (PT-texture-lod).
+#[cfg(not(target_arch = "wasm32"))]
+fn resolve_texture_layers(
+    textures: &[crate::pathtrace::mesh::TextureImage],
+) -> (u32, u32, u32, Vec<Vec<u8>>) {
+    const MAX_DIM: u32 = 2048;
+    let target_w = textures.iter().map(|t| t.width).max().unwrap().min(MAX_DIM);
+    let target_h = textures
+        .iter()
+        .map(|t| t.height)
+        .max()
+        .unwrap()
+        .min(MAX_DIM);
+    let resized: Vec<Vec<u8>> = textures
+        .iter()
+        .map(|t| {
+            if t.width == target_w && t.height == target_h {
+                t.rgba.clone()
+            } else {
+                let img = image::RgbaImage::from_raw(t.width, t.height, t.rgba.clone())
+                    .expect("texture rgba length must match width * height * 4");
+                let resized = image::imageops::resize(
+                    &img,
+                    target_w,
+                    target_h,
+                    image::imageops::FilterType::Triangle,
+                );
+                resized.into_raw()
+            }
+        })
+        .collect();
+    (target_w, target_h, textures.len() as u32, resized)
+}
+
+/// Wasm: no `image` crate available. The wasm web pipeline only
+/// loads the embedded Cornell scene where texture layers are
+/// already uniformly sized — assert that invariant and zero-copy
+/// the layers through.
+#[cfg(target_arch = "wasm32")]
+fn resolve_texture_layers(
+    textures: &[crate::pathtrace::mesh::TextureImage],
+) -> (u32, u32, u32, Vec<Vec<u8>>) {
+    let w = textures[0].width;
+    let h = textures[0].height;
+    for (i, t) in textures.iter().enumerate() {
+        assert!(
+            t.width == w && t.height == h,
+            "wasm32 texture-array path: layer {i} is {}×{} but layer 0 is {w}×{h}; \
+             mixed sizes need the native `image` crate's resize (currently gated \
+             cfg(not(target_arch = \"wasm32\")) in Cargo.toml)",
+            t.width,
+            t.height,
+        );
+    }
+    let layers: Vec<Vec<u8>> = textures.iter().map(|t| t.rgba.clone()).collect();
+    (w, h, textures.len() as u32, layers)
+}
+
 fn build_texture_array(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     textures: &[crate::pathtrace::mesh::TextureImage],
 ) -> (wgpu::Texture, wgpu::TextureView, wgpu::Sampler) {
-    let (width, height, layer_count, source) = if textures.is_empty() {
-        (1u32, 1u32, 1u32, None)
+    // Plan 0022 finding: real-world glTF assets (e.g. Sponza) ship
+    // textures at mismatched dimensions (4×4 placeholders + 1K and
+    // 2K material maps in the same scene). Resize each layer to a
+    // common (max-dimensions, capped) target so the texture array
+    // can hold them as parallel layers.
+    //
+    // Native uses `image::imageops::resize`; wasm doesn't carry the
+    // `image` crate (it's gated under `cfg(not(target_arch =
+    // "wasm32"))` in Cargo.toml so the `hdr` feature stays native-
+    // only). The wasm web pipeline only ever loads the embedded
+    // Cornell scene where textures are already uniformly sized,
+    // so the wasm path keeps the original assert + zero-copy
+    // upload.
+    let (width, height, layer_count, resized) = if textures.is_empty() {
+        (1u32, 1u32, 1u32, Vec::new())
     } else {
-        let w = textures[0].width;
-        let h = textures[0].height;
-        for (i, t) in textures.iter().enumerate() {
-            assert!(
-                t.width == w && t.height == h,
-                "PT-textures: texture array layer {i} has size {}×{} but layer 0 is {w}×{h}; \
-                 mixed sizes need resizing support (not yet implemented)",
-                t.width,
-                t.height,
-            );
-        }
-        (w, h, textures.len() as u32, Some(textures))
+        resolve_texture_layers(textures)
+    };
+    let source: Option<&[Vec<u8>]> = if textures.is_empty() {
+        None
+    } else {
+        Some(&resized)
     };
 
     let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -859,7 +929,7 @@ fn build_texture_array(
 
     match source {
         Some(layers) => {
-            for (layer_idx, img) in layers.iter().enumerate() {
+            for (layer_idx, layer_rgba) in layers.iter().enumerate() {
                 queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
                         texture: &texture,
@@ -871,15 +941,15 @@ fn build_texture_array(
                         },
                         aspect: wgpu::TextureAspect::All,
                     },
-                    &img.rgba,
+                    layer_rgba,
                     wgpu::TexelCopyBufferLayout {
                         offset: 0,
-                        bytes_per_row: Some(img.width * 4),
-                        rows_per_image: Some(img.height),
+                        bytes_per_row: Some(width * 4),
+                        rows_per_image: Some(height),
                     },
                     wgpu::Extent3d {
-                        width: img.width,
-                        height: img.height,
+                        width,
+                        height,
                         depth_or_array_layers: 1,
                     },
                 );

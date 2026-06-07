@@ -604,12 +604,20 @@ pub fn compute_tangents(
 // glTF loader
 // ---------------------------------------------------------------------------
 
-/// Reads a glTF file from disk (`.glb` or `.gltf` + sidecar `.bin`).
+/// Reads a glTF file from disk (`.glb` or `.gltf` + sidecar `.bin` +
+/// external texture URIs). Routes through `gltf::import(path)` so
+/// the loader can resolve external file references relative to the
+/// scene file's directory — the canonical layout for multi-file
+/// glTFs like the Khronos Sponza distribution under plan 0022.
 /// Native-only because the wasm target doesn't have `std::fs`.
+///
+/// For self-contained `.glb` or data-URI glTF blobs already in
+/// memory (e.g. the embedded Cornell default + the wasm web
+/// pipeline that fetches bytes via `fetch`), use [`load_glb_bytes`].
 #[cfg(not(target_arch = "wasm32"))]
 pub fn load_glb<P: AsRef<std::path::Path>>(path: P) -> Result<TriangleScene, MeshError> {
-    let bytes = std::fs::read(path.as_ref())?;
-    load_glb_bytes(&bytes)
+    let (document, buffers, images) = gltf::import(path.as_ref())?;
+    build_scene_from_gltf(document, buffers, images)
 }
 
 /// Parses a glTF blob (binary `.glb` or JSON `.gltf` with embedded
@@ -617,7 +625,19 @@ pub fn load_glb<P: AsRef<std::path::Path>>(path: P) -> Result<TriangleScene, Mes
 /// `fetch`.
 pub fn load_glb_bytes(bytes: &[u8]) -> Result<TriangleScene, MeshError> {
     let (document, buffers, images) = gltf::import_slice(bytes)?;
+    build_scene_from_gltf(document, buffers, images)
+}
 
+/// Shared post-parse pipeline used by both [`load_glb`] (path-based,
+/// resolves external URIs) and [`load_glb_bytes`] (self-contained
+/// blob). Splitting this out keeps the two ingest entry points
+/// honest about *only* differing in how they obtain `(document,
+/// buffers, images)` — every downstream behavior is identical.
+fn build_scene_from_gltf(
+    document: gltf::Document,
+    buffers: Vec<gltf::buffer::Data>,
+    images: Vec<gltf::image::Data>,
+) -> Result<TriangleScene, MeshError> {
     let mut scene = TriangleScene::default();
     // Ingest texture images first so material extraction can resolve
     // baseColorTexture indices. We only carry images that some material

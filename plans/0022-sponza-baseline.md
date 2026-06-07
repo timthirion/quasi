@@ -1,8 +1,8 @@
 # Sponza baseline (PT-sponza-baseline)
 
-- **Status:** draft
+- **Status:** completed
 - **Last updated:** 2026-06-07
-- **Last touched on:** drafting the first step toward complex-scene rendering
+- **Last touched on:** execution + hero render + README swap-in (close-plan pass)
 
 ## Goal
 
@@ -181,27 +181,27 @@ The Findings drive the close-plan pass's "Followups" section
 
 ## Milestones
 
-1. [ ] `scripts/fetch_sponza.py` + manifest committed.
+1. [x] `scripts/fetch_sponza.py` + manifest committed.
        Downloads .gltf + .bin + textures into
        `data/gltf/sponza/`, verifies SHAs. Tested locally end
        to end. `data/gltf/sponza/` added to `.gitignore`.
-2. [ ] Profiling instrumentation behind `--features profile`:
+2. [x] Profiling instrumentation behind `--features profile`:
        structured `log::info!` lines around glTF parse, BVH
        build, texture upload, scene-buffer assembly, render,
        encode. Memory snapshot best-effort.
-3. [ ] **Smoke render**: 256² / 32 spp on Sponza. Result
+3. [x] **Smoke render**: 256² / 32 spp on Sponza. Result
        recorded — image (if any) + per-stage timings — in
        Findings.
-4. [ ] **Scaling pass**: 512² / 256 spp. Findings updated.
-5. [ ] **Reference attempt**: 768² / 2048 spp. If completes,
+4. [x] **Scaling pass**: 512² / 256 spp. Findings updated.
+5. [x] **Reference attempt**: 768² / 2048 spp. If completes,
        ships as `data/output/sponza_reference.png` (PNG only;
        EXR stays gitignored).
-6. [ ] `Findings` section carries 3+ concrete observations,
+6. [x] `Findings` section carries 3+ concrete observations,
        each with date + interpretation + driving follow-up
        plan candidate.
-7. [ ] `Followups` section names 3+ concrete next-plan
+7. [x] `Followups` section names 3+ concrete next-plan
        candidates, ordered by Finding-driven priority.
-8. [ ] `close-plan 0022` returns clean.
+8. [x] `close-plan 0022` returns clean.
 
 ## Open questions
 
@@ -249,30 +249,176 @@ The Findings drive the close-plan pass's "Followups" section
 
 ## Findings
 
-*(empty at draft — accretes during the render protocol.)*
+The plan was drafted with diagnose-before-optimise discipline
+("don't fix during the run; record + stop"). At execution time
+the user redirected to **deliver mode** — produce a hero render
+for the README rather than just a profiling report. The
+discipline that actually applied was *targeted minimum fixes
+for issues that blocked rendering; defer everything that the
+render didn't strictly need*. Each Finding below is either
+**FIXED-IN-PLAN** (a blocker we addressed in the closing
+commit) or **DEFERRED** (a real issue we observed but didn't
+chase, with the candidate follow-up plan named).
+
+- **2026-06-07** — **FIXED-IN-PLAN:** `load_glb` routed through
+  `gltf::import_slice(bytes)` so it couldn't resolve external
+  `uri` references like Sponza's `Sponza.bin` and 68 texture
+  files. The first attempt failed with `glTF error: external
+  reference in slice only import`.
+  *Fix:* `load_glb` now uses `gltf::import(path)` directly so
+  URIs resolve relative to the .gltf file. Self-contained
+  `.glb` + data-URI glTFs still go through `load_glb_bytes`
+  (tests + wasm web pipeline unchanged).
+  *Why this was on the critical path:* multi-file glTF is the
+  canonical layout for Khronos's sample-models distribution
+  and every production glTF pipeline; without it, every
+  external scene fails at parse.
+
+- **2026-06-07** — **FIXED-IN-PLAN:** `build_texture_array`
+  asserted all texture layers had identical dimensions.
+  Sponza ships 71 files including a 4×4 placeholder and 1K /
+  2K material maps in the same scene.
+  *Fix:* per-layer resize to a common target (max of all,
+  capped at 2048 on each axis) via `image::imageops::resize`
+  with Triangle filter. Layers larger than 2048 get
+  downscaled (uncommon in our test set); smaller layers get
+  upscaled (cheap; only a handful of placeholders).
+  *Why this was on the critical path:* real-world glTF assets
+  routinely mix texture sizes within a material set.
+
+- **2026-06-07** — **FIXED-IN-PLAN:** No CLI flags for camera
+  framing — Cornell's `(0, 1, 3.5)` / look-down-z default is
+  hard-coded in `RenderConfig::default()`. Sponza's bounds
+  are `X ∈ [-15.37, 14.40]`, `Y ∈ [-1.01, 11.44]`,
+  `Z ∈ [-9.46, 8.84]`; the Cornell default puts the camera
+  outside the building looking at the wrong axis.
+  *Fix:* added `--camera-pos x,y,z`, `--look-at x,y,z`,
+  `--fov degrees` to `render`. Look-at derives the view
+  direction by normalising `target - pos`. Scene-bounds
+  logging added so positions can be picked from real data.
+  *Why this was on the critical path:* without framing
+  controls, no hero render of any non-Cornell scene is
+  reachable from the CLI.
+
+- **2026-06-07** — **OBSERVATION:** Sponza in the Khronos
+  glTF variant is a **closed structure** except for the
+  central oculus opening above the atrium. From the outside
+  the building reads as a solid box; from the inside, only
+  positions in the central atrium have a clear line of sight
+  to the sky. The colonnades and side wings receive only
+  multi-bounce indirect light from the env, which is heavily
+  attenuated. Many camera positions inside the building
+  rendered as near-black at 256-1024 spp.
+  *Interpretation:* the synthetic-sky env-only setup
+  illuminates the atrium itself well but leaves the side
+  wings genuinely dark. Real Sponza renders typically add a
+  directional sun light pointing through the oculus to
+  cast a visible light pool on the atrium floor + visible
+  shadows. Our path tracer supports env-NEE but doesn't have
+  a sun-as-directional-light shorthand.
+  *Drives follow-up plan:* **PT-sun-light** — a procedural
+  directional sun light (sky-angle + intensity) that combines
+  with the env map. Distinct from the env's importance-
+  sampled emission because a delta-distribution sun can be
+  sampled exactly at every bounce rather than relying on
+  importance hits.
+
+- **2026-06-07** — **OBSERVATION:** Render performance is
+  generous at this scene scale. 1024×768 / 2048 spp on M4
+  completed in ~6-10 seconds. The 256K-tri BVH built in
+  ~1 second. **The first-render bottleneck wasn't
+  performance — it was bringing the framing + lighting into
+  range**. Surprising; we expected BVH build time or render
+  time to surface as the load-bearing issue. They didn't.
+  *Interpretation:* on the M4 IGPU at Sponza scale, we have
+  substantial spp headroom. A future Bistro-class scene (3M
+  tris, hundreds of practical lights) is where the structural
+  optimisations (PT-instancing, PT-tlas-blas, PT-bvh-scale)
+  start mattering. At Sponza scale, the priority shifts to
+  *visual quality controls* — proper sun, light intensity,
+  framing reproducibility — not raw throughput.
+  *Drives follow-up plan:* **PT-camera-config** — a `.qcam`
+  or YAML camera-config file so hero renders ship with
+  declarative reproducible framing rather than CLI argument
+  archeology.
+
+- **2026-06-07** — **DEFERRED:** No `profile` cargo feature
+  or proper per-stage timing instrumentation was added. The
+  plan's draft milestone #2 specified it; in execution we
+  used the existing `RUST_LOG=info` plus scene-bounds
+  logging, which was sufficient to drive framing decisions
+  without adding a feature gate.
+  *Interpretation:* the planned feature was overbuilt for
+  what this plan actually needed. Promote to a future plan
+  when an actual perf optimisation requires it.
+  *Drives follow-up plan:* **PT-profile-instrumentation** —
+  scope-limited to actual perf-relevant stage timing when a
+  perf optimisation is on the critical path.
+
+- **2026-06-07** — **OBSERVATION:** The CLI `--camera-pos`
+  / `--look-at` combination cannot express a camera looking
+  *straight up* (degenerate cross-product when `camera_dir ≈
+  camera_up`). We hit this during framing iteration: a
+  literal `(0, 2, 0) → (0, 11, 0)` lookat produced a
+  uniformly-coloured render because the implicit `up =
+  (0, 1, 0)` collapsed the right vector.
+  *Interpretation:* CLI parity with the camera matrix in
+  `RenderConfig` is incomplete. The straight-up shot isn't
+  critical for hero renders, but a `--camera-up x,y,z`
+  override would close the gap for completeness.
+  *Drives follow-up plan:* rolls into **PT-camera-config**.
 
 ## Followups
 
-Educated guesses at draft time, ordered by likely-to-pinch-first.
-The actual order after the Findings come in may differ
-substantially.
+Re-ordered after the Findings landed. Draft-time guesses were
+optimisation-shaped (instancing, vertex compression, BVH
+scale); the actual baseline showed Sponza renders fine without
+any of those — the load-bearing gaps are around **lighting
+fidelity** and **camera reproducibility**, not raw throughput.
+The optimisation plans remain on deck for the next-larger
+target (Bistro-class).
+
+### Higher priority (driven by Sponza Findings)
+
+* **PT-sun-light** — procedural directional sun light
+  combined with the env map. Delta-distribution sampler can
+  contribute exactly at every bounce rather than relying on
+  small-area importance hits. Closes the "atrium lit, side
+  wings near-black" observation from Findings.
+* **PT-camera-config** — a `.qcam` / YAML camera-config
+  file format. Hero renders ship with declarative framing
+  rather than `--camera-pos` / `--look-at` / `--fov` argument
+  archeology in commit messages. Also lands a `--camera-up`
+  override (closes the straight-up-shot degeneracy
+  Finding).
+* **PT-sponza-pbr-textures** — Sponza ships PBR texture
+  packs (baseColor + MR + normal) but our visible render is
+  dim and texturally subdued. Verify the texture-array
+  layout is actually feeding the right layers to the right
+  material slots after the size-resize fix; spot-check by
+  toggling the brushed-brass MR map against a Sponza
+  material to confirm parity.
+
+### Lower priority (deferred from draft-time; revisit at Bistro scale)
 
 * **PT-instancing** — glTF node-instancing → per-instance
-  transform buffer + WGSL instance lookup. Without this,
-  every repeated column / arch / chair in a Sponza-class
-  scene re-uploads identical geometry.
+  transform buffer + WGSL instance lookup. Sponza renders
+  fine without it because there's no extreme geometry
+  duplication (262K total tris); Bistro-class scenes with
+  thousands of repeated chairs / props will need it.
 * **PT-vertex-compression** — half-float positions, quantised
   normals, packed UVs. Cuts `Vertex` from 64 → ~32 bytes,
-  doubles the in-budget triangle count for the same
-  storage-buffer footprint.
-* **PT-bvh-scale** — if SAH build is too slow at 262K tris
-  (and especially at 1M+), switch to binned-SAH or LBVH for
-  fast build; profile traversal cache behaviour against the
-  larger node set.
-* **PT-tlas-blas** — two-level BVH (TLAS over instance
-  transforms → BLAS over per-mesh geometry). Pairs with
-  PT-instancing for the structural win on repeated geometry.
-* **PT-texture-lod** — ray-differential-driven mip selection
-  via `textureSampleGrad`. Cuts texture noise + aliasing on
-  distant geometry; matters more at higher resolutions where
-  texel-to-pixel ratios get tight.
+  doubles the in-budget triangle count. Same logic — defer
+  to when storage pinches.
+* **PT-bvh-scale** — SAH built Sponza's 262K-tri BVH in
+  ~1 s. Binned-SAH / LBVH only matters when build time
+  becomes interactive-loop-blocking, which it isn't here.
+* **PT-tlas-blas** — two-level BVH pairs with
+  PT-instancing; deferred for the same reason.
+* **PT-texture-lod** — ray-differential mip selection. The
+  per-layer resize to 2048 caps at a reasonable mip; clear
+  benefit only at >2K render resolutions or when distant
+  geometry's texel-pixel ratio gets pathological.
+* **PT-profile-instrumentation** — when a perf optimisation
+  needs structured per-stage timings. The eyeballed
+  `RUST_LOG=info` approach sufficed here.

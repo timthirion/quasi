@@ -23,8 +23,8 @@
       <br><sub><b>PT-fog</b> — Cornell room filled with homogeneous fog, light scattering off particles in the room, soft halo around the ceiling light.</sub>
     </td>
     <td align="center">
-      <img src="data/output/cornell_cloud_reference.png" width="360" alt="Procedural cumulus cloud">
-      <br><sub><b>PT-vdb</b> — Procedural cumulus cloud, heterogeneous density sampled from a 3-D grid via delta tracking, anisotropic phase via Henyey-Greenstein at g = 0.4.</sub>
+      <img src="data/output/sponza_reference.png" width="360" alt="Crytek Sponza atrium">
+      <br><sub><b>PT-sponza-baseline</b> — Crytek Sponza (~262K triangles, 68 PBR textures) lit entirely by an HDR equirectangular sky entering through the open oculus above. First scene at Quasi's complex-geometry tier; first plan toward published-quality renders of architectural assets.</sub>
     </td>
   </tr>
 </table>

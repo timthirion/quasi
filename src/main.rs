@@ -86,6 +86,16 @@ struct RenderArgs {
     /// `--brute-force` switches the WGSL fragment shader to a linear
     /// triangle scan; the default walks the BVH.
     brute_force: bool,
+    /// `--camera-pos x,y,z` overrides the camera origin. Plan 0022
+    /// adds this so Sponza-class scenes (which don't fit Cornell's
+    /// (0,1,3.5)/look-down-z framing) can be aimed without
+    /// recompiling.
+    camera_pos: Option<[f32; 3]>,
+    /// `--look-at x,y,z` overrides the camera target. Used together
+    /// with `--camera-pos` to derive the view direction.
+    look_at: Option<[f32; 3]>,
+    /// `--fov degrees` overrides the camera vertical FOV.
+    fov: Option<f32>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -103,8 +113,23 @@ impl Default for RenderArgs {
             env_map: None,
             denoise: false,
             brute_force: false,
+            camera_pos: None,
+            look_at: None,
+            fov: None,
         }
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_vec3(s: &str) -> Result<[f32; 3], String> {
+    let parts: Vec<&str> = s.split(',').collect();
+    if parts.len() != 3 {
+        return Err(format!("expected 'x,y,z', got '{s}'"));
+    }
+    let x = parts[0].parse().map_err(|e| format!("x: {e}"))?;
+    let y = parts[1].parse().map_err(|e| format!("y: {e}"))?;
+    let z = parts[2].parse().map_err(|e| format!("z: {e}"))?;
+    Ok([x, y, z])
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -173,6 +198,24 @@ fn parse_render_args(args: &[String]) -> Result<RenderArgs, String> {
             "--brute-force" => {
                 r.brute_force = true;
             }
+            "--camera-pos" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| "--camera-pos needs x,y,z".to_string())?;
+                r.camera_pos = Some(parse_vec3(v).map_err(|e| format!("--camera-pos: {e}"))?);
+            }
+            "--look-at" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| "--look-at needs x,y,z".to_string())?;
+                r.look_at = Some(parse_vec3(v).map_err(|e| format!("--look-at: {e}"))?);
+            }
+            "--fov" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| "--fov needs a number".to_string())?;
+                r.fov = Some(v.parse().map_err(|e| format!("--fov: {e}"))?);
+            }
             "--help" | "-?" => {
                 println!(
                     "render options:\n\
@@ -204,7 +247,7 @@ fn run_render(args: &[String]) {
         eprintln!("error: {e}");
         std::process::exit(2);
     });
-    let cfg = RenderConfig {
+    let mut cfg = RenderConfig {
         width: cli.width,
         height: cli.height,
         samples: cli.samples,
@@ -213,6 +256,20 @@ fn run_render(args: &[String]) {
         use_bvh: !cli.brute_force,
         ..RenderConfig::default()
     };
+    if let Some(p) = cli.camera_pos {
+        cfg.camera_pos = p;
+    }
+    if let Some(target) = cli.look_at {
+        let pos = cfg.camera_pos;
+        let dx = target[0] - pos[0];
+        let dy = target[1] - pos[1];
+        let dz = target[2] - pos[2];
+        let len = (dx * dx + dy * dy + dz * dz).sqrt().max(1e-6);
+        cfg.camera_dir = [dx / len, dy / len, dz / len];
+    }
+    if let Some(f) = cli.fov {
+        cfg.fov = f;
+    }
     log::info!(
         "rendering {}x{} @ {} spp ({:?} / {:?})",
         cfg.width,
@@ -233,6 +290,28 @@ fn run_render(args: &[String]) {
         scene.triangle_count(),
         scene.emissive_lights.len(),
     );
+    // Plan 0022: bounds logging so framing flags can be derived from
+    // data, not guessed.
+    {
+        let mut min = [f32::INFINITY; 3];
+        let mut max = [f32::NEG_INFINITY; 3];
+        for v in scene.vertices.iter() {
+            for c in 0..3 {
+                if v.position[c] < min[c] {
+                    min[c] = v.position[c];
+                }
+                if v.position[c] > max[c] {
+                    max[c] = v.position[c];
+                }
+            }
+        }
+        log::info!(
+            "scene bounds: min=({:.2}, {:.2}, {:.2}) max=({:.2}, {:.2}, {:.2}) extents=({:.2}, {:.2}, {:.2})",
+            min[0], min[1], min[2],
+            max[0], max[1], max[2],
+            max[0] - min[0], max[1] - min[1], max[2] - min[2],
+        );
+    }
     let cloud_grid = cli.cloud_grid.as_deref().map(|p| {
         quasi::pathtrace::grid::Grid3D::load_from_path(p).unwrap_or_else(|e| {
             eprintln!("failed to load --cloud-grid {}: {e}", p.display());
