@@ -31,8 +31,8 @@
       <br><sub><b>PT-sun-light</b> — Crytek Sponza (~262K triangles, 68 PBR textures) under HDR sky + a delta-distribution directional sun streaming through the oculus. Banners pop in saturated reds, blues, greens, and golds; the marble floor catches a hard-edged sun pool along the atrium's long axis. 1024×768 / 2048 spp.</sub>
     </td>
     <td align="center">
-      <img src="data/output/bistro_reference.png" width="280" alt="Lumberyard Bistro courtyard archway">
-      <br><sub><b>PT-bistro</b> — Amazon Lumberyard Bistro Exterior at ~2.8 M triangles — 10× past Sponza on geometry, the canonical "renderer flex" cafe scene. 1024×768 / 2048 spp, sun-only lighting through a Parisian courtyard archway. Textures stripped pending PT-ktx2 (KTX2 / Basis Universal decoder); the no-texture pass reads as marble-model architectural drawing.</sub>
+      <img src="data/output/bistro_reference.png" width="280" alt="Lumberyard Bistro courtyard archway with full PBR textures">
+      <br><sub><b>PT-bistro</b> — Amazon Lumberyard Bistro Exterior at ~2.8 M triangles + 582 PBR textures, 10× past Sponza on geometry. Full <code>KHR_texture_basisu</code> ingest via <code>basisu</code> pre-decode (plan 0026 PT-ktx2). 1024×768 / 2048 spp through the Parisian courtyard archway to the sunlit gothic facade beyond — brick + cobblestone + wooden door + lantern all reading.</sub>
     </td>
   </tr>
 </table>

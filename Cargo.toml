@@ -19,9 +19,15 @@ serde_json = "1"
 winit = "0.29"
 pollster = "0.3"
 env_logger = "0.11"
-image = { version = "0.25", default-features = false, features = ["png", "hdr"] }
+image = { version = "0.25", default-features = false, features = ["png", "hdr", "jpeg"] }
 exr = "1"
 half = { version = "2", default-features = false }
+# PT-ktx2 (plan 0026): Basis Universal / KTX2 texture decode for
+# modern glTF assets (e.g. Bistro) that ship .ktx2 textures via
+# the KHR_texture_basisu extension. Native-only; the wasm pipeline
+# stays PNG/JPG.
+ktx2 = "0.5"
+basis-universal = "0.3"
 
 [dev-dependencies]
 naga = { version = "29", features = ["wgsl-in"] }

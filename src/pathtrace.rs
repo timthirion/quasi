@@ -822,15 +822,18 @@ pub(crate) fn build_cloud_grid_texture_from(
 /// asserts uniform dimensions for now.
 /// Native: per-layer resize to a common target size using
 /// `image::imageops::resize` with the Triangle filter. Cap at
-/// 2048 on each axis — most PBR textures top out there, and
-/// downscaling rare 4K textures keeps GPU memory + upload time
-/// bounded at this first-render stage. Refining mip selection is
-/// a follow-up (PT-texture-lod).
+/// 1024 on each axis — Bistro (~400 textures) at 2048² × 4 bytes
+/// per layer hits ~6.5 GB of texture-array memory which blows
+/// past Metal's per-resource allocation. Sponza + chess + the
+/// Cornell suite all topped at 2K but only had 8-68 layers each;
+/// 1024 keeps Bistro under 1.6 GB while still carrying the
+/// material story. Refining mip selection is a follow-up
+/// (PT-texture-lod).
 #[cfg(not(target_arch = "wasm32"))]
 fn resolve_texture_layers(
     textures: &[crate::pathtrace::mesh::TextureImage],
 ) -> (u32, u32, u32, Vec<Vec<u8>>) {
-    const MAX_DIM: u32 = 2048;
+    const MAX_DIM: u32 = 1024;
     let target_w = textures.iter().map(|t| t.width).max().unwrap().min(MAX_DIM);
     let target_h = textures
         .iter()
