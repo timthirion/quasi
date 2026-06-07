@@ -1,7 +1,8 @@
 # PT-mikktspace — per-face tangents in WGSL
 
-- **Status:** in-flight (shader + chess + sponza shipped; bistro re-render parked)
+- **Status:** completed
 - **Last updated:** 2026-06-07
+- **Last touched on:** all four milestones ticked; bistro re-render shipped + attacker-verified clean
 
 ## Goal
 
@@ -143,12 +144,15 @@ Bistro-scale assets.
   marble bodies. Render-attacker (tightened mandate from
   commit `a5043a6`) passes the periodic-pattern check on
   the pawn balls, bishop crowns, and marble board.
-- [ ] **[PT-mikktspace/bistro]** Bistro hero re-renders
-  without brick stripes (~38 px period), ashlar stripes
-  (~48 px), or door-trim stripes (~28-32 px). Deferred
-  — needs ~30 min GPU; smoke render at 768×576/256 spp
-  verified the fix works; full 1024×768/2048 spp hero is
-  parked for the user's GPU window.
+- [x] **[PT-mikktspace/bistro]** Bistro hero re-rendered at
+  1024×768 / 2048 spp. Tightened render-attacker confirmed
+  red-brick column, ashlar wall, and door-surround trim are
+  all clean of UV-seam stripes; no degenerate-UV holes or
+  sign-flip facet seams introduced. Residual non-mikktspace
+  defects flagged: shadow-area chroma noise (NEE/sampler
+  convergence), foliage billboard holdouts (PT-alpha-mask),
+  mild shadow crush under arch (sun-only tonemap
+  compromise) — all known + tracked.
 - [x] **[PT-mikktspace/sponza]** Sponza hero re-renders
   cleanly with no regression on the lit brick walls /
   arches / banners.
