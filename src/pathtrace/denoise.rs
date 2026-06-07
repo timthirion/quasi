@@ -54,9 +54,15 @@ pub struct DenoiseParams {
     ///
     /// **Tests** flip this to `false` to ablate the tonemap wrap
     /// and assert the tonemap-on-vs-off relationship the fix
-    /// depends on. **Production code should keep the default** —
-    /// switching it off silently restores the HDR-halo failure
-    /// mode plan 0018 closed.
+    /// depends on. **Production code should keep the default.**
+    /// Switching it off silently restores the HDR-halo failure
+    /// mode plan 0018 closed; additionally, the `σ_c = 0.5`
+    /// default was tuned against **tonemapped** inputs and will
+    /// over-blur raw HDR radiance — the colour edge stop
+    /// `exp(-(Δc)² / σ_c²)` collapses to zero on any pair with
+    /// `|Δc| > ~1`, killing legitimate edge preservation. This
+    /// knob is a **test-only ablation**, not a production
+    /// alternative.
     pub tonemap_passes: bool,
 }
 
@@ -686,6 +692,75 @@ mod tests {
             peak < dim * 2.5,
             "halo at r=8 around 3×3 cluster: peak R = {peak} exceeds 2.5×dim ({})",
             dim * 2.5,
+        );
+    }
+
+    /// Pin the production-protecting default. A future contributor
+    /// who flips this to `false` flips production into the
+    /// HDR-halo failure mode plan 0018 closed *and* the
+    /// σ-tuning-mismatch failure mode noted on the field's doc
+    /// comment. Accept code-attacker P1 (#1) from the close-plan
+    /// pass on plan 0021.
+    #[test]
+    fn denoise_params_default_keeps_tonemap_on() {
+        let p = DenoiseParams::default();
+        assert!(
+            p.tonemap_passes,
+            "Default tonemap_passes flipped to false — production now \
+             over-blurs HDR + restores the plan-0018 halo failure mode",
+        );
+    }
+
+    /// `radius == 0` is the degenerate "ring" — it should read the
+    /// centre pixel exactly. No division (the helper returns peak,
+    /// not average), so no panic.
+    #[test]
+    fn halo_intensity_at_ring_radius_zero_returns_centre() {
+        let w = 8_u32;
+        let h = 8_u32;
+        let mut out = vec![[0.0_f32; 4]; (w * h) as usize];
+        out[(4 * w + 4) as usize] = [3.0, 0.0, 0.0, 1.0];
+        let peak = halo_intensity_at_ring(&out, w, 0, (4, 4));
+        assert!(
+            (peak - 3.0).abs() < 1e-6,
+            "expected 3.0 at radius=0, got {peak}"
+        );
+    }
+
+    /// Ring fully outside the image should return `f32::NEG_INFINITY`
+    /// (no in-bounds samples to peak across). Caller is responsible
+    /// for treating the sentinel — we just guarantee no panic and
+    /// no spurious low value that would mask a real halo.
+    #[test]
+    fn halo_intensity_at_ring_fully_oob_does_not_panic() {
+        let w = 8_u32;
+        let h = 8_u32;
+        let out = vec![[0.5_f32; 4]; (w * h) as usize];
+        // Centre at corner, radius 16 → every ring pixel out of bounds.
+        let peak = halo_intensity_at_ring(&out, w, 16, (0, 0));
+        assert!(
+            peak == f32::NEG_INFINITY,
+            "expected NEG_INFINITY for fully-OOB ring, got {peak}",
+        );
+    }
+
+    /// Ring that straddles the image boundary should peak over
+    /// the in-bounds pixels only, without panic. Confirms the
+    /// bounds-check at the top of `halo_intensity_at_ring`.
+    #[test]
+    fn halo_intensity_at_ring_partial_oob_clips_cleanly() {
+        let w = 8_u32;
+        let h = 8_u32;
+        let mut out = vec![[0.5_f32; 4]; (w * h) as usize];
+        // One bright in-bounds ring pixel: (1, 0) is on the ring of
+        // radius 1 around centre (1, 1), and is in-bounds even
+        // though the ring at (1, 1) with radius 1 includes the OOB
+        // pixel at (1, -1). Index = row * w + col = 0 * w + 1 = 1.
+        out[1] = [9.0, 0.0, 0.0, 1.0];
+        let peak = halo_intensity_at_ring(&out, w, 1, (1, 1));
+        assert!(
+            (peak - 9.0).abs() < 1e-6,
+            "expected 9.0 from in-bounds ring sample, got {peak}",
         );
     }
 }

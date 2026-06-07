@@ -1,8 +1,8 @@
 # Quantified halo metric for PT-denoise (PT-denoise-halo-metric)
 
-- **Status:** active
+- **Status:** completed
 - **Last updated:** 2026-06-07
-- **Last touched on:** drafting from the plan-skeptic audit of plan 0018
+- **Last touched on:** close-plan pass — plan-skeptic + code-attacker/defender + 4 accept-with-fix P1 items applied
 
 ## Goal
 
@@ -141,25 +141,30 @@ tighten the bounds.
 
 ## Milestones
 
-1. [ ] `tonemap_passes: bool` added to `DenoiseParams` (default
+1. [x] `tonemap_passes: bool` added to `DenoiseParams` (default
        true). Existing tests + `denoise_comparison.png`
        regeneration both produce byte-stable output.
-2. [ ] `halo_intensity_at_ring` helper extracted; existing
+2. [x] `halo_intensity_at_ring` helper extracted; existing
        `tonemap_kills_hdr_halo_around_bright_pixel` refactored
        onto it (byte-stable output, just deduplication).
-3. [ ] `tonemap_ablation_at_hdr_ratios` test added. Asserts
+3. [x] `tonemap_ablation_at_hdr_ratios` test added. Asserts
        both tonemap-on and tonemap-off halo stay within
        `1.1 × background` at every HDR ratio in
        `{3, 10, 30, 100, 300}`. The hypothesis-from-draft
        ("tonemap < no-tonemap at high HDR") inverted on
        contact with the data — finding recorded in the
        Empirical sweep table.
-4. [ ] `halo_with_realistic_albedo` test added. Closes the
+4. [x] `halo_with_realistic_albedo` test added. Closes the
        demodulation-pathway audit gap.
-5. [ ] `halo_from_bright_cluster` test added. Exercises a
+5. [x] `halo_from_bright_cluster` test added. Exercises a
        footprint closer to real ceiling lights.
-6. [ ] `denoise::tests` count rises from 6 → 9; all pass.
-7. [ ] `close-plan` skill orchestration returns clean
+6. [x] `denoise::tests` count rises from 6 → **13** (was
+       planned 6 → 9; the close-plan pass added 4 more — default
+       tonemap_passes pin, halo_intensity_at_ring radius-0,
+       fully-OOB, and partial-OOB edge cases — addressing
+       code-defender's accepted P1 attacks from the closure
+       review).
+7. [x] `close-plan` skill orchestration returns clean
        (plan-skeptic + code-attacker/defender; no hero PNG
        changes, so render-attacker/defender skipped).
 

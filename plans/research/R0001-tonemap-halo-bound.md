@@ -171,5 +171,26 @@ The contribution narrative is:
 
 ## Findings
 
-*(none yet — move from `hypothesis` to `experimenting` when
-the first analytic step is in hand.)*
+- **2026-06-07** — Single-pixel synthetic sweep at `σ_c = 0.5`
+  recorded by plan 0021 PT-denoise-halo-metric **inverts** the
+  draft hypothesis on this geometry. The colour edge stop
+  `exp(-(L-ℓ)² / σ_c²)` collapses to ≈0 **without** tonemap
+  for any HDR ratio ≥ 3 — the bright pixel contributes nothing
+  to its dim neighbours, halo @ r=8 = `1.000 × dim` at every
+  ratio in {3, 10, 30, 100, 300}. **With** tonemap, Reinhard
+  compresses the colour distance so `w_colour ≈ 0.42`, and a
+  small halo appears (1.002 → 1.020× background across the
+  ratio range).
+
+  Interpretation: the directional claim "Reinhard pre-tonemap
+  bounds the halo radius" needs to be **scoped to multi-pixel
+  emitter footprints and smooth HDR gradients** — not isolated
+  bright pixels, where the existing σ_c-based edge stop
+  already kills the halo. The analytic derivation needs to
+  start from a footprint that *does* halo without tonemap
+  (e.g. a luminance ramp), not the single-pixel toy.
+
+  Test details + raw numbers: `plans/0021-denoise-halo-metric.md`
+  "Empirical sweep results" section; CPU-side helper in
+  `pathtrace::denoise::tests::halo_intensity_at_ring` for any
+  follow-up sweep.
