@@ -158,6 +158,12 @@ behaviour.
   normal, depth) weights is the SVGF-style baseline. Replacing
   the product with a max/min combination would chase specific
   artefacts; defer until we see one.
+- **Variance-adaptive σ_c (SVGF proper).** The right long-term
+  fix for HDR halos. Needs a per-pixel variance AOV the path
+  tracer doesn't write today. See
+  [`research/R0001-tonemap-halo-bound.md`](research/R0001-tonemap-halo-bound.md)
+  for the theoretical alternative — a Reinhard pre-tonemap that
+  bounds the halo radius without requiring variance instrumentation.
 - **Albedo edges vs base-color textures.** Demodulation makes
   the denoiser blind to baseColor / albedo texture detail
   (which is the *intent*: that detail rides in the albedo

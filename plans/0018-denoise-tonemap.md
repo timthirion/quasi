@@ -37,7 +37,10 @@ What this plan is **not**:
 
 * Variance-adaptive σ_c (SVGF proper). That's the right
   long-term fix but needs a per-pixel variance AOV the path
-  tracer doesn't write. Deferred to a future plan.
+  tracer doesn't write. The tonemap fix here is the cheap
+  alternative; the theoretical analysis of *why* it works
+  (and when SVGF would still win) is the subject of
+  [`research/R0001-tonemap-halo-bound.md`](research/R0001-tonemap-halo-bound.md).
 * Log-luminance colour stop. Equivalent fix; tonemap is just
   the more visually-grounded version of the same idea.
 * Bilateral filter in tonemapped space. Same thing again with

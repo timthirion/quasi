@@ -172,6 +172,11 @@ silhouette rather than aliasing at triangle edges.
   one tangent per vertex from the UV deltas — those are
   constant across the quad, so the barycentric blend collapses
   to the constant. Tests this is the case.
+- **Surface UVs as a sampling prior, not just a texturing one.**
+  Per-vertex UVs (and the parameterizations morsel can compute)
+  are stored as decoration today. The hypothesis that they're
+  also valuable as an *importance-sampling* substrate sits in
+  [`research/R0002-param-driven-sampling.md`](research/R0002-param-driven-sampling.md).
 
 ## Done when
 

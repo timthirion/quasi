@@ -15,6 +15,10 @@ truth for "what's done." Commit plan updates alongside the code they describe.
 - `ROADMAP.md` — the high-level, phased direction. The north star.
 - `NNNN-short-slug.md` — one document per concrete piece of work, zero-padded and
   incrementing (`0001-`, `0002-`, …). The number is ordering, not priority.
+- `research/` — research plans (hypotheses, experimental designs, paper
+  roadmaps) with their own `RNNNN-*` numbering. See `research/README.md`.
+  These run in parallel to implementation plans; cross-link freely between
+  the two tracks.
 
 ## Plan document template
 
