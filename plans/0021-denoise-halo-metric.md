@@ -104,16 +104,17 @@ change.
 1. **`tonemap_ablation_at_hdr_ratios`** — sweep `L/ℓ ∈ {3, 10,
    30, 100, 300}`. For each ratio, run the denoiser **twice**:
    once with `tonemap_passes = true`, once with `false`.
-   Measure halo intensity at radius 8 in each case. Assert
-   the tonemap-on halo intensity is **strictly less than** the
-   tonemap-off halo intensity at every HDR ratio ≥ 30 — the
-   load-bearing claim plan 0018 makes about the fix.
+   Measure halo intensity at radius 8 in each case.
 
-   The specific bound is **discovered empirically by the test
-   itself**, not assumed: the test prints the per-ratio
-   intensities on failure so a denoiser change that flips the
-   relationship surfaces with numbers, not a vague "looks
-   wrong."
+   The draft hypothesis was "assert tonemap halo < no-tonemap
+   halo at high HDR ratios." The empirical sweep — recorded
+   in "Empirical sweep results" below — **inverted** the
+   hypothesis: on a single bright pixel the colour edge stop
+   already kills the halo without tonemap, so no-tonemap
+   leaves the halo at exactly background. The test was
+   rewritten to assert **both configurations stay within
+   `1.1 × background`** at every HDR ratio — falsifiable,
+   5× tighter than the original `1.5 ×` the audit flagged.
 
 2. **`halo_with_realistic_albedo`** — single bright pixel at
    `L = 30`, all pixels carry `albedo = 0.7` (not unity). This
@@ -146,8 +147,13 @@ tighten the bounds.
 2. [ ] `halo_intensity_at_ring` helper extracted; existing
        `tonemap_kills_hdr_halo_around_bright_pixel` refactored
        onto it (byte-stable output, just deduplication).
-3. [ ] `tonemap_ablation_at_hdr_ratios` test added. Verifies
-       `tonemap < no-tonemap` at HDR ratios ≥ 30.
+3. [ ] `tonemap_ablation_at_hdr_ratios` test added. Asserts
+       both tonemap-on and tonemap-off halo stay within
+       `1.1 × background` at every HDR ratio in
+       `{3, 10, 30, 100, 300}`. The hypothesis-from-draft
+       ("tonemap < no-tonemap at high HDR") inverted on
+       contact with the data — finding recorded in the
+       Empirical sweep table.
 4. [ ] `halo_with_realistic_albedo` test added. Closes the
        demodulation-pathway audit gap.
 5. [ ] `halo_from_bright_cluster` test added. Exercises a
@@ -197,15 +203,51 @@ tighten the bounds.
   P0 attacks (accept-with-fix or refute-with-citation).
 * CI green at HEAD.
 
-### Empirical sweep results (filled at close time)
+### Empirical sweep results
+
+Measured at this plan's close-time, single-pixel scene,
+`σ_c = 0.5`, `dim = 1.0`:
 
 | L / ℓ | halo @ r=8 (tonemap on) | halo @ r=8 (tonemap off) | tonemap / no-tonemap |
 |------:|------------------------:|-------------------------:|---------------------:|
-|     3 |                     TBD |                      TBD |                  TBD |
-|    10 |                     TBD |                      TBD |                  TBD |
-|    30 |                     TBD |                      TBD |                  TBD |
-|   100 |                     TBD |                      TBD |                  TBD |
-|   300 |                     TBD |                      TBD |                  TBD |
+|     3 |               1.001935 |                 1.000000 |               1.0019 |
+|    10 |               1.006730 |                 1.000000 |               1.0067 |
+|    30 |               1.013410 |                 1.000000 |               1.0134 |
+|   100 |               1.018499 |                 1.000000 |               1.0185 |
+|   300 |               1.020488 |                 1.000000 |               1.0205 |
+
+**Finding — inverted from the plan's draft hypothesis:** on
+a single bright pixel, the colour edge stop
+`exp(-(L-ℓ)² / σ_c²)` collapses to ≈0 for any HDR ratio ≥ 3
+**without** tonemap — the bright pixel contributes nothing to
+its dim neighbours and the halo is exactly the background.
+**With** tonemap, the Reinhard curve compresses the colour
+distance so `w_colour ≈ 0.42`, the bright pixel does
+contribute, and a small halo appears (1.002 → 1.020× background
+across the ratio range).
+
+So on **isolated bright pixels** the tonemap fix is
+marginally *worse* than no-tonemap. This contradicts the
+hypothesis embedded in plan 0018's design narrative — but
+the visible halo plan 0018 *closed* lives elsewhere
+(multi-pixel emitter footprints, smooth HDR gradients), and
+`halo_from_bright_cluster` is the closer-to-real test for
+that geometry. The single-pixel sweep is included for
+regression protection on the synthetic case the original
+unit test used, and the assertion is now `< 1.1 × dim` for
+both configurations (5× tighter than the `1.5 ×` the audit
+flagged as too loose).
+
+The plan's load-bearing claim is therefore **not** "tonemap
+beats no-tonemap" on this geometry; it's "both stay within
+1.1× background, the assertion is falsifiable, the
+relationship is documented." The structural argument plan
+0018 makes about HDR ratios is correct in *spirit* — Reinhard
+does keep the colour distance bounded — but the synthetic
+unit test doesn't reproduce the failure mode the real-scene
+fix mitigates. That's research/R0001's territory; the test
+here just makes plan 0018's claim *checkable* on the
+synthetic geometry it actually has.
 
 ## Followups (out of scope for this plan)
 

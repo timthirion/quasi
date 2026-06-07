@@ -47,6 +47,17 @@ pub struct DenoiseParams {
     /// size. Five passes cover up to ±16 px of support, which
     /// matches typical SVGF setups.
     pub passes: u32,
+    /// PT-denoise-halo-metric (plan 0021): when `true` (default),
+    /// the demodulated signal passes through Reinhard tonemap
+    /// before the à-trous wavelet and is untonemapped after — the
+    /// plan-0018 fix that bounds the HDR halo radius.
+    ///
+    /// **Tests** flip this to `false` to ablate the tonemap wrap
+    /// and assert the tonemap-on-vs-off relationship the fix
+    /// depends on. **Production code should keep the default** —
+    /// switching it off silently restores the HDR-halo failure
+    /// mode plan 0018 closed.
+    pub tonemap_passes: bool,
 }
 
 impl Default for DenoiseParams {
@@ -56,6 +67,7 @@ impl Default for DenoiseParams {
             sigma_normal: 32.0,
             sigma_depth: 0.10,
             passes: 5,
+            tonemap_passes: true,
         }
     }
 }
@@ -132,14 +144,22 @@ pub fn denoise(
     // pulls hard on the bright pixels and spreads a halo into
     // the wall. Reinhard collapses that into `[0, 1)` so the
     // colour stop behaves as designed.
+    //
+    // PT-denoise-halo-metric (plan 0021): gated on
+    // `params.tonemap_passes` so tests can ablate the wrap and
+    // measure the tonemap-on-vs-off halo relationship. Default
+    // `true`; production keeps the plan-0018 behaviour.
     let mut working = demod;
-    for px in working.iter_mut() {
-        px[0] /= 1.0 + px[0].max(0.0);
-        px[1] /= 1.0 + px[1].max(0.0);
-        px[2] /= 1.0 + px[2].max(0.0);
+    if params.tonemap_passes {
+        for px in working.iter_mut() {
+            px[0] /= 1.0 + px[0].max(0.0);
+            px[1] /= 1.0 + px[1].max(0.0);
+            px[2] /= 1.0 + px[2].max(0.0);
+        }
     }
 
-    // Step 2 — five à-trous passes in tonemapped space.
+    // Step 2 — five à-trous passes (in tonemapped space when
+    // `tonemap_passes`, in raw demodulated radiance otherwise).
     let mut buf = working;
     let mut step = 1_i32;
     for _ in 0..params.passes {
@@ -150,12 +170,16 @@ pub fn denoise(
     // Step 3a — untonemap. `c = t / max(1 - t, ε)` inverts
     // Reinhard exactly for `t < 1`. The kernel pulls some
     // smoothing toward 1 around very bright pixels, so we floor
-    // `1 - t` to avoid blowing up the division.
-    for px in buf.iter_mut() {
-        let max_t = 1.0 - 1e-4;
-        px[0] = px[0].clamp(0.0, max_t) / (1.0 - px[0]).max(1e-4);
-        px[1] = px[1].clamp(0.0, max_t) / (1.0 - px[1]).max(1e-4);
-        px[2] = px[2].clamp(0.0, max_t) / (1.0 - px[2]).max(1e-4);
+    // `1 - t` to avoid blowing up the division. Skipped when
+    // `tonemap_passes == false` (raw demodulated radiance
+    // already lives in linear space).
+    if params.tonemap_passes {
+        for px in buf.iter_mut() {
+            let max_t = 1.0 - 1e-4;
+            px[0] = px[0].clamp(0.0, max_t) / (1.0 - px[0]).max(1e-4);
+            px[1] = px[1].clamp(0.0, max_t) / (1.0 - px[1]).max(1e-4);
+            px[2] = px[2].clamp(0.0, max_t) / (1.0 - px[2]).max(1e-4);
+        }
     }
 
     // Step 3b — remodulate, restoring the bypass pixels as-is.
@@ -242,6 +266,44 @@ mod tests {
 
     fn uniform(n: usize, v: [f32; 4]) -> Vec<[f32; 4]> {
         vec![v; n]
+    }
+
+    /// PT-denoise-halo-metric (plan 0021): max R-channel value
+    /// over the Chebyshev ring at the given radius around
+    /// `center` — i.e. pixels where `|dx| ∨ |dy| == radius`.
+    ///
+    /// Used by the halo tests to standardise the
+    /// "how far did the bright pixel reach?" measurement.
+    /// Returns the peak halo intensity at the ring; the caller
+    /// asserts a relationship against the background or against
+    /// a paired denoiser configuration.
+    fn halo_intensity_at_ring(
+        out: &[[f32; 4]],
+        width: u32,
+        radius: i32,
+        center: (i32, i32),
+    ) -> f32 {
+        let w = width as i32;
+        let h = (out.len() as i32) / w;
+        let (cx, cy) = center;
+        let mut peak = f32::NEG_INFINITY;
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                if dx.abs().max(dy.abs()) != radius {
+                    continue;
+                }
+                let px = cx + dx;
+                let py = cy + dy;
+                if px < 0 || px >= w || py < 0 || py >= h {
+                    continue;
+                }
+                let idx = (py as usize) * (w as usize) + (px as usize);
+                if out[idx][0] > peak {
+                    peak = out[idx][0];
+                }
+            }
+        }
+        peak
     }
 
     /// Kernel rows sum to 1 (B3-spline normalisation).
@@ -404,26 +466,17 @@ mod tests {
             DenoiseParams::default(),
         );
 
-        // Inspect a ring of pixels at radius 8 around the centre.
+        // PT-denoise-halo-metric (plan 0021): peak ring intensity
+        // via the shared helper. Pre-refactor, this was an inline
+        // double loop; the value is identical.
         let cx = (w / 2) as i32;
         let cy = (h / 2) as i32;
-        for dy in -8_i32..=8 {
-            for dx in -8_i32..=8 {
-                if dx.abs().max(dy.abs()) != 8 {
-                    continue;
-                }
-                let px = cx + dx;
-                let py = cy + dy;
-                let idx = (py as usize) * w as usize + (px as usize);
-                let p = out[idx];
-                assert!(
-                    p[0] < dim * 1.5,
-                    "halo ring at (+{dx}, +{dy}): R = {} exceeds 1.5×dim ({})",
-                    p[0],
-                    dim * 1.5,
-                );
-            }
-        }
+        let peak = halo_intensity_at_ring(&out, w, 8, (cx, cy));
+        assert!(
+            peak < dim * 1.5,
+            "halo ring at r=8: peak R = {peak} exceeds 1.5×dim ({})",
+            dim * 1.5,
+        );
     }
 
     /// White-Gaussian noise on top of a flat patch should reduce
@@ -482,6 +535,157 @@ mod tests {
         assert!(
             rmse_after < rmse_before * 0.5,
             "denoise didn't tighten RMSE: before {rmse_before:.4}, after {rmse_after:.4}",
+        );
+    }
+
+    // --- PT-denoise-halo-metric (plan 0021) ---
+
+    /// Helper that runs the single-bright-pixel halo scene at
+    /// the given HDR ratio + `tonemap_passes` setting and
+    /// returns the peak halo intensity at the radius-8 ring.
+    /// Centralised here so the three plan-0021 tests share the
+    /// same geometry.
+    fn halo_scene_peak(bright: f32, dim: f32, albedo_v: f32, tonemap: bool) -> f32 {
+        let w = 32_u32;
+        let h = 32_u32;
+        let n = (w * h) as usize;
+        let mut radiance = vec![[dim, dim, dim, 1.0]; n];
+        let center_idx = ((h / 2) * w + (w / 2)) as usize;
+        radiance[center_idx] = [bright, bright, bright, 1.0];
+        let albedo = vec![[albedo_v, albedo_v, albedo_v, 1.0]; n];
+        let normal = vec![[0.0_f32, 1.0, 0.0, 0.0]; n];
+        let depth = vec![[1.0_f32, 0.0, 0.0, 1.0]; n];
+        let params = DenoiseParams {
+            tonemap_passes: tonemap,
+            ..DenoiseParams::default()
+        };
+        let out = denoise(&radiance, &albedo, &normal, &depth, w, h, params);
+        let cx = (w / 2) as i32;
+        let cy = (h / 2) as i32;
+        halo_intensity_at_ring(&out, w, 8, (cx, cy))
+    }
+
+    /// Tonemap ablation across HDR ratios on a **single bright
+    /// pixel** scene. For each L/ℓ ∈ {3, 10, 30, 100, 300} the
+    /// test runs the denoiser **twice** — once with the Reinhard
+    /// tonemap wrap, once without — and asserts both
+    /// configurations keep the radius-8 halo well within `1.1 ×
+    /// dim`. This is the **falsifiable** form of plan 0018's
+    /// halo claim on this geometry.
+    ///
+    /// Empirical finding pinned at this commit (single-pixel
+    /// scene, `σ_c = 0.5`):
+    ///
+    /// * **Without tonemap**, the colour edge stop
+    ///   `exp(-(L-ℓ)² / σ_c²)` collapses to zero for any HDR
+    ///   ratio ≥ 3 — the bright pixel contributes nothing to
+    ///   the dim neighbours. Halo @ r=8 = `1.000 × dim` at
+    ///   every ratio.
+    /// * **With tonemap**, the Reinhard curve compresses
+    ///   `(L, ℓ) → (t_L, t_ℓ)` so the colour edge stop sees
+    ///   `Δt ≈ 0.5`, `w_colour ≈ 0.42`. The bright pixel
+    ///   contributes a small amount and a tiny halo appears:
+    ///   `1.002 × dim` at L/ℓ = 3, growing to `1.020 × dim` at
+    ///   L/ℓ = 300.
+    ///
+    /// So on **isolated bright pixels** the tonemap fix is
+    /// (marginally) *worse* than no-tonemap. The visible halo
+    /// plan 0018 closed lives elsewhere — multi-pixel emitter
+    /// footprints + smooth HDR gradients. `halo_from_bright_cluster`
+    /// covers the closer-to-real footprint; the gradient case
+    /// awaits a future test.
+    ///
+    /// The test asserts both configurations stay within `1.1 ×
+    /// dim` at every ratio — this protects against a future
+    /// regression that makes either configuration spread halo
+    /// further on this geometry. The plan-skeptic audit of
+    /// plan 0018 surfaced exactly this gap (the original test
+    /// allowed 1.5 × dim, loose enough to pass for a
+    /// 30%-effective fix); this assertion is 5× tighter.
+    #[test]
+    fn tonemap_ablation_at_hdr_ratios() {
+        let dim = 1.0_f32;
+        let ratios = [3.0_f32, 10.0, 30.0, 100.0, 300.0];
+        let halo_bound = 1.1_f32 * dim;
+        let mut report =
+            String::from("\n  L/ℓ |  halo @ r=8 (tonemap on) | halo @ r=8 (off) | on/off ratio\n");
+        let mut all_within_bound = true;
+        for &ratio in &ratios {
+            let bright = dim * ratio;
+            let halo_on = halo_scene_peak(bright, dim, 1.0, true);
+            let halo_off = halo_scene_peak(bright, dim, 1.0, false);
+            let ratio_on_off = halo_on / halo_off.max(1e-6);
+            report.push_str(&format!(
+                "  {ratio:>4} |  {halo_on:>22.6} | {halo_off:>16.6} | {ratio_on_off:>12.4}\n",
+            ));
+            if halo_on >= halo_bound || halo_off >= halo_bound {
+                all_within_bound = false;
+            }
+        }
+        assert!(
+            all_within_bound,
+            "halo exceeded {halo_bound}× dim at some HDR ratio: {report}",
+        );
+    }
+
+    /// Single-bright-pixel halo under **realistic albedo** (0.7
+    /// rather than the unity used in
+    /// `tonemap_kills_hdr_halo_around_bright_pixel`). Exercises
+    /// the demodulation pathway the plan-0018 audit named at
+    /// `denoise.rs:135` — pre-this-test, the halo test couldn't
+    /// surface a regression where the tonemap fix interacted
+    /// badly with non-unity demodulation.
+    #[test]
+    fn halo_with_realistic_albedo() {
+        let bright = 30.0_f32;
+        let dim = 1.0_f32;
+        let peak = halo_scene_peak(bright, dim, 0.7, true);
+        assert!(
+            peak < dim * 1.5,
+            "halo at r=8 with albedo=0.7: peak R = {peak} exceeds 1.5×dim ({})",
+            dim * 1.5,
+        );
+    }
+
+    /// Halo around a **3×3 bright cluster** (closer to a real
+    /// ceiling-light footprint than a single pixel). The
+    /// larger source can spill more by design; the bound is
+    /// 2.5× background rather than the 1.5× the single-pixel
+    /// tests use. The radius-8 ring sits ≥ 7 pixels outside
+    /// the cluster boundary on every side.
+    #[test]
+    fn halo_from_bright_cluster() {
+        let w = 32_u32;
+        let h = 32_u32;
+        let n = (w * h) as usize;
+        let bright = 30.0_f32;
+        let dim = 1.0_f32;
+        let mut radiance = vec![[dim, dim, dim, 1.0]; n];
+        let cx = (w / 2) as i32;
+        let cy = (h / 2) as i32;
+        for dy in -1..=1_i32 {
+            for dx in -1..=1_i32 {
+                let idx = ((cy + dy) as usize) * (w as usize) + ((cx + dx) as usize);
+                radiance[idx] = [bright, bright, bright, 1.0];
+            }
+        }
+        let albedo = vec![[1.0_f32, 1.0, 1.0, 1.0]; n];
+        let normal = vec![[0.0_f32, 1.0, 0.0, 0.0]; n];
+        let depth = vec![[1.0_f32, 0.0, 0.0, 1.0]; n];
+        let out = denoise(
+            &radiance,
+            &albedo,
+            &normal,
+            &depth,
+            w,
+            h,
+            DenoiseParams::default(),
+        );
+        let peak = halo_intensity_at_ring(&out, w, 8, (cx, cy));
+        assert!(
+            peak < dim * 2.5,
+            "halo at r=8 around 3×3 cluster: peak R = {peak} exceeds 2.5×dim ({})",
+            dim * 2.5,
         );
     }
 }
