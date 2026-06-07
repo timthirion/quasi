@@ -250,6 +250,12 @@ pub struct TriangleScene {
     /// uniform-pick `Vec<u32>` field. Populated by
     /// [`Self::recompute_emissive`].
     pub emissive_lights: Vec<EmissiveLight>,
+    /// PT-light-vs-env: unnormalised total emitted power summed
+    /// across all emissive triangles (`Σ area · max emission`).
+    /// Surfaced as a uniform so the WGSL Bernoulli pick between
+    /// env and triangle NEE can derive `p_env`. 0 when the scene
+    /// has no emissive triangles.
+    pub triangle_total_power: f32,
     /// SAH BVH over the triangles in `indices`. Built at glTF load
     /// time. The WGSL fragment shader walks this via stack-based
     /// traversal; the linear-scan path also remains, gated behind
@@ -279,6 +285,7 @@ impl TriangleScene {
     /// previous uniform-pick behaviour for `N == 1`.
     pub fn recompute_emissive(&mut self) {
         self.emissive_lights.clear();
+        self.triangle_total_power = 0.0;
         // First pass: collect (tri, power) pairs.
         let mut entries: Vec<(u32, f32)> = Vec::new();
         for (tri_idx, &mat_idx) in self.triangle_materials.iter().enumerate() {
@@ -292,6 +299,7 @@ impl TriangleScene {
             entries.push((tri_idx as u32, power));
         }
         let total_power: f32 = entries.iter().map(|(_, p)| *p).sum();
+        self.triangle_total_power = total_power;
         if total_power <= 0.0 {
             return;
         }

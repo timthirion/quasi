@@ -400,6 +400,11 @@ pub(crate) struct SceneBuffers {
     /// a stub buffer with a single 1.0 entry stands in when no env
     /// is set. Layout is documented on `build_env_storage`.
     pub env_data: wgpu::Buffer,
+    /// PT-light-vs-env (plan 0020): unnormalised total emitted
+    /// power of the environment map. Used as a uniform field so
+    /// the WGSL Bernoulli pick can derive `p_env`. 0 when no
+    /// env is bound.
+    pub env_total_power: f32,
 }
 
 fn make_storage_buffer(
@@ -532,10 +537,10 @@ fn build_scene_buffers_full(
     let (cloud_grid, cloud_grid_view, cloud_grid_sampler) =
         build_cloud_grid_texture_from(device, queue, cloud_grid_data);
     #[cfg(not(target_arch = "wasm32"))]
-    let (env_texture, env_view, env_sampler, env_data) =
+    let (env_texture, env_view, env_sampler, env_data, env_total_power) =
         build_environment_resources(device, queue, env_map.as_ref());
     #[cfg(target_arch = "wasm32")]
-    let (env_texture, env_view, env_sampler, env_data) =
+    let (env_texture, env_view, env_sampler, env_data, env_total_power) =
         build_environment_resources_empty(device, queue);
     SceneBuffers {
         uniform,
@@ -556,6 +561,7 @@ fn build_scene_buffers_full(
         env_view,
         env_sampler,
         env_data,
+        env_total_power,
     }
 }
 
@@ -575,6 +581,7 @@ fn build_environment_resources(
     wgpu::TextureView,
     wgpu::Sampler,
     wgpu::Buffer,
+    f32,
 ) {
     use crate::pathtrace::env::{EnvironmentMap, ImportanceTables};
     let stub = EnvironmentMap::new(1, 1, vec![[0.0, 0.0, 0.0]]);
@@ -662,7 +669,16 @@ fn build_environment_resources(
     data.extend_from_slice(&tables.conditional_cdf);
     data.extend_from_slice(&tables.conditional_pdf);
     let env_data = make_storage_buffer(device, queue, bytemuck::cast_slice(&data), "env-tables");
-    (texture, view, sampler, env_data)
+    // PT-light-vs-env: surface the env's total power. When `env_map`
+    // is None, the stub `(1, 1, [0, 0, 0])` env has zero luminance
+    // → zero total — `p_env = 0` → Bernoulli pick collapses to
+    // always-triangle, matching the no-env behaviour byte-stably.
+    let env_total_power = if env_map.is_some() {
+        tables.total_power
+    } else {
+        0.0
+    };
+    (texture, view, sampler, env_data, env_total_power)
 }
 
 /// Wasm32 fallback: no HDR loading dep on wasm, but the bind group
@@ -677,6 +693,7 @@ fn build_environment_resources_empty(
     wgpu::TextureView,
     wgpu::Sampler,
     wgpu::Buffer,
+    f32,
 ) {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("pathtrace-env-texture-empty"),
@@ -727,7 +744,8 @@ fn build_environment_resources_empty(
     });
     // 4 bytes of zero — enough for a non-empty storage binding.
     let env_data = make_storage_buffer(device, queue, &[0u8; 4], "env-tables-empty");
-    (texture, view, sampler, env_data)
+    // Wasm builds never bind a real env map; total power is 0.
+    (texture, view, sampler, env_data, 0.0)
 }
 
 /// Embeds the procedural-cumulus `.qvg` so every scene boots with a
@@ -1171,6 +1189,7 @@ impl State {
         uniforms.sampler_kind = SamplerKind::default().as_u32();
         uniforms.integrator_kind = IntegratorKind::default().as_u32();
         uniforms.use_bvh = 1;
+        uniforms.triangle_total_power = triangle_scene.triangle_total_power;
 
         let scene_buffers = build_scene_buffers(&device, &queue, &triangle_scene);
         let pathtrace_bg = build_pathtrace_bg(&device, &pathtrace_bgl, &scene_buffers);
@@ -1193,7 +1212,9 @@ impl State {
             env_view: _,
             env_sampler: env_sampler_obj,
             env_data: env_data_buf,
+            env_total_power,
         } = scene_buffers;
+        uniforms.env_total_power = env_total_power;
 
         let accum_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("accum-uniform"),

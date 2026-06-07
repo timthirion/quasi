@@ -104,6 +104,21 @@ pub struct Uniforms {
     /// 16-byte alignment pad for the uniform buffer. Read by WGSL but
     /// ignored.
     pub _pad_env: u32,
+    /// PT-light-vs-env (plan 0020): unnormalised total emitted
+    /// power of the environment map (sum of `luminance × sin θ`
+    /// across pixels). Used to drive the Bernoulli pick between
+    /// env NEE and triangle NEE — `p_env = env_total_power /
+    /// (env_total_power + triangle_total_power)`. 0 when no env
+    /// map is bound (collapses the pick to always-triangle).
+    pub env_total_power: f32,
+    /// PT-light-vs-env (plan 0020): unnormalised total emitted
+    /// power of all emissive triangles (sum of `area × max
+    /// emission channel`). 0 when the scene has no emissive
+    /// triangles (collapses the pick to always-env).
+    pub triangle_total_power: f32,
+    /// 16-byte alignment pad after the two power scalars.
+    pub _pad_pick0: u32,
+    pub _pad_pick1: u32,
 }
 
 /// CPU description of the Cornell Box.
@@ -274,14 +289,17 @@ mod tests {
         // triangle data lives in storage buffers now. T2 added
         // `use_bvh` in what used to be the trailing pad slot.
         // PT-env grew Uniforms by 4 × u32 (has_environment, env_width,
-        // env_height, pad) — 80 → 96 bytes.
-        assert_eq!(size_of::<Uniforms>(), 96);
+        // env_height, pad) — 80 → 96 bytes. PT-light-vs-env added
+        // env_total_power + triangle_total_power + 2 pads → 112 bytes.
+        assert_eq!(size_of::<Uniforms>(), 112);
         assert_eq!(offset_of!(Uniforms, triangle_count), 48);
         assert_eq!(offset_of!(Uniforms, integrator_kind), 48 + 6 * 4);
         assert_eq!(offset_of!(Uniforms, use_bvh), 48 + 7 * 4);
         assert_eq!(offset_of!(Uniforms, has_environment), 48 + 8 * 4);
         assert_eq!(offset_of!(Uniforms, env_width), 48 + 9 * 4);
         assert_eq!(offset_of!(Uniforms, env_height), 48 + 10 * 4);
+        assert_eq!(offset_of!(Uniforms, env_total_power), 48 + 12 * 4);
+        assert_eq!(offset_of!(Uniforms, triangle_total_power), 48 + 13 * 4);
     }
 
     #[test]

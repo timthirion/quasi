@@ -125,6 +125,13 @@ struct Uniforms {
     env_width: u32,
     env_height: u32,
     _pad_env: u32,
+    // PT-light-vs-env (plan 0020): total unnormalised emitted
+    // power of the env map and of the triangle emitters. Drive
+    // the Bernoulli pick `p_env = E / (E + T)`.
+    env_total_power: f32,
+    triangle_total_power: f32,
+    _pad_pick0: u32,
+    _pad_pick1: u32,
 };
 
 struct BvhNode {
@@ -1904,9 +1911,18 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
                 let env_rad = env_radiance_at_dir(ray.dir);
                 var wmis = 1.0;
                 if (mis_nee_mode && bounce > 0 && !specular_bounce) {
+                    // PT-light-vs-env: the env pdf the BSDF MIS weight
+                    // sees is the **picked** pdf — `env_pdf_at_dir *
+                    // p_env`. When no triangle light is present
+                    // `p_env = 1` and the weight collapses to the prior
+                    // behaviour; when the env is the only source we'd
+                    // never enter the Bernoulli branch anyway.
                     let env_p = env_pdf_at_dir(ray.dir);
-                    if (env_p > 0.0) {
-                        wmis = power_heuristic(prev_bsdf_pdf, env_p);
+                    let total = U.env_total_power + U.triangle_total_power;
+                    let p_env = select(1.0, U.env_total_power / total, total > 0.0);
+                    let picked_p = env_p * p_env;
+                    if (picked_p > 0.0) {
+                        wmis = power_heuristic(prev_bsdf_pdf, picked_p);
                     }
                 }
                 result.radiance = result.radiance + throughput * env_rad * wmis;
@@ -2066,7 +2082,13 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
             if (!mis_nee_mode || specular_bounce) {
                 result.radiance = result.radiance + throughput * m.emission;
             } else {
-                let lp = light_pdf_solid_angle(prev_point, hit.point, hit.normal, hit.tri);
+                let lp_raw = light_pdf_solid_angle(prev_point, hit.point, hit.normal, hit.tri);
+                // PT-light-vs-env: same picked-pdf correction as the
+                // BSDF MIS weight on the env miss-shader path. `p_tri
+                // = 1 - p_env`; when no env is bound this is 1.
+                let total = U.env_total_power + U.triangle_total_power;
+                let p_tri = select(1.0, U.triangle_total_power / total, total > 0.0);
+                let lp = lp_raw * p_tri;
                 var wmis = 1.0;
                 if (lp > 0.0) {
                     wmis = power_heuristic(prev_bsdf_pdf, lp);
@@ -2078,52 +2100,62 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
 
         let wo_dir = -ray.dir;
 
-        // NEE — only in MIS+NEE mode. PT-fog routes through
-        // `shadow_transmittance`: the function returns full ones
-        // when no media intervene (so existing scenes stay
-        // identical) and accumulates `exp(-σ_t · t)` across any
-        // fog boundary crossings on the way to the light.
+        // PT-light-vs-env (plan 0020): a single Bernoulli pick
+        // between env and triangle NEE every step. `p_env` is the
+        // env's share of the total emitted power; when only one
+        // kind of light is present the pick collapses to the sole
+        // branch (other branch's power is 0 → never picked, but
+        // also never divides into the pdf). The pre-plan-0020
+        // additive-multi-light path lived in shader history.
         if (mis_nee_mode) {
-            let ls = sample_light(hit.point, s);
-            if (ls.valid) {
-                let cos_surf = dot(hit.normal, ls.wi);
-                if (cos_surf > 0.0) {
-                    let shadow_o = hit.point + hit.normal * 0.001;
-                    let trans = shadow_transmittance(
-                        shadow_o, ls.wi, ls.dist, current_medium, s);
-                    let trans_sum = trans.x + trans.y + trans.z;
-                    if (trans_sum > 0.0) {
-                        let f = eval_bsdf(m, albedo, hit.normal, wo_dir, ls.wi);
-                        let bsdf_p = bsdf_pdf(m, hit.normal, wo_dir, ls.wi);
-                        let wlight = power_heuristic(ls.pdf_w, bsdf_p);
-                        result.radiance = result.radiance
-                            + throughput * trans * f * cos_surf * ls.le * wlight / ls.pdf_w;
+            let total_power = U.env_total_power + U.triangle_total_power;
+            if (total_power > 0.0) {
+                let p_env = U.env_total_power / total_power;
+                let pick_xi = next_1d(s);
+                let pick_env = pick_xi < p_env && U.has_environment == 1u;
+                if (pick_env) {
+                    let xi_env = next_2d(s);
+                    let es = sample_env_importance(xi_env);
+                    if (es.valid) {
+                        let cos_env = dot(hit.normal, es.dir);
+                        if (cos_env > 0.0) {
+                            let shadow_o = hit.point + hit.normal * 0.001;
+                            let trans = shadow_transmittance(
+                                shadow_o, es.dir, 1e10, current_medium, s);
+                            let trans_sum = trans.x + trans.y + trans.z;
+                            if (trans_sum > 0.0) {
+                                let f = eval_bsdf(m, albedo, hit.normal, wo_dir, es.dir);
+                                let bsdf_p = bsdf_pdf(m, hit.normal, wo_dir, es.dir);
+                                // PT-light-vs-env: the env pdf the
+                                // BSDF MIS weight needs is the *picked*
+                                // pdf — `es.pdf * p_env`. Likewise the
+                                // outgoing contribution divides by the
+                                // picked pdf, not the raw env pdf.
+                                let picked_pdf = es.pdf * p_env;
+                                let wlight = power_heuristic(picked_pdf, bsdf_p);
+                                result.radiance = result.radiance
+                                    + throughput * trans * f * cos_env * es.le * wlight / picked_pdf;
+                            }
+                        }
                     }
-                }
-            }
-
-            // PT-env NEE: sample the environment dome via inverse-CDF
-            // on the luminance × sin θ tables. Independent of triangle
-            // NEE (additive multi-light), each MIS-weighted against
-            // BSDF. Shadow ray uses `LARGE_FAR` for `dist` — any
-            // opaque triangle on the way blocks it; a clean miss
-            // accumulates segment transmittance only.
-            if (U.has_environment == 1u) {
-                let xi_env = next_2d(s);
-                let es = sample_env_importance(xi_env);
-                if (es.valid) {
-                    let cos_env = dot(hit.normal, es.dir);
-                    if (cos_env > 0.0) {
-                        let shadow_o = hit.point + hit.normal * 0.001;
-                        let trans = shadow_transmittance(
-                            shadow_o, es.dir, 1e10, current_medium, s);
-                        let trans_sum = trans.x + trans.y + trans.z;
-                        if (trans_sum > 0.0) {
-                            let f = eval_bsdf(m, albedo, hit.normal, wo_dir, es.dir);
-                            let bsdf_p = bsdf_pdf(m, hit.normal, wo_dir, es.dir);
-                            let wlight = power_heuristic(es.pdf, bsdf_p);
-                            result.radiance = result.radiance
-                                + throughput * trans * f * cos_env * es.le * wlight / es.pdf;
+                } else {
+                    let ls = sample_light(hit.point, s);
+                    if (ls.valid) {
+                        let cos_surf = dot(hit.normal, ls.wi);
+                        if (cos_surf > 0.0) {
+                            let shadow_o = hit.point + hit.normal * 0.001;
+                            let trans = shadow_transmittance(
+                                shadow_o, ls.wi, ls.dist, current_medium, s);
+                            let trans_sum = trans.x + trans.y + trans.z;
+                            if (trans_sum > 0.0) {
+                                let f = eval_bsdf(m, albedo, hit.normal, wo_dir, ls.wi);
+                                let bsdf_p = bsdf_pdf(m, hit.normal, wo_dir, ls.wi);
+                                let p_tri = 1.0 - p_env;
+                                let picked_pdf = ls.pdf_w * p_tri;
+                                let wlight = power_heuristic(picked_pdf, bsdf_p);
+                                result.radiance = result.radiance
+                                    + throughput * trans * f * cos_surf * ls.le * wlight / picked_pdf;
+                            }
                         }
                     }
                 }

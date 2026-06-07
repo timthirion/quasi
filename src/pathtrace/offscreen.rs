@@ -236,6 +236,9 @@ async fn render_offscreen_async(
         uniforms.env_width = env.width;
         uniforms.env_height = env.height;
     }
+    // PT-light-vs-env: surface the triangle total power up front
+    // (env total power lands after `build_scene_buffers_*` below).
+    uniforms.triangle_total_power = scene_data.triangle_total_power;
 
     let scene_buffers = match (cloud_grid, env_map) {
         (Some(g), None) => {
@@ -251,6 +254,7 @@ async fn render_offscreen_async(
         }
         (None, None) => build_scene_buffers(&device, &queue, scene_data),
     };
+    uniforms.env_total_power = scene_buffers.env_total_power;
     let uniform_buf = scene_buffers.uniform.clone();
     let accum_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("offscreen-accum-uniform"),
