@@ -82,3 +82,15 @@ recipe.
 - [`pre-flight.md`](pre-flight.md) — full quality-gate
   sequence required before any commit + push. Codifies
   [[feedback_verify_ci_after_push]].
+- [`commit-and-push.md`](commit-and-push.md) — pre-flight,
+  then commit with project-convention message, push, watch
+  CI on the just-pushed run, refuse to consider the push
+  "done" until CI is green. Codifies the green-CI half of
+  [[feedback_autonomy]].
+- [`close-plan.md`](close-plan.md) — orchestrator for
+  closing an implementation plan. Invokes `plan-skeptic`,
+  conditionally invokes `code-attacker/defender` (on code
+  diffs) and `render-attacker/defender` (on hero-gallery
+  PNG diffs), refuses to close on unaddressed P0 attacks,
+  ticks milestones, calls `commit-and-push`. Research-plan
+  closure is a separate path.
