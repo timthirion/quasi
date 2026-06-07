@@ -2,7 +2,7 @@
 
 - **Status:** completed
 - **Last updated:** 2026-06-06
-- **Last touched on:** vertex tangent + fur bunny showcase
+- **Last touched on:** vertex tangent + bumpy bunny showcase
 
 ## Goal
 
@@ -117,11 +117,10 @@ shading-normal code can re-read them.
 
 The bunny under `cornell_normal_mapped.gltf` currently uses
 the brushed-brass MR map but NOT a normal map (the normal map
-goes on the floor). Bake a procedural bunny-fur-bump normal
-map (per-cell wave pattern in UV space, low amplitude — just
-enough to read as "soft fur" under the cylindrical wrap), and
-add it to the bunny material in a new scene
-`cornell_fur_bunny.gltf`. With per-vertex tangents in place
+goes on the floor). Bake a procedural multi-octave-fbm normal
+map (low amplitude — just enough to read as "hammered metal"
+under the cylindrical wrap), and add it to the bunny material
+in a new scene `cornell_bumpy_bunny.gltf`. With per-vertex tangents in place
 the normal-map perturbation reads smoothly across the bunny
 silhouette rather than aliasing at triangle edges.
 
@@ -146,15 +145,15 @@ silhouette rather than aliasing at triangle edges.
       stone-tile floor collapses to the same TBN under both
       paths.
 
-### PT-fur-bunny — showcase
-- [x] `examples/gen_pbr_maps` bakes a low-amplitude bunny-fur
+### PT-bumpy-bunny — showcase
+- [x] `examples/gen_pbr_maps` bakes a low-amplitude bunny-bumpy
       normal map (multi-octave fbm) into
-      `data/textures/bunny_fur_normal.png`. Mean Z = 0.87.
-- [x] `cornell_fur_bunny.gltf`: Cornell room with the
-      brushed-brass bunny material gaining the fur normal map.
+      `data/textures/bunny_bumpy_normal.png`. Mean Z = 0.87.
+- [x] `cornell_bumpy_bunny.gltf`: Cornell room with the
+      brushed-brass bunny material gaining the bumpy normal map.
 - [x] Reference at 768²/2048 spp →
-      `data/output/cornell_fur_bunny_reference.png`. Visible
-      fur texture reads smoothly across the bunny silhouette.
+      `data/output/cornell_bumpy_bunny_reference.png`. Visible
+      bumpy texture reads smoothly across the bunny silhouette.
 
 ## Open questions
 
@@ -176,7 +175,7 @@ silhouette rather than aliasing at triangle edges.
 
 ## Done when
 
-- The brushed-brass bunny under a fresh normal map (the fur
+- The brushed-brass bunny under a fresh normal map (the bumpy
   scene) reads as smoothly-shaded across the body without
   triangle-edge aliasing in the perturbed normal.
 - All existing scenes still render correctly.

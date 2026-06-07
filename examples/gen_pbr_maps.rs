@@ -182,11 +182,11 @@ fn stone_tile_normal(width: u32, height: u32) -> ImageBuffer<Rgba<u8>, Vec<u8>> 
     img
 }
 
-/// Soft bunny-fur normal map. Multi-octave fbm height (low
+/// Soft bunny-bumpy normal map. Multi-octave fbm height (low
 /// amplitude) → finite-difference normal. Tiles seamlessly in
 /// U via low-frequency band synthesis; no per-cell structure,
 /// just organic high-freq noise.
-fn bunny_fur_normal(width: u32, height: u32) -> ImageBuffer<Rgba<u8>, Vec<u8>> {
+fn bunny_bumpy_normal(width: u32, height: u32) -> ImageBuffer<Rgba<u8>, Vec<u8>> {
     let seed = 0x1234_5678_u32;
     let normal_strength = 1.6_f32;
     let height_at = |fx: f32, fy: f32| -> f32 {
@@ -255,21 +255,21 @@ fn main() {
         (stone_total_z as f64 / stone_n as f64) / 255.0,
     );
 
-    // PT-vertex-tangent showcase: low-amplitude bunny-fur normal
+    // PT-vertex-tangent showcase: low-amplitude bunny-bumpy normal
     // map. Multi-octave fbm → finite-difference normal. Tiles
     // cleanly over the bunny's cylindrical UVs.
-    let fur_img = bunny_fur_normal(256, 256);
-    let fur_path = out_dir.join("bunny_fur_normal.png");
-    fur_img
-        .save(&fur_path)
-        .unwrap_or_else(|e| panic!("save {}: {e}", fur_path.display()));
-    let fur_total_z: u64 = fur_img.pixels().map(|p| p.0[2] as u64).sum();
-    let fur_n = (fur_img.width() * fur_img.height()) as u64;
+    let bumpy_img = bunny_bumpy_normal(256, 256);
+    let bumpy_path = out_dir.join("bunny_bumpy_normal.png");
+    bumpy_img
+        .save(&bumpy_path)
+        .unwrap_or_else(|e| panic!("save {}: {e}", bumpy_path.display()));
+    let bumpy_total_z: u64 = bumpy_img.pixels().map(|p| p.0[2] as u64).sum();
+    let bumpy_n = (bumpy_img.width() * bumpy_img.height()) as u64;
     println!(
         "wrote {} ({}×{}, mean Z channel {:.3})",
-        fur_path.display(),
-        fur_img.width(),
-        fur_img.height(),
-        (fur_total_z as f64 / fur_n as f64) / 255.0,
+        bumpy_path.display(),
+        bumpy_img.width(),
+        bumpy_img.height(),
+        (bumpy_total_z as f64 / bumpy_n as f64) / 255.0,
     );
 }

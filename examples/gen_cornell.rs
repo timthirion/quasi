@@ -188,10 +188,10 @@ fn main() {
     );
 
     // 4c) PT-vertex-tangent showcase: Cornell room with the
-    //     brushed-brass bunny wearing a fur normal map. With
+    //     brushed-brass bunny wearing a bumpy normal map. With
     //     per-vertex tangents the normal-mapped bunny reads
     //     smoothly across triangle seams.
-    let bytes = build_cornell_fur_bunny(
+    let bytes = build_cornell_bumpy_bunny(
         &room_quads,
         &room_materials,
         &bunny_positions,
@@ -200,10 +200,10 @@ fn main() {
         &bunny_raw_uvs,
         metal_bunny_mat,
     );
-    let path = out_dir.join("cornell_fur_bunny.gltf");
+    let path = out_dir.join("cornell_bumpy_bunny.gltf");
     fs::write(&path, &bytes).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
     println!(
-        "wrote {} ({} bytes, fur-normal-mapped bunny + brushed brass → {} triangles)",
+        "wrote {} ({} bytes, bumpy-normal-mapped bunny + brushed brass → {} triangles)",
         path.display(),
         bytes.len(),
         room_quads.len() * 2 + bunny_indices.len() / 3,
@@ -1178,11 +1178,11 @@ fn build_cornell_brushed_metal_bunny(
     )
 }
 
-/// PT-vertex-tangent: `data/gltf/cornell_fur_bunny.gltf` — the
-/// brushed-brass bunny with a low-amplitude fur normal map.
+/// PT-vertex-tangent: `data/gltf/cornell_bumpy_bunny.gltf` — the
+/// brushed-brass bunny with a low-amplitude bumpy normal map.
 /// Showcases that per-vertex tangents make normal mapping work
 /// smoothly on a triangulated organic mesh.
-fn build_cornell_fur_bunny(
+fn build_cornell_bumpy_bunny(
     quads: &[GpuQuad],
     materials: &[GpuMaterial],
     bunny_positions: &[[f32; 3]],
@@ -1219,7 +1219,7 @@ fn build_cornell_fur_bunny(
 
     let textures: &[&[u8]] = &[
         include_bytes!("../data/textures/brushed_brass_mr.png"),
-        include_bytes!("../data/textures/bunny_fur_normal.png"),
+        include_bytes!("../data/textures/bunny_bumpy_normal.png"),
     ];
 
     emit_gltf(
