@@ -17,8 +17,8 @@
       <br><sub><b>PT-beer-lambert</b> — Stanford bunny in green glass, Beer-Lambert absorption distance-modulated through the body.</sub>
     </td>
     <td align="center" width="33%">
-      <img src="data/output/cornell_disney_cloud_reference.png" width="280" alt="Disney WDAS cloud">
-      <br><sub><b>PT-vdb</b> — Walt Disney Animation Studios cumulus dataset rendered from its OpenVDB source; heterogeneous medium via delta + ratio tracking, Henyey-Greenstein anisotropic phase.</sub>
+      <img src="data/output/cornell_cloud_reference.png" width="280" alt="Procedural cumulus cloud">
+      <br><sub><b>PT-cloud</b> — Procedurally-baked cumulus floating in a Cornell Box; heterogeneous medium via delta + ratio tracking, Henyey-Greenstein anisotropic phase. The same pipeline ingests the Walt Disney Animation Studios cloud dataset; see <code>scripts/README.md</code>.</sub>
     </td>
   </tr>
   <tr>
