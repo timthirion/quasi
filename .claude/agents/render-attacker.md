@@ -86,6 +86,17 @@ In single-image mode, attack the render alone:
   poles. Tangent-space collapses or normal-map seam.
 * **Seam visibility** — bright/dark lines where two UV
   islands meet.
+* **Tile / brick / panel periodic patterns** — on
+  regularly-tiled surfaces (brick walls, cobblestone,
+  parquet, panelled doors), check for **repeating
+  bright or dark lines at the tile frequency**. The
+  per-vertex-tangent / UV-seam artifact class shows up
+  as a stripe at every brick row, a vertical line
+  through every cobblestone joint, a luminance step at
+  every panel edge. This is a known artifact in the
+  Quasi renderer that PT-mikktspace will close; if
+  you see it, name the tile period (in pixels) and the
+  asset surface where it lives.
 * **Fireflies** — isolated brilliant pixels from singular
   light paths.
 * **Banding** — visible quantisation in smooth gradients,
@@ -94,6 +105,33 @@ In single-image mode, attack the render alone:
   texture seams or beyond-edge pixels.
 * **Lighting discontinuities** — abrupt brightness
   transitions inside what should be one lit surface.
+
+## Crop to native resolution before judging
+
+Reading a 1024×768 image directly into the conversation
+downsamples it to ~256×256 in the multimodal encoding.
+That blends per-texel artifacts (the brick / tile / pole
+patterns above) into "texture" and you'll miss them. For
+any surface where you suspect a periodic artifact:
+
+1. Use Bash to crop a representative region at **native
+   resolution** with `sips -c <h> <w> --cropOffset <x> <y>
+   <input> --out <crop>` — `man sips` on macOS for the
+   exact flags. Pick a tile of ~200-400 pixels on a side
+   covering a repeating-pattern surface.
+2. Read the crop. Now per-tile lines that were invisible
+   in the full image will be obvious if they exist.
+3. Repeat for 2-4 representative surfaces. Skip surfaces
+   you've already cleared at lower resolution (no need
+   to crop a clearly smooth sky).
+
+If sips isn't available on the platform, fall back to
+ImageMagick's `convert` or Python's PIL, but **don't skip
+the crop step** — single-image attacks at thumbnail
+resolution miss the artifacts they exist to catch. The
+chess UV-pole patches AND the Bistro brick UV-seam stripes
+were both shipped past the agent because earlier rounds
+skipped this step.
 
 Use the Read tool to view the single image. **Look at every
 instance of every visible asset class** — if a mesh appears
