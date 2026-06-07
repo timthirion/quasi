@@ -55,3 +55,10 @@ data/output/*.exr
 # `python3 scripts/fetch_sponza.py`. Source + licence:
 # https://github.com/KhronosGroup/glTF-Sample-Models 2.0/Sponza.
 data/gltf/sponza/
+
+# Plan 0024 PT-chess-showcase + future PT-* scene-delivery plans:
+# Khronos sample-assets distributions (ABeautifulGame ~30 MB, etc.)
+# live on contributor disk only. Re-fetch with
+# `python3 scripts/fetch_khronos_scene.py <ModelName>`. Source +
+# licence: https://github.com/KhronosGroup/glTF-Sample-Assets.
+data/gltf/abeautifulgame/

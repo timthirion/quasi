@@ -8,23 +8,31 @@
 
 <table>
   <tr>
-    <td align="center" width="50%">
-      <img src="data/output/outdoor_normal_bunny_reference.png" width="360" alt="Brushed-brass bunny on stone tile under HDR sky">
+    <td align="center" width="33%">
+      <img src="data/output/outdoor_normal_bunny_reference.png" width="280" alt="Brushed-brass bunny on stone tile under HDR sky">
       <br><sub><b>PT-env-pbr</b> — Brushed-brass bunny (metallic-roughness map) on a stone-tile normal-mapped floor, lit entirely by an HDR equirectangular sky. Per-texel GGX picks up shimmering sun-glint.</sub>
     </td>
-    <td align="center" width="50%">
-      <img src="data/output/cornell_glass_bunny_reference.png" width="360" alt="Green-glass Stanford bunny">
+    <td align="center" width="33%">
+      <img src="data/output/cornell_glass_bunny_reference.png" width="280" alt="Green-glass Stanford bunny">
       <br><sub><b>PT-beer-lambert</b> — Stanford bunny in green glass, Beer-Lambert absorption distance-modulated through the body.</sub>
+    </td>
+    <td align="center" width="33%">
+      <img src="data/output/cornell_disney_cloud_reference.png" width="280" alt="Disney WDAS cloud">
+      <br><sub><b>PT-vdb</b> — Walt Disney Animation Studios cumulus dataset rendered from its OpenVDB source; heterogeneous medium via delta + ratio tracking, Henyey-Greenstein anisotropic phase.</sub>
     </td>
   </tr>
   <tr>
     <td align="center">
-      <img src="data/output/cornell_foggy_room_reference.png" width="360" alt="God-rays through fog">
+      <img src="data/output/cornell_foggy_room_reference.png" width="280" alt="God-rays through fog">
       <br><sub><b>PT-fog</b> — Cornell room filled with homogeneous fog, light scattering off particles in the room, soft halo around the ceiling light.</sub>
     </td>
     <td align="center">
-      <img src="data/output/sponza_sunlit_reference.png" width="360" alt="Crytek Sponza atrium with direct sunlight">
+      <img src="data/output/sponza_sunlit_reference.png" width="280" alt="Crytek Sponza atrium with direct sunlight">
       <br><sub><b>PT-sun-light</b> — Crytek Sponza (~262K triangles, 68 PBR textures) under HDR sky + a delta-distribution directional sun streaming through the oculus. Banners pop in saturated reds, blues, greens, and golds; the marble floor catches a hard-edged sun pool along the atrium's long axis. 1024×768 / 2048 spp.</sub>
+    </td>
+    <td align="center">
+      <img src="data/output/chess_reference.png" width="280" alt="Marble chess set mid-game">
+      <br><sub><b>PT-chess-showcase</b> — Khronos ABeautifulGame chess scene at ~1.5 M triangles, 64 PBR textures across 32 marble pieces + the inlaid board. 1024² / 2048 spp; same delta sun + HDR sky pipeline as the Sponza hero, scaled 6× past it on geometry alone.</sub>
     </td>
   </tr>
 </table>
