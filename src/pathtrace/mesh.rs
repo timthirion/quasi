@@ -535,8 +535,19 @@ pub fn orthonormalize_tangent(t: [f32; 3], n: [f32; 3]) -> [f32; 3] {
 ///
 /// Degenerate triangles (UV determinant near zero) are skipped —
 /// they contribute neither to the tangent nor the bitangent
-/// accumulator. Vertices that end up with no contributions get a
-/// fixed-frame fallback via [`orthonormalize_tangent`].
+/// accumulator.
+///
+/// **UV-pole handling (plan 0024 fix).** Where the accumulated
+/// tangent collapses to ~0 — typically at UV-sphere poles where
+/// many radial triangles cancel — the function writes a
+/// zero-length tangent (xyz = 0, w = 0). The WGSL `apply_normal_map`
+/// detects this sentinel and skips normal-map perturbation at
+/// that vertex, returning the geometric normal instead. The
+/// alternative (inflating to an arbitrary unit-length axis via
+/// the Gram-Schmidt fallback) gave the chess-pawn dark-patch
+/// artifact: each instance of a shared mesh had the same
+/// UV-pole sample produce a meaningless TBN rotation, visible as
+/// identically-placed dark spots on every piece.
 pub fn compute_tangents(
     positions: &[[f32; 3]],
     normals: &[[f32; 3]],
@@ -591,6 +602,22 @@ pub fn compute_tangents(
     (0..n)
         .map(|i| {
             let norm = normalize_or_zero(normals[i]);
+            // Pole detection: project the raw accumulator onto the
+            // tangent plane, BEFORE the fallback kicks in. If the
+            // projection is tiny, the vertex sits at a UV pole and
+            // has no meaningful tangent direction. Return the
+            // zero sentinel — WGSL apply_normal_map will see
+            // length < 1e-3 and skip the normal-map perturbation.
+            let nt = norm[0] * tan_acc[i][0] + norm[1] * tan_acc[i][1] + norm[2] * tan_acc[i][2];
+            let proj = [
+                tan_acc[i][0] - norm[0] * nt,
+                tan_acc[i][1] - norm[1] * nt,
+                tan_acc[i][2] - norm[2] * nt,
+            ];
+            let p_len2 = proj[0] * proj[0] + proj[1] * proj[1] + proj[2] * proj[2];
+            if p_len2 < 1e-12 {
+                return [0.0, 0.0, 0.0, 0.0];
+            }
             let tangent = orthonormalize_tangent(tan_acc[i], norm);
             let c = cross(norm, tangent);
             let dot_cb = c[0] * bit_acc[i][0] + c[1] * bit_acc[i][1] + c[2] * bit_acc[i][2];
@@ -896,7 +923,18 @@ fn process_primitive(
             .unwrap_or([1.0, 0.0, 0.0, 1.0]);
         let t_w = transform_dir(&raw_columns, [t_local[0], t_local[1], t_local[2]]);
         let n_unit = normalize_or_zero(n);
-        let t_proj = orthonormalize_tangent(t_w, n_unit);
+        // Propagate the compute_tangents UV-pole sentinel ([0,0,0,0])
+        // through to the GPU buffer instead of letting
+        // `orthonormalize_tangent` inflate it to an arbitrary axis.
+        // WGSL apply_normal_map detects xyz≈0 and skips the
+        // normal-map perturbation at the pole.
+        let t_local_len2 =
+            t_local[0] * t_local[0] + t_local[1] * t_local[1] + t_local[2] * t_local[2];
+        let t_proj = if t_local_len2 < 1e-12 {
+            [0.0, 0.0, 0.0]
+        } else {
+            orthonormalize_tangent(t_w, n_unit)
+        };
         scene.vertices.push(Vertex {
             position: p,
             _pad0: 0.0,
@@ -1125,16 +1163,81 @@ mod tests {
     #[test]
     fn compute_tangents_skips_degenerate_uv_triangles() {
         // Triangle with collinear UVs (det = 0) shouldn't contribute;
-        // the lone vertex without contribution should still get a
-        // sensible tangent from the fallback path.
+        // the lone vertex without contribution falls into the plan-
+        // 0024 zero-tangent sentinel (xyz=0, w=0) so WGSL
+        // apply_normal_map can skip perturbation there.
         let positions = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]];
         let normals = vec![[0.0, 1.0, 0.0]; 3];
         let uvs = vec![[0.0, 0.0], [0.5, 0.0], [1.0, 0.0]];
         let indices = vec![0, 1, 2];
         let tangents = compute_tangents(&positions, &normals, &uvs, &indices);
-        // No NaN, finite.
+        // No NaN, finite, and all vertices flag the degenerate
+        // contribution via the zero-tangent sentinel.
         for t in tangents {
             assert!(t.iter().all(|v| v.is_finite()));
+            let len2 = t[0] * t[0] + t[1] * t[1] + t[2] * t[2];
+            assert!(
+                len2 < 1e-12,
+                "degenerate UV column should write the zero sentinel; got {t:?}"
+            );
+        }
+    }
+
+    /// Plan 0024 regression: UV-sphere pole vertex (where many
+    /// triangles fan around one shared UV coordinate, contributing
+    /// radial tangents that cancel) must produce the zero-tangent
+    /// sentinel. The WGSL shader's `apply_normal_map` reads the
+    /// sentinel and skips normal-map perturbation, eliminating the
+    /// chess-pawn dark-patch artifact.
+    ///
+    /// The geometry mimics the cap of a real UV-sphere with the
+    /// seam handled the canonical way: the rim vertex at θ=0 is
+    /// duplicated with s=0 and s=1 so the fan triangles cover the
+    /// whole circle without a UV discontinuity inside any triangle.
+    /// With four cardinal rim points + one seam duplicate, the
+    /// four per-triangle tangent contributions at the pole sum
+    /// exactly to zero.
+    #[test]
+    fn compute_tangents_emits_sentinel_at_uv_sphere_pole() {
+        let mut positions = vec![[0.0, 1.0, 0.0]]; // pole
+        let mut normals = vec![[0.0, 1.0, 0.0]];
+        let mut uvs = vec![[0.5, 1.0]];
+        // Four cardinal rim points + one seam duplicate at θ=0 with s=1.
+        let rim = [
+            ([1.0_f32, 0.0, 0.0], [0.0_f32, 0.0]),
+            ([0.0, 0.0, 1.0], [0.25, 0.0]),
+            ([-1.0, 0.0, 0.0], [0.5, 0.0]),
+            ([0.0, 0.0, -1.0], [0.75, 0.0]),
+            ([1.0, 0.0, 0.0], [1.0, 0.0]), // seam duplicate
+        ];
+        for (p, uv) in &rim {
+            positions.push(*p);
+            normals.push([0.0, 1.0, 0.0]);
+            uvs.push(*uv);
+        }
+        let mut indices = Vec::new();
+        for k in 1..rim.len() {
+            // pole + rim_{k} + rim_{k+1}, sweeping the circle.
+            indices.push(0);
+            indices.push(k as u32);
+            indices.push((k + 1) as u32);
+        }
+        let tangents = compute_tangents(&positions, &normals, &uvs, &indices);
+        let pole = tangents[0];
+        let pole_len2 = pole[0] * pole[0] + pole[1] * pole[1] + pole[2] * pole[2];
+        assert!(
+            pole_len2 < 1e-12,
+            "UV-sphere pole tangent should be the zero sentinel; got {pole:?} (|t|² = {pole_len2})"
+        );
+        // Rim vertices have well-defined non-cancelling tangent
+        // contributions, so they should be unit-length and NOT the
+        // sentinel.
+        for (i, t) in tangents.iter().enumerate().skip(1) {
+            let len2 = t[0] * t[0] + t[1] * t[1] + t[2] * t[2];
+            assert!(
+                (len2 - 1.0).abs() < 1e-3,
+                "rim vertex {i} should carry a unit tangent; |t|² = {len2}"
+            );
         }
     }
 

@@ -551,7 +551,19 @@ fn apply_normal_map(mat: Material, tri: u32, bary: vec2<f32>, normal: vec3<f32>,
     );
     let tbn = interpolated_tbn(tri, bary, normal);
     let world = tbn.tangent * ts.x + tbn.bitangent * ts.y + tbn.normal * ts.z;
-    return normalize(world);
+    let perturbed = normalize(world);
+    // Plan 0024 fix: `compute_tangents` writes a zero-length tangent
+    // sentinel at UV poles where the radial tangent sum cancels.
+    // Smooth-fade the perturbed normal back to the geometric normal
+    // as the interpolated tangent magnitude collapses toward the
+    // pole. Hard threshold either pinholes (too tight — visible
+    // dark spot at the pole) or flattens whole pole-fan triangles
+    // (too loose — pawn marble looks like low-poly plastic). The
+    // smoothstep handles a wide range of fan triangle geometries.
+    let raw_t = vertex_tangent(tri, bary);
+    let t_len = length(raw_t.xyz);
+    let blend = smoothstep(0.005, 0.04, t_len);
+    return normalize(mix(normal, perturbed, blend));
 }
 
 // PT-mr-map: per-texel roughness + metallic, glTF 2.0 convention.

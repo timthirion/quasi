@@ -98,8 +98,68 @@ Framing chosen from a 4-variation smoke pass at 384²/128 spp:
   gitignored)
 * This plan moves to `Status: completed`
 
+## Findings
+
+### UV-pole tangent-space collapse (post-ship bug)
+
+The chess hero shipped without an adversarial render review,
+and the user caught a same-location dark patch on every white
+pawn's top and bottom and a smaller one on each bishop's
+crown. Root cause: Khronos ABeautifulGame ships only
+`POSITION / NORMAL / TEXCOORD_0` — **no `TANGENT`** — so the
+ingest path falls back to `compute_tangents`. At UV-sphere
+poles where many radial triangles converge, the accumulated
+tangent contributions cancel to ~zero. The old
+`orthonormalize_tangent` then inflated the zero accumulator
+to an arbitrary unit-length axis, the WGSL barycentric blend
+inherited that axis as a unit-length but UV-meaningless
+tangent, and the normal-map sample at the pole rotated the
+shading normal through a meaningless direction. Shared mesh
++ shared UV-pole pixel → identical defect on every instance.
+
+Fix is two-sided:
+
+* `pathtrace::mesh::compute_tangents` writes a zero-length
+  sentinel `[0,0,0,0]` when the projected accumulator
+  collapses (length² < 1e-12), instead of inflating to the
+  fallback axis. New unit test
+  `compute_tangents_emits_sentinel_at_uv_sphere_pole` pins
+  the behaviour with a UV-sphere-cap test geometry.
+* WGSL `apply_normal_map` reads the interpolated raw
+  tangent magnitude and smoothstep-fades the perturbed
+  normal back to the geometric normal over
+  `t_len ∈ [0.005, 0.04]`. Smooth fade avoids both the
+  pinhole-too-tight failure (visible dark or bright dot at
+  the pole) and the flatten-whole-triangle-too-loose
+  failure (pole-fan triangles read as faceted plastic).
+  Tuned by a `render-attacker` / `render-defender` pair on
+  the close-up pawn renders.
+* glTF-`TANGENT` ingest also propagates the sentinel when
+  the supplied tangent is itself near-zero (defensive — the
+  spec doesn't forbid degenerate suppliers).
+
+The agent-tooling gap that allowed the bug to ship: the
+`render-attacker` agent was defined for pair-mode (old vs
+new of the same scene). A first render of a new scene has
+no baseline, so pair-mode didn't apply, and I didn't invoke
+it. The agent definition has been updated to spell out a
+**single-image mode** ("attack the render alone for same-
+location patterns across instances, pole patches, seams,
+fireflies, banding") and "first render of a new scene" is
+called out as the canonical trigger.
+
 ## Followups
 
+* **PT-mikktspace** — the industry-standard fix for UV-pole
+  tangent-space is **per-face tangents** (mikktspace
+  convention) instead of per-vertex. Each triangle stores
+  three corner tangents derived from its own UV gradient;
+  no accumulation, no cancellation. Closes the smoothstep
+  fade hack and the residual sub-pixel pinhole both. Scope:
+  Vertex grows or we add a per-face-tangent buffer
+  (storage-buffer cap is at 8 already — would need a
+  repack). Deferred until a scene whose pole defects the
+  smoothstep doesn't hide demands it.
 * **PT-bistro** — Lumberyard Bistro as the real cafe
   target. Probably gated by an FBX→glTF converter and
   PT-instancing. Stays deferred until one of those
