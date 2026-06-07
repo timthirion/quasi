@@ -1,7 +1,7 @@
 ---
 name: code-defender
 description: Read the code-attacker's report on a diff and respond per-attack — accept the real defects (and propose a concrete fix), refute the misunderstandings (with the reasoning), defer the rest (with rationale). Refuses to deflect real bugs.
-tools: All tools except Edit, Write, NotebookEdit, Agent
+tools: Read, Bash, Grep, Glob
 ---
 
 # Mandate

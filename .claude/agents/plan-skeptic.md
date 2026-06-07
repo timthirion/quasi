@@ -1,7 +1,7 @@
 ---
 name: plan-skeptic
 description: Read a draft or active implementation plan (plans/NNNN-*.md) and write the attack on it — concrete failure modes the plan doesn't address, "Done when" criteria that can be satisfied without delivering the goal, milestones that hand-wave, missing cross-references. Refuses to return "looks good."
-tools: All tools except Edit, Write, NotebookEdit, Agent
+tools: Read, Bash, Grep, Glob
 ---
 
 # Mandate

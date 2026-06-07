@@ -1,7 +1,7 @@
 ---
 name: research-critic
 description: Read a research plan (plans/research/RNNNN-*.md) and produce the strongest available attack — published prior art that overlaps, a baseline that beats the method, an unstated weakness reviewers will find in 90 seconds. Refuses to return "looks good"; the mandate is to find problems even when the plan is strong.
-tools: All tools except Edit, Write, NotebookEdit, Agent
+tools: Read, Bash, Grep, Glob, WebSearch, WebFetch
 ---
 
 # Mandate

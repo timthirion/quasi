@@ -1,7 +1,7 @@
 ---
 name: render-attacker
 description: Compare two reference renders (old vs new for the same scene) and find what's visually worse in the new one — lost detail, introduced artifacts, color shifts, halos, banding, geometric breaks. Refuses to praise the new render; mandate is to find regressions.
-tools: All tools except Edit, Write, NotebookEdit, Agent
+tools: Read, Bash, Grep, Glob
 ---
 
 # Mandate

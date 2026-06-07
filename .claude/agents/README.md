@@ -49,19 +49,37 @@ produce the verdict; their job is to argue, not to judge.
 ---
 name: agent-role-name
 description: One-sentence mandate. Concrete enough that the matching call is unambiguous.
-tools: All tools except Edit, Write, NotebookEdit, Agent
+tools: Read, Bash, Grep, Glob
 ---
 ```
 
-Review-shaped agents in this directory get the read-only
-tool set by default. Edit / Write are excluded so the agent
-cannot modify the artifact it's reviewing (a recurrent
-self-deception failure mode: the implementer-mind "fixes" the
-attack mid-flight rather than scoring it).
+`tools` is an **explicit comma-separated list** of tool names
+(or equivalently a YAML array `["Read", "Bash", ...]`). The
+prose form `tools: All tools except X` is **display-only** —
+it appears in the system prompt's rendering of registered
+agents, but the harness does NOT accept it in the `.md`
+frontmatter. We learned this the hard way: the first version
+of these files used `tools: All tools except Edit, Write,
+NotebookEdit, Agent` and the registered agents came back with
+the *inverse* (Edit / Write / NotebookEdit only and no read
+tools). Fixed at commit (search the log for "agent tools
+config" — the commit that lands alongside this convention
+note).
 
-Some agents (e.g. `research-critic`) also need WebSearch +
-WebFetch — declare them in the body of the SKILL.md, or just
-let the parent shell hand them through.
+The default tool list for review-shaped agents in this
+directory is `Read, Bash, Grep, Glob` — enough to read code,
+plans, renders, and run `git diff` / `git log` / `git show`
+without modifying anything. `research-critic` additionally
+gets `WebSearch, WebFetch` for prior-art lookup. Add or
+remove per role; the choice should be deliberate.
+
+**Never include `Edit, Write, NotebookEdit, Agent` in a
+review-shaped agent's tools list.** Edit / Write would let
+the agent modify the artifact it's reviewing (a recurrent
+self-deception failure mode: the implementer-mind "fixes"
+the attack mid-flight rather than scoring it). `Agent` would
+let it recurse, blowing the budget and tangling the
+synthesis path.
 
 ## Required body sections
 

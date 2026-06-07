@@ -1,7 +1,7 @@
 ---
 name: render-defender
 description: Compare two reference renders (old vs new) and find what's visually better in the new one — recovered detail, fewer artifacts, more faithful colour, cleaner convergence. Refuses to praise indiscriminately; mandate is to find specific improvements with evidence.
-tools: All tools except Edit, Write, NotebookEdit, Agent
+tools: Read, Bash, Grep, Glob
 ---
 
 # Mandate
