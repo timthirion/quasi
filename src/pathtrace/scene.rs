@@ -72,8 +72,8 @@ pub struct GpuMaterial {
 /// out of a uniform buffer in T1. Triangle geometry and materials live
 /// in storage buffers bound alongside this uniform.
 ///
-/// Layout: 96 bytes (camera 48 + 12 × u32 = 96). Must match `Uniforms`
-/// in `pathtrace.wgsl` byte-for-byte.
+/// Layout: 128 bytes. Must match `Uniforms` in `pathtrace.wgsl`
+/// byte-for-byte.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct Uniforms {
@@ -119,6 +119,19 @@ pub struct Uniforms {
     /// 16-byte alignment pad after the two power scalars.
     pub _pad_pick0: u32,
     pub _pad_pick1: u32,
+    /// PT-sun-light (plan 0023): delta-distribution directional sun.
+    /// `xyz` is the unit vector pointing **toward** the sun (the
+    /// incoming-light direction); `w` is the enabled flag (1.0 to
+    /// include in NEE, 0.0 to skip — bit-identical with pre-plan
+    /// when 0). Combines additively with env + triangle NEE; does
+    /// not participate in the Bernoulli env-vs-triangle pick (it's
+    /// a delta light, no PDF to weight against).
+    pub sun_dir: [f32; 4],
+    /// PT-sun-light (plan 0023): emitted radiance per steradian,
+    /// linear, can exceed 1.0 (real sun is ~1.6 × 10⁹ W/m²/sr but
+    /// we work in arbitrary linear units that the tonemap normalises).
+    /// `w` is padding.
+    pub sun_color: [f32; 4],
 }
 
 /// CPU description of the Cornell Box.
@@ -291,7 +304,9 @@ mod tests {
         // PT-env grew Uniforms by 4 × u32 (has_environment, env_width,
         // env_height, pad) — 80 → 96 bytes. PT-light-vs-env added
         // env_total_power + triangle_total_power + 2 pads → 112 bytes.
-        assert_eq!(size_of::<Uniforms>(), 112);
+        // PT-sun-light (plan 0023) added two `vec4<f32>` fields
+        // (sun_dir + sun_color) → 144 bytes.
+        assert_eq!(size_of::<Uniforms>(), 144);
         assert_eq!(offset_of!(Uniforms, triangle_count), 48);
         assert_eq!(offset_of!(Uniforms, integrator_kind), 48 + 6 * 4);
         assert_eq!(offset_of!(Uniforms, use_bvh), 48 + 7 * 4);
@@ -300,6 +315,10 @@ mod tests {
         assert_eq!(offset_of!(Uniforms, env_height), 48 + 10 * 4);
         assert_eq!(offset_of!(Uniforms, env_total_power), 48 + 12 * 4);
         assert_eq!(offset_of!(Uniforms, triangle_total_power), 48 + 13 * 4);
+        // PT-sun-light: sun_dir at byte 112, sun_color at byte 128
+        // (each is 16 bytes / vec4<f32>).
+        assert_eq!(offset_of!(Uniforms, sun_dir), 112);
+        assert_eq!(offset_of!(Uniforms, sun_color), 128);
     }
 
     #[test]

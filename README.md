@@ -23,8 +23,8 @@
       <br><sub><b>PT-fog</b> — Cornell room filled with homogeneous fog, light scattering off particles in the room, soft halo around the ceiling light.</sub>
     </td>
     <td align="center">
-      <img src="data/output/sponza_reference.png" width="360" alt="Crytek Sponza atrium">
-      <br><sub><b>PT-sponza-baseline</b> — Crytek Sponza (~262K triangles, 68 PBR textures) lit entirely by an HDR equirectangular sky entering through the open oculus above. First scene at Quasi's complex-geometry tier; first plan toward published-quality renders of architectural assets.</sub>
+      <img src="data/output/sponza_sunlit_reference.png" width="360" alt="Crytek Sponza atrium with direct sunlight">
+      <br><sub><b>PT-sun-light</b> — Crytek Sponza (~262K triangles, 68 PBR textures) under HDR sky + a delta-distribution directional sun streaming through the oculus. Banners pop in saturated reds, blues, greens, and golds; the marble floor catches a hard-edged sun pool along the atrium's long axis. 1024×768 / 2048 spp.</sub>
     </td>
   </tr>
 </table>

@@ -83,6 +83,15 @@ pub struct RenderConfig {
     pub camera_dir: [f32; 3],
     pub camera_up: [f32; 3],
     pub fov: f32,
+    /// PT-sun-light (plan 0023): optional delta-distribution
+    /// directional sun. Unit vector points TOWARD the sun (so
+    /// surface normals with positive dot product see the sun).
+    /// `None` keeps the sun disabled — bit-identical with pre-plan.
+    pub sun_dir: Option<[f32; 3]>,
+    /// PT-sun-light: emitted radiance per steradian, linear units.
+    /// Defaults to `[1, 1, 1]` when `sun_dir` is set; override for
+    /// warmer / cooler suns or stronger intensity.
+    pub sun_color: [f32; 3],
 }
 
 impl Default for RenderConfig {
@@ -100,6 +109,8 @@ impl Default for RenderConfig {
             camera_dir: [0.0, 0.0, -1.0],
             camera_up: [0.0, 1.0, 0.0],
             fov: 40.0,
+            sun_dir: None,
+            sun_color: [1.0, 1.0, 1.0],
         }
     }
 }
@@ -239,6 +250,17 @@ async fn render_offscreen_async(
     // PT-light-vs-env: surface the triangle total power up front
     // (env total power lands after `build_scene_buffers_*` below).
     uniforms.triangle_total_power = scene_data.triangle_total_power;
+
+    // PT-sun-light (plan 0023): pack the delta sun. `sun_dir.w` is
+    // the on/off flag (1.0 to include in NEE). `None` → all zeros,
+    // bit-identical with pre-plan.
+    if let Some(dir) = cfg.sun_dir {
+        let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2])
+            .sqrt()
+            .max(1e-6);
+        uniforms.sun_dir = [dir[0] / len, dir[1] / len, dir[2] / len, 1.0];
+        uniforms.sun_color = [cfg.sun_color[0], cfg.sun_color[1], cfg.sun_color[2], 0.0];
+    }
 
     let scene_buffers = match (cloud_grid, env_map) {
         (Some(g), None) => {

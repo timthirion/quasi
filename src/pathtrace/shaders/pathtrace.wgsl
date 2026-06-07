@@ -132,6 +132,15 @@ struct Uniforms {
     triangle_total_power: f32,
     _pad_pick0: u32,
     _pad_pick1: u32,
+    // PT-sun-light (plan 0023): delta-distribution directional sun.
+    // `xyz` is the unit vector pointing TOWARD the sun (the
+    // incoming-light direction at any surface). `w` is the enabled
+    // flag (>0.5 → on). Combines additively with env + triangle NEE;
+    // no PDF / no MIS (it's a delta).
+    sun_dir: vec4<f32>,
+    // PT-sun-light: emitted radiance per steradian, linear units.
+    // `w` is padding.
+    sun_color: vec4<f32>,
 };
 
 struct BvhNode {
@@ -2165,6 +2174,29 @@ fn path_trace(ray_in: Ray, s: ptr<function, SamplerState>) -> Sample {
                             }
                         }
                     }
+                }
+            }
+        }
+
+        // PT-sun-light (plan 0023): delta-distribution directional
+        // sun. Additive to env + triangle NEE. No PDF (delta), no
+        // MIS weight — BSDF sampling has zero probability of
+        // landing exactly on the sun direction. Skipped in pure-
+        // BSDF mode for the same reason the env+triangle NEE
+        // above is skipped: pure-BSDF integrator is a verification
+        // path, not a delivery path.
+        if (mis_nee_mode && U.sun_dir.w > 0.5) {
+            let sun_wi = U.sun_dir.xyz;
+            let cos_sun = dot(hit.normal, sun_wi);
+            if (cos_sun > 0.0) {
+                let shadow_o = hit.point + hit.normal * 0.001;
+                let trans = shadow_transmittance(
+                    shadow_o, sun_wi, 1e10, current_medium, s);
+                let trans_sum = trans.x + trans.y + trans.z;
+                if (trans_sum > 0.0) {
+                    let f = eval_bsdf(m, albedo, hit.normal, wo_dir, sun_wi);
+                    result.radiance = result.radiance
+                        + throughput * trans * f * cos_sun * U.sun_color.xyz;
                 }
             }
         }

@@ -96,6 +96,19 @@ struct RenderArgs {
     look_at: Option<[f32; 3]>,
     /// `--fov degrees` overrides the camera vertical FOV.
     fov: Option<f32>,
+    /// `--sun-dir x,y,z` (PT-sun-light, plan 0023) enables a delta-
+    /// distribution directional sun. The vector is interpreted as
+    /// pointing TOWARD the sun (i.e. surface normals with positive
+    /// dot product are sun-facing). Disabled when None.
+    sun_dir: Option<[f32; 3]>,
+    /// `--sun-color r,g,b` (PT-sun-light) sets the sun's emitted
+    /// radiance per steradian. Linear, can exceed 1.0. Defaults to
+    /// white (1,1,1) when `--sun-dir` is provided.
+    sun_color: [f32; 3],
+    /// `--sun-intensity I` (PT-sun-light) is a scalar multiplier on
+    /// `--sun-color`. Defaults to 1.0. Common values: 1-3 for soft
+    /// ambient, 5-30 for strong direct sun, 50+ for blown-out sky.
+    sun_intensity: f32,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -116,6 +129,9 @@ impl Default for RenderArgs {
             camera_pos: None,
             look_at: None,
             fov: None,
+            sun_dir: None,
+            sun_color: [1.0, 1.0, 1.0],
+            sun_intensity: 1.0,
         }
     }
 }
@@ -216,6 +232,24 @@ fn parse_render_args(args: &[String]) -> Result<RenderArgs, String> {
                     .ok_or_else(|| "--fov needs a number".to_string())?;
                 r.fov = Some(v.parse().map_err(|e| format!("--fov: {e}"))?);
             }
+            "--sun-dir" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| "--sun-dir needs x,y,z".to_string())?;
+                r.sun_dir = Some(parse_vec3(v).map_err(|e| format!("--sun-dir: {e}"))?);
+            }
+            "--sun-color" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| "--sun-color needs r,g,b".to_string())?;
+                r.sun_color = parse_vec3(v).map_err(|e| format!("--sun-color: {e}"))?;
+            }
+            "--sun-intensity" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| "--sun-intensity needs a number".to_string())?;
+                r.sun_intensity = v.parse().map_err(|e| format!("--sun-intensity: {e}"))?;
+            }
             "--help" | "-?" => {
                 println!(
                     "render options:\n\
@@ -231,7 +265,13 @@ fn parse_render_args(args: &[String]) -> Result<RenderArgs, String> {
                      \t--env-map PATH      attach a Radiance .hdr environment map\n\
                      \t--denoise           run the PT-denoise à-trous post-process; writes\n\
                      \t                    <out>_denoised.png alongside the raw PNG\n\
-                     \t--brute-force       skip the BVH and linear-scan triangles (verification)"
+                     \t--brute-force       skip the BVH and linear-scan triangles (verification)\n\
+                     \t--camera-pos x,y,z  override camera origin\n\
+                     \t--look-at x,y,z     override camera target (combine with --camera-pos)\n\
+                     \t--fov degrees       override vertical FOV\n\
+                     \t--sun-dir x,y,z     enable delta-distribution sun (vector toward sun)\n\
+                     \t--sun-color r,g,b   sun radiance per steradian (default 1,1,1)\n\
+                     \t--sun-intensity I   scalar multiplier on --sun-color (default 1.0)"
                 );
                 std::process::exit(0);
             }
@@ -269,6 +309,14 @@ fn run_render(args: &[String]) {
     }
     if let Some(f) = cli.fov {
         cfg.fov = f;
+    }
+    if let Some(dir) = cli.sun_dir {
+        cfg.sun_dir = Some(dir);
+        cfg.sun_color = [
+            cli.sun_color[0] * cli.sun_intensity,
+            cli.sun_color[1] * cli.sun_intensity,
+            cli.sun_color[2] * cli.sun_intensity,
+        ];
     }
     log::info!(
         "rendering {}x{} @ {} spp ({:?} / {:?})",
