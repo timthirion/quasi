@@ -20,6 +20,7 @@
 pub mod gpu;
 pub mod pathtrace;
 pub mod raster;
+pub mod util;
 
 // ---------------------------------------------------------------------------
 // Native: a single winit window + event loop, driving one of the two

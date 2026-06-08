@@ -144,7 +144,7 @@ fn create_aov_texture(
 /// the accumulated AOVs. Blocks the calling thread (intended for use
 /// from a CLI render command).
 pub fn render_offscreen(cfg: RenderConfig, scene: &TriangleScene) -> Aovs {
-    pollster::block_on(render_offscreen_async(cfg, scene, None, None))
+    pollster::block_on(render_offscreen_async(cfg, scene, None, None, None))
 }
 
 /// Same as [`render_offscreen`], but with a runtime-loaded cloud
@@ -154,7 +154,7 @@ pub fn render_offscreen_with_grid(
     scene: &TriangleScene,
     cloud_grid: Option<crate::pathtrace::grid::Grid3D>,
 ) -> Aovs {
-    pollster::block_on(render_offscreen_async(cfg, scene, cloud_grid, None))
+    pollster::block_on(render_offscreen_async(cfg, scene, cloud_grid, None, None))
 }
 
 /// Full offscreen entry: optional cloud grid + optional environment
@@ -166,7 +166,27 @@ pub fn render_offscreen_with_grid_and_env(
     cloud_grid: Option<crate::pathtrace::grid::Grid3D>,
     env_map: Option<crate::pathtrace::env::EnvironmentMap>,
 ) -> Aovs {
-    pollster::block_on(render_offscreen_async(cfg, scene, cloud_grid, env_map))
+    pollster::block_on(render_offscreen_async(
+        cfg, scene, cloud_grid, env_map, None,
+    ))
+}
+
+/// Like [`render_offscreen_with_grid_and_env`] but with an optional
+/// generic progress sink (see [`crate::util::progress`]). Pass a
+/// concrete sink for live CLI progress, or `None` for silent
+/// rendering. Used by the `render` CLI subcommand to draw the
+/// stderr progress bar; tests and examples use the bare entries
+/// above.
+pub fn render_offscreen_full(
+    cfg: RenderConfig,
+    scene: &TriangleScene,
+    cloud_grid: Option<crate::pathtrace::grid::Grid3D>,
+    env_map: Option<crate::pathtrace::env::EnvironmentMap>,
+    progress: Option<&mut dyn crate::util::progress::ProgressSink>,
+) -> Aovs {
+    pollster::block_on(render_offscreen_async(
+        cfg, scene, cloud_grid, env_map, progress,
+    ))
 }
 
 async fn render_offscreen_async(
@@ -174,6 +194,7 @@ async fn render_offscreen_async(
     scene_data: &TriangleScene,
     cloud_grid: Option<crate::pathtrace::grid::Grid3D>,
     env_map: Option<crate::pathtrace::env::EnvironmentMap>,
+    mut progress: Option<&mut dyn crate::util::progress::ProgressSink>,
 ) -> Aovs {
     assert!(
         cfg.width > 0 && cfg.height > 0,
@@ -347,6 +368,16 @@ async fn render_offscreen_async(
     let accumulate_bg = [make_accum_bg(0), make_accum_bg(1)];
 
     // --- Render loop ---
+    //
+    // Progress ticks live here. The submit calls below queue GPU
+    // work without blocking, so without a sync the entire loop body
+    // returns in microseconds and the progress bar would race to
+    // 100% before the GPU has done meaningful work. We block the
+    // CPU on a `device.poll(wait)` once every `sync_every` frames so
+    // the tick rate reflects actual rendered samples — at most 100
+    // sync points per render, which keeps the throughput cost in the
+    // noise on long jobs.
+    let sync_every = (cfg.samples / 100).max(1);
     let mut read_idx = 0usize;
     for frame in 0..cfg.samples {
         uniforms.frame_count = frame;
@@ -383,6 +414,23 @@ async fn render_offscreen_async(
         );
         queue.submit(std::iter::once(encoder.finish()));
         read_idx = dst;
+
+        let last = frame + 1 == cfg.samples;
+        if let Some(p) = progress.as_mut() {
+            if (frame + 1) % sync_every == 0 || last {
+                // Block until the GPU has finished everything
+                // submitted so far. Without this the tick fires on
+                // submission, not completion, and the bar reaches
+                // 100% within milliseconds. The cost is ~1 sync per
+                // `sync_every` frames; amortised across a long
+                // render it's invisible.
+                let _ = device.poll(wgpu::PollType::wait_indefinitely());
+                p.tick((frame + 1) as u64, cfg.samples as u64);
+            }
+        }
+    }
+    if let Some(p) = progress.as_mut() {
+        p.finish();
     }
 
     // --- Readback ---

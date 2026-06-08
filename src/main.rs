@@ -25,7 +25,7 @@ use quasi::pathtrace::default_triangle_scene;
 #[cfg(not(target_arch = "wasm32"))]
 use quasi::pathtrace::integrator::IntegratorKind;
 #[cfg(not(target_arch = "wasm32"))]
-use quasi::pathtrace::offscreen::{render_offscreen_with_grid, RenderConfig};
+use quasi::pathtrace::offscreen::RenderConfig;
 #[cfg(not(target_arch = "wasm32"))]
 use quasi::pathtrace::output::write_render;
 #[cfg(not(target_arch = "wasm32"))]
@@ -376,13 +376,14 @@ fn run_render(args: &[String]) {
         log::info!("env map: {} × {}", env.width, env.height);
     }
     let start = std::time::Instant::now();
-    let aovs = if env_map.is_some() {
-        quasi::pathtrace::offscreen::render_offscreen_with_grid_and_env(
-            cfg, &scene, cloud_grid, env_map,
-        )
-    } else {
-        render_offscreen_with_grid(cfg, &scene, cloud_grid)
-    };
+    let mut bar = quasi::util::progress::Bar::new("render", "spp");
+    let aovs = quasi::pathtrace::offscreen::render_offscreen_full(
+        cfg,
+        &scene,
+        cloud_grid,
+        env_map,
+        Some(&mut bar),
+    );
     let render_dur = start.elapsed();
     log::info!(
         "render took {:.2}s ({} samples)",
