@@ -512,15 +512,104 @@ scheduler correctly tracks per-pixel convergence and the
 variance map is a real diagnostic deliverable. It's the
 "architectural choice forecloses the win" mode.
 
-**The fix is PT-adaptive-scout** (already listed in the
-follow-ups): a separate scout-sample population decides
-termination, an independent production-sample population
-forms the final estimate, and the two are statistically
-independent. Bias is decoupled from budget. This is the
-rigorous architecture the plan rev-3 named as "the
-correctly-unbiased option" but explicitly walked back from
-to ship the cheaper checkpoint version. The measurement now
-shipped *demands* the rigorous version.
+### Update — PT-adaptive-scout implementation + result
+
+The scout-and-produce architecture (originally listed as the
+"rigorous unbiased alternative the plan walked back from")
+was implemented as a **replacement** of the checkpoint
+scheme. The new architecture:
+
+* At the scout-phase boundary (`min_spp` samples), snapshot
+  the running radiance + mean_y2 accumulators to single-
+  buffer textures.
+* Run the one-shot termination compute pass to decide which
+  pixels converge.
+* **Clear** the live accumulators' radiance + mean_y2
+  channels via `LoadOp::Clear` render passes.
+* Reset the accumulate uniform's frame_count to 0; production
+  phase runs with the accumulate shader using `eff_frame =
+  production_frame_count` for the mix-weight so production
+  samples accumulate fresh.
+* At readback, per-pixel combine: `mask == 0` (converged) →
+  scout snapshot; `mask != 0` (active/clamped) → live
+  accumulator (production-only, unbiased).
+
+This **is** the rigorous unbiased scout-and-produce
+architecture. The measurement after implementing it:
+
+**Cornell glass-bunny @ threshold 0.01:**
+
+| max-spp | adapt-spp | fixed-spp | fixed RMSE | adaptive RMSE | ratio |
+| ------- | --------- | --------- | ---------- | ------------- | ----- |
+| 256     | 256       | 254       | 0.020962   | 0.024327      | 1.161 |
+| 1024    | 1024      | 1013      | 0.009787   | 0.010117      | 1.034 |
+| 2048    | 2048      | 2024      | 0.006323   | 0.006376      | 1.008 |
+
+**Sponza @ threshold 0.01:**
+
+| max-spp | adapt-spp | fixed-spp | fixed RMSE | adaptive RMSE | ratio |
+| ------- | --------- | --------- | ---------- | ------------- | ----- |
+| 128     | 128       | 124       | 0.007445   | 0.010032      | 1.347 |
+| 512     | 512       | 480       | 0.004743   | 0.005101      | 1.075 |
+| 1024    | 1024      | 954       | 0.004160   | 0.004472      | 1.075 |
+
+**Scout-and-produce loses harder than checkpoint at low
+budget**, ties or slightly loses at high budget. The
+rev-3 Done-when (ratio ≤ 0.7) is **still not met**.
+
+### The mathematical reason this architecture also doesn't win
+
+Scout-and-produce is **provably unbiased**, but it discards
+the scout samples from the active-pixel final estimate. So
+active pixels' final mean is computed from only `cfg.samples
+- min_spp` samples, while fixed-spp at the equivalent total
+budget gives every pixel `~cfg.samples` samples each. Adaptive
+hands fixed-spp a 25%+ per-pixel sample advantage at low spp.
+
+For scout-and-produce to win at equal sample budget, the
+bias eliminated by discarding scout samples would have to
+exceed the variance added by having ~25% fewer samples. On
+Cornell / Sponza pixel classes (most pixels are
+moderately-noisy, neither caustic-extreme nor sun-pool-flat),
+the bias was already small and the variance cost dominates.
+
+### What architecture would actually win
+
+The literature's "scout-and-produce gives 1.5–3× win" claim
+assumes **variable-frame-count adaptive sampling**: the
+render runs for as many frames as needed to either exhaust
+a global sample budget or hit max-spp on the worst-case
+pixel, with each frame only sampling active pixels. Savings
+on converged pixels translate to MORE samples on active
+pixels (because the frame loop keeps running past where a
+fixed-spp render would stop). My implementation runs for
+exactly `cfg.samples` frames regardless of convergence, so
+the savings are lost — converged pixels' freed compute
+doesn't go anywhere useful.
+
+The variable-frame-count restructure is **PT-adaptive-budget-driven**
+(new followup added to the list). It would require:
+* A target-total-samples parameter instead of per-pixel max.
+* A loop that continues until budget exhausted *and* hits
+  the per-active-pixel max-spp ceiling.
+* Per-frame active-pixel count tracking so the loop knows
+  when to stop.
+
+Given two architectures (checkpoint, scout-and-produce) shipped
+and neither meeting the rev-3 Done-when, the next move is
+either:
+* Implement the budget-driven control structure and re-measure;
+* Conclude the plan's "1.5-3× win" was overclaimed for the
+  scenes in the test set, accept the variance map as the
+  real shipped deliverable, and update the plan's
+  expectations.
+
+The next-followup decision lives outside this Findings
+section. What this section documents: **the scheduler is
+architecturally correct, two control structures have been
+measured, neither delivers the promised win at equal-sample-
+budget on Cornell or Sponza, and the structural reason is
+now clear.**
 
 What the measurement *does* validate:
 * The scheduler doesn't produce visually wrong images.
@@ -605,3 +694,12 @@ What this milestone does **not** deliver:
   to the WGSL `init_sampler` call so K-seed multi-run
   averages are possible. Required by the bias-decay
   sub-check.
+* **PT-adaptive-budget-driven** — restructure the render loop
+  to be budget-driven instead of frame-count-driven. Run
+  frames until either total-samples budget exhausted or
+  per-active-pixel max-spp reached. Allows the literature's
+  "scout-and-produce wins at equal-budget" claim to
+  potentially be realized — savings on converged pixels go
+  toward extra samples on active pixels, instead of being
+  lost. Both currently-shipped schedulers (checkpoint and
+  scout-and-produce) leave this on the table.

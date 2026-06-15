@@ -435,7 +435,8 @@ async fn render_offscreen_async(
         format: wgpu::TextureFormat::R32Uint,
         usage: wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::STORAGE_BINDING
-            | wgpu::TextureUsages::COPY_DST,
+            | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
     let active_mask_view = active_mask_texture.create_view(&Default::default());
@@ -462,6 +463,35 @@ async fn render_offscreen_async(
             },
         );
     }
+
+    // PT-adaptive-scout: scout-result snapshot textures. At the
+    // scout-phase boundary (frame == min_spp), the running radiance
+    // + mean_y2 accumulators are copied into these. The production
+    // phase then resets the live accumulator to 0 and accumulates
+    // fresh production-only samples; converged pixels' final
+    // radiance/mean_y2 come from these snapshots, active pixels'
+    // come from the production accumulator. This decouples
+    // termination bias from the final estimate.
+    let make_snapshot = |label: &str| {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width: cfg.width,
+                height: cfg.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: OFFSCREEN_FORMAT,
+            usage: wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+    };
+    let scout_radiance_snapshot = make_snapshot("scout-snap-radiance");
+    let scout_mean_y2_snapshot = make_snapshot("scout-snap-mean-y2");
 
     // PT-adaptive-sample-count: per-pixel sample-count storage
     // texture. Initialized to `cfg.samples` so that the fixed-spp
@@ -729,25 +759,45 @@ async fn render_offscreen_async(
     // sync points per render, which keeps the throughput cost in the
     // noise on long jobs.
     let sync_every = (cfg.samples / 100).max(1);
-    // PT-adaptive (plan 0028): checkpoint every 64 samples once
-    // `min_spp` is reached. At each checkpoint the CPU reads back the
-    // running radiance + mean_y2, derives per-pixel relative standard
-    // error, and uploads an updated active-mask texture. With
-    // `cfg.adaptive.is_none()` the entire branch is skipped — the
-    // shader's `adaptive_enabled` flag also stays 0, so the per-frame
-    // cost is exactly pre-plan.
-    const CHECKPOINT_INTERVAL: u32 = 64;
+
+    // PT-adaptive-scout (architectural replacement of the rev-3
+    // checkpoint-with-decay scheme): runs a **single** termination
+    // decision at the scout-phase boundary (`min_spp` samples), then
+    // switches to a fresh production accumulator so the final
+    // estimate for active pixels comes from samples drawn
+    // independently of the stopping rule. Converged pixels' final
+    // estimate comes from the scout snapshot taken at the boundary.
+    //
+    // The measured architectural finding (plan 0028 Findings):
+    // checkpoint-with-decay couldn't deliver the rev-3 win because
+    // the same samples that decided "converged" became the locked
+    // estimate. Scout-and-produce decouples the two.
+    //
+    // With `cfg.adaptive.is_none()` everything below is a no-op —
+    // `scout_boundary` is `u32::MAX` so the boundary never trips.
     let accum_adaptive_flag: u32 = u32::from(cfg.adaptive.is_some());
+    let scout_boundary: u32 = cfg.adaptive.map(|a| a.min_spp).unwrap_or(u32::MAX);
+    let mut in_production = false;
+    let mut production_frame_count: u32 = 0;
 
     let mut read_idx = 0usize;
     for frame in 0..cfg.samples {
         uniforms.frame_count = frame;
         queue.write_buffer(&uniform_buf, 0, bytemuck::bytes_of(&uniforms));
+        // PT-adaptive-scout: during the production phase, the
+        // accumulate shader's `frame_count` restarts from 0 so the
+        // mix-weight is right for fresh production samples (the
+        // scout-phase accumulator has been cleared).
+        let eff_frame_count = if in_production {
+            production_frame_count
+        } else {
+            frame
+        };
         queue.write_buffer(
             &accum_uniform_buf,
             0,
             bytemuck::bytes_of(&AccumUniform {
-                frame_count: frame,
+                frame_count: eff_frame_count,
                 adaptive_enabled: accum_adaptive_flag,
                 _pad: [0; 2],
             }),
@@ -777,41 +827,112 @@ async fn render_offscreen_async(
         queue.submit(std::iter::once(encoder.finish()));
         read_idx = dst;
 
-        // PT-adaptive (plan 0028): every CHECKPOINT_INTERVAL samples
-        // (after `min_spp` is reached), dispatch the mask-update
-        // compute pass to mark converged / clamped pixels. The
-        // shader reads the current accumulators (which now hold the
-        // post-frame-`frame` running mean) via `accum_views[read_idx]`
-        // and updates `active_mask_texture` in place.
-        if let Some(adapt) = cfg.adaptive {
-            let n = frame + 1;
+        if in_production {
+            production_frame_count += 1;
+        }
+
+        // PT-adaptive-scout: at frame + 1 == scout_boundary, the
+        // current accumulator (at `accum_textures[read_idx]`) holds
+        // the running mean of the first `scout_boundary` samples —
+        // this *is* the scout mean. Copy it to the snapshot, run
+        // the one-shot termination compute pass to mark converged
+        // pixels, then clear the live accumulator's radiance +
+        // mean_y2 channels so production samples start fresh.
+        if let Some(adapt) = cfg.adaptive.filter(|_| frame + 1 == scout_boundary) {
             let max_spp_eff = adapt.max_spp.min(cfg.samples);
-            if n >= adapt.min_spp && n.is_multiple_of(CHECKPOINT_INTERVAL) {
-                let mask_u = MaskUniform {
-                    sample_count: n,
-                    min_spp: adapt.min_spp,
-                    max_spp: max_spp_eff,
-                    _pad: 0,
-                    noise_threshold: adapt.noise_threshold,
-                    eps_dark: 0.001,
-                    _pad2: 0.0,
-                    _pad3: 0.0,
-                };
-                queue.write_buffer(&mask_uniform_buf, 0, bytemuck::bytes_of(&mask_u));
-                let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("offscreen-mask-update"),
-                });
-                {
-                    let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("offscreen-mask-compute"),
-                        timestamp_writes: None,
-                    });
-                    cp.set_pipeline(&mask_pipeline);
-                    cp.set_bind_group(0, &mask_bg[read_idx], &[]);
-                    cp.dispatch_workgroups(cfg.width.div_ceil(8), cfg.height.div_ceil(8), 1);
-                }
-                queue.submit(std::iter::once(enc.finish()));
+
+            // 1. Snapshot scout radiance + mean_y2 (whole frame).
+            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("scout-snapshot-and-decide"),
+            });
+            for (snap, aov) in [
+                (&scout_radiance_snapshot, AOV_RADIANCE),
+                (&scout_mean_y2_snapshot, AOV_MEAN_Y2),
+            ] {
+                enc.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &accum_textures[read_idx][aov],
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: snap,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: cfg.width,
+                        height: cfg.height,
+                        depth_or_array_layers: 1,
+                    },
+                );
             }
+            queue.submit(std::iter::once(enc.finish()));
+
+            // 2. One-shot mask-update compute pass: decides
+            //    convergence from the scout accumulator, writes the
+            //    per-pixel sample count for everyone (= scout_boundary
+            //    for now; CPU fixes up active pixels at readback).
+            let mask_u = MaskUniform {
+                sample_count: scout_boundary,
+                min_spp: adapt.min_spp,
+                max_spp: max_spp_eff,
+                _pad: 0,
+                noise_threshold: adapt.noise_threshold,
+                eps_dark: 0.001,
+                _pad2: 0.0,
+                _pad3: 0.0,
+            };
+            queue.write_buffer(&mask_uniform_buf, 0, bytemuck::bytes_of(&mask_u));
+            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("scout-decide-compute"),
+            });
+            {
+                let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("scout-mask-compute"),
+                    timestamp_writes: None,
+                });
+                cp.set_pipeline(&mask_pipeline);
+                cp.set_bind_group(0, &mask_bg[read_idx], &[]);
+                cp.dispatch_workgroups(cfg.width.div_ceil(8), cfg.height.div_ceil(8), 1);
+            }
+            queue.submit(std::iter::once(enc.finish()));
+
+            // 3. Clear the live accumulator's radiance + mean_y2
+            //    channels (slot `read_idx` — the one production's
+            //    next frame will read as `prev`). LoadOp::Clear via
+            //    a render-pass writes the whole texture to a fixed
+            //    value with no shader work. Other AOVs (albedo,
+            //    normal, depth) are left intact since the accumulate
+            //    shader's pass-through still uses them for the final
+            //    image's first-hit data.
+            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("scout-accum-clear"),
+            });
+            for aov in [AOV_RADIANCE, AOV_MEAN_Y2] {
+                enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("scout-accum-clear-pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &accum_views[read_idx][aov],
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    occlusion_query_set: None,
+                    timestamp_writes: None,
+                    multiview_mask: None,
+                });
+            }
+            queue.submit(std::iter::once(enc.finish()));
+
+            in_production = true;
+            production_frame_count = 0;
         }
 
         let last = frame + 1 == cfg.samples;
@@ -867,6 +988,32 @@ async fn render_offscreen_async(
         mapped_at_creation: false,
     });
 
+    // PT-adaptive-scout: separate staging buffers for the scout
+    // snapshots (Rgba32Float, same stride as the AOVs) + the
+    // active mask (R32Uint, same stride as sample_count) so we can
+    // combine on CPU: converged pixels (mask == 0) take their
+    // radiance + mean_y2 from the snapshot; active/clamped pixels
+    // take them from the live accumulator (which has been
+    // accumulating unbiased production-only samples).
+    let scout_radiance_staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("staging-scout-radiance"),
+        size: buffer_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let scout_mean_y2_staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("staging-scout-mean-y2"),
+        size: buffer_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mask_staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("staging-active-mask"),
+        size: (sample_count_bpr as u64) * (cfg.height as u64),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("offscreen-readback"),
     });
@@ -914,15 +1061,69 @@ async fn render_offscreen_async(
             depth_or_array_layers: 1,
         },
     );
+    // PT-adaptive-scout: also copy scout snapshots + active mask.
+    for (tex, buf) in [
+        (&scout_radiance_snapshot, &scout_radiance_staging),
+        (&scout_mean_y2_snapshot, &scout_mean_y2_staging),
+    ] {
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(cfg.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: cfg.width,
+                height: cfg.height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &active_mask_texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &mask_staging,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(sample_count_bpr),
+                rows_per_image: Some(cfg.height),
+            },
+        },
+        wgpu::Extent3d {
+            width: cfg.width,
+            height: cfg.height,
+            depth_or_array_layers: 1,
+        },
+    );
     queue.submit(std::iter::once(encoder.finish()));
 
     for buf in &staging {
         buf.slice(..)
             .map_async(wgpu::MapMode::Read, |r| r.expect("map_async failed"));
     }
-    sample_count_staging
-        .slice(..)
-        .map_async(wgpu::MapMode::Read, |r| r.expect("map_async failed"));
+    for buf in [
+        &sample_count_staging,
+        &scout_radiance_staging,
+        &scout_mean_y2_staging,
+        &mask_staging,
+    ] {
+        buf.slice(..)
+            .map_async(wgpu::MapMode::Read, |r| r.expect("map_async failed"));
+    }
     device
         .poll(wgpu::PollType::wait_indefinitely())
         .expect("device.poll failed");
@@ -943,16 +1144,18 @@ async fn render_offscreen_async(
         out
     };
 
-    let radiance = read_aov(&staging[AOV_RADIANCE]);
+    let mut radiance = read_aov(&staging[AOV_RADIANCE]);
     let albedo = read_aov(&staging[AOV_ALBEDO]);
     let normal = read_aov(&staging[AOV_NORMAL]);
     let depth = read_aov(&staging[AOV_DEPTH]);
-    let mean_y2 = read_aov(&staging[AOV_MEAN_Y2]);
+    let mut mean_y2 = read_aov(&staging[AOV_MEAN_Y2]);
+    let scout_radiance = read_aov(&scout_radiance_staging);
+    let scout_mean_y2 = read_aov(&scout_mean_y2_staging);
 
-    let sample_counts: Vec<u32> = {
+    let read_u32 = |buf: &wgpu::Buffer| -> Vec<u32> {
         let unpadded = (cfg.width * 4) as usize;
         let padded = sample_count_bpr as usize;
-        let raw = sample_count_staging.slice(..).get_mapped_range();
+        let raw = buf.slice(..).get_mapped_range();
         let mut out: Vec<u32> = Vec::with_capacity(cfg.width as usize * cfg.height as usize);
         for y in 0..cfg.height as usize {
             let start = y * padded;
@@ -961,9 +1164,38 @@ async fn render_offscreen_async(
             out.extend_from_slice(pixels);
         }
         drop(raw);
-        sample_count_staging.unmap();
+        buf.unmap();
         out
     };
+    let mut sample_counts = read_u32(&sample_count_staging);
+    let mask_data = read_u32(&mask_staging);
+
+    // PT-adaptive-scout combining: for pixels marked converged
+    // (mask == 0), the live accumulator's radiance + mean_y2 are
+    // zero (cleared at the scout boundary, then never written
+    // because the fragment shader discards converged pixels) —
+    // replace them with the scout snapshot. For pixels still
+    // active (mask == 1), the live accumulator holds the unbiased
+    // production-only mean; keep it. Sample counts are min_spp
+    // for converged (GPU shader wrote that value at the scout
+    // boundary) and `cfg.samples` for active pixels (CPU fixup
+    // since the production phase has no checkpoints).
+    if cfg.adaptive.is_some() {
+        for i in 0..radiance.len() {
+            if mask_data[i] == 0 {
+                // Converged at scout — snapshot is the final
+                // radiance + mean_y2. Sample count was written by
+                // the GPU compute pass at scout_boundary.
+                radiance[i] = scout_radiance[i];
+                mean_y2[i] = scout_mean_y2[i];
+            } else {
+                // Active or clamped — production accumulator
+                // already holds the right values; fix up the
+                // sample count to reflect the full run.
+                sample_counts[i] = cfg.samples;
+            }
+        }
+    }
 
     Aovs {
         width: cfg.width,
