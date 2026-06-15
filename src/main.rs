@@ -421,6 +421,7 @@ fn run_render(args: &[String]) {
             albedo: aovs.albedo.clone(),
             normal: aovs.normal.clone(),
             depth: aovs.depth.clone(),
+            mean_y2: aovs.mean_y2.clone(),
         };
         let mut denoise_out = cli.out.clone();
         let basename = denoise_out

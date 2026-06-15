@@ -68,6 +68,7 @@ fn main() {
         albedo: aovs.albedo.clone(),
         normal: aovs.normal.clone(),
         depth: aovs.depth.clone(),
+        mean_y2: aovs.mean_y2.clone(),
     };
     let denoised = aov_to_png(&denoised_aovs);
 

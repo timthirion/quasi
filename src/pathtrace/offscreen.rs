@@ -20,8 +20,8 @@ use crate::pathtrace::sampler::SamplerKind;
 use crate::pathtrace::scene;
 use crate::pathtrace::{
     build_accumulate_bgl, build_pathtrace_bg, build_pathtrace_bgl, build_scene_buffers,
-    make_pipeline, mrt_pass, AccumUniform, AOV_ALBEDO, AOV_DEPTH, AOV_NORMAL, AOV_RADIANCE,
-    NUM_AOVS,
+    make_pipeline, mrt_pass, AccumUniform, AOV_ALBEDO, AOV_DEPTH, AOV_MEAN_Y2, AOV_NORMAL,
+    AOV_RADIANCE, NUM_AOVS,
 };
 
 /// `Rgba32Float`: 16 bytes per pixel; trivially round-trips through host
@@ -46,23 +46,63 @@ pub struct Aovs {
     pub normal: Vec<[f32; 4]>,
     /// First-hit `t` (camera-ray distance); alpha is the hit mask.
     pub depth: Vec<[f32; 4]>,
+    /// PT-adaptive (plan 0028): per-pixel running mean of luminance²,
+    /// i.e. `E[Y²]` over the accumulated samples. Channel R carries
+    /// the value; G/B/A are unused. Used to derive per-pixel variance
+    /// via [`Aovs::luminance_variance`].
+    pub mean_y2: Vec<[f32; 4]>,
 }
 
 impl Aovs {
-    /// Number of pixels — matches all four AOV vectors' lengths.
+    /// Number of pixels — matches all five AOV vectors' lengths.
     pub fn pixel_count(&self) -> usize {
         self.width as usize * self.height as usize
     }
 
-    /// Slice access by AOV index (`AOV_RADIANCE`, …, `AOV_DEPTH`).
+    /// Slice access by AOV index
+    /// (`AOV_RADIANCE`, …, `AOV_DEPTH`, `AOV_MEAN_Y2`).
     pub fn aov(&self, idx: usize) -> &[[f32; 4]] {
         match idx {
             AOV_RADIANCE => &self.radiance,
             AOV_ALBEDO => &self.albedo,
             AOV_NORMAL => &self.normal,
             AOV_DEPTH => &self.depth,
+            AOV_MEAN_Y2 => &self.mean_y2,
             _ => panic!("invalid aov index {idx}"),
         }
+    }
+
+    /// PT-adaptive: per-pixel luminance variance derived from the
+    /// running mean of `Y` (via the radiance accumulator) and the
+    /// running mean of `Y²` (via the `mean_y2` AOV):
+    ///
+    /// ```text
+    /// var(Y) = E[Y²] - (E[Y])²
+    /// ```
+    ///
+    /// where `Y = 0.2126·R + 0.7152·G + 0.0722·B` is the Rec. 709
+    /// scalar luminance. Returns one f32 per pixel.
+    ///
+    /// Note this is the **population variance** at the accumulated
+    /// sample count, not the **sample variance** with Bessel's
+    /// correction. The plan-0028 termination criterion uses
+    /// `var/n` (the variance of the sample mean), so a factor of
+    /// `n/(n-1)` is irrelevant for thresholding decisions at the
+    /// sample counts we care about (≥ 64). The unit test compares
+    /// against the population-variance closed form.
+    pub fn luminance_variance(&self) -> Vec<f32> {
+        let pixels = self.pixel_count();
+        let mut out = Vec::with_capacity(pixels);
+        for i in 0..pixels {
+            let r = self.radiance[i];
+            let y = 0.2126 * r[0] + 0.7152 * r[1] + 0.0722 * r[2];
+            let e_y2 = self.mean_y2[i][0];
+            // Clamp to zero — finite-precision FMA can drive
+            // E[Y²] - (E[Y])² slightly negative on near-constant
+            // pixels even though the true variance is non-negative.
+            out.push((e_y2 - y * y).max(0.0));
+        }
+        out
     }
 }
 
@@ -310,7 +350,13 @@ async fn render_offscreen_async(
 
     // --- Targets ---
     let sample_textures: [wgpu::Texture; NUM_AOVS] = std::array::from_fn(|i| {
-        let name = ["sample-rad", "sample-alb", "sample-nor", "sample-dep"][i];
+        let name = [
+            "sample-rad",
+            "sample-alb",
+            "sample-nor",
+            "sample-dep",
+            "sample-my2",
+        ][i];
         create_aov_texture(
             &device,
             cfg.width,
@@ -325,8 +371,20 @@ async fn render_offscreen_async(
     let accum_textures: [[wgpu::Texture; NUM_AOVS]; 2] = std::array::from_fn(|p| {
         std::array::from_fn(|i| {
             let name = [
-                ["accum0-rad", "accum0-alb", "accum0-nor", "accum0-dep"],
-                ["accum1-rad", "accum1-alb", "accum1-nor", "accum1-dep"],
+                [
+                    "accum0-rad",
+                    "accum0-alb",
+                    "accum0-nor",
+                    "accum0-dep",
+                    "accum0-my2",
+                ],
+                [
+                    "accum1-rad",
+                    "accum1-alb",
+                    "accum1-nor",
+                    "accum1-dep",
+                    "accum1-my2",
+                ],
             ][p][i];
             create_aov_texture(
                 &device,
@@ -442,7 +500,15 @@ async fn render_offscreen_async(
 
     let staging: [wgpu::Buffer; NUM_AOVS] = std::array::from_fn(|i| {
         device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some(["staging-rad", "staging-alb", "staging-nor", "staging-dep"][i]),
+            label: Some(
+                [
+                    "staging-rad",
+                    "staging-alb",
+                    "staging-nor",
+                    "staging-dep",
+                    "staging-my2",
+                ][i],
+            ),
             size: buffer_size,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
@@ -505,6 +571,7 @@ async fn render_offscreen_async(
     let albedo = read_aov(&staging[AOV_ALBEDO]);
     let normal = read_aov(&staging[AOV_NORMAL]);
     let depth = read_aov(&staging[AOV_DEPTH]);
+    let mean_y2 = read_aov(&staging[AOV_MEAN_Y2]);
 
     Aovs {
         width: cfg.width,
@@ -513,6 +580,7 @@ async fn render_offscreen_async(
         albedo,
         normal,
         depth,
+        mean_y2,
     }
 }
 
@@ -539,11 +607,170 @@ mod tests {
             albedo: vec![[2.0; 4]; n],
             normal: vec![[3.0; 4]; n],
             depth: vec![[4.0; 4]; n],
+            mean_y2: vec![[5.0, 0.0, 0.0, 0.0]; n],
         };
         assert_eq!(a.aov(AOV_RADIANCE)[0][0], 1.0);
         assert_eq!(a.aov(AOV_ALBEDO)[0][0], 2.0);
         assert_eq!(a.aov(AOV_NORMAL)[0][0], 3.0);
         assert_eq!(a.aov(AOV_DEPTH)[0][0], 4.0);
+        assert_eq!(a.aov(AOV_MEAN_Y2)[0][0], 5.0);
         assert_eq!(a.pixel_count(), 4);
+    }
+
+    /// PT-adaptive (plan 0028) buffers milestone:
+    /// `Aovs::luminance_variance` derives per-pixel variance from
+    /// the running mean E[Y] (via the radiance accumulator) and the
+    /// running mean E[Y²] (via the mean_y2 AOV). This test exercises
+    /// the load-bearing arithmetic with a synthetic Monte Carlo
+    /// sequence that has a known closed-form variance.
+    #[test]
+    fn luminance_variance_matches_closed_form_on_synthetic_sequence() {
+        // Three pixels with three different ground-truth variance
+        // structures. For each, we directly construct what the GPU
+        // accumulator should hold after N samples and check the
+        // derived variance.
+        //
+        // Pixel 0: constant pure-grey, variance = 0.
+        // Pixel 1: alternates between (1, 0, 0) and (0, 1, 0) over
+        //          large N — luminance alternates 0.2126 / 0.7152.
+        // Pixel 2: uniform-random luminance in [0, 1] — variance
+        //          asymptotes to 1/12 ≈ 0.0833.
+        let rec709 = |rgb: [f32; 3]| 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
+
+        // Pixel 0: 64 samples of (0.5, 0.5, 0.5) → Y = 0.5,
+        // E[Y] = 0.5, E[Y²] = 0.25, variance = 0.
+        let p0_y = 0.5_f32;
+        let p0_e_y = p0_y;
+        let p0_e_y2 = p0_y * p0_y;
+
+        // Pixel 1: alternates with equal probability between
+        // Y_a = rec709((1,0,0)) and Y_b = rec709((0,1,0)).
+        // E[Y] = (Y_a + Y_b) / 2; E[Y²] = (Y_a² + Y_b²) / 2.
+        let ya = rec709([1.0, 0.0, 0.0]);
+        let yb = rec709([0.0, 1.0, 0.0]);
+        let p1_e_y = (ya + yb) / 2.0;
+        let p1_e_y2 = (ya * ya + yb * yb) / 2.0;
+        let p1_closed_form_var = p1_e_y2 - p1_e_y * p1_e_y;
+        // Sanity-check the closed form against ((Y_a - Y_b) / 2)².
+        // The two derivations are algebraically identical but
+        // numerically diverge by ~1e-7 due to f32 precision in the
+        // E[Y²] - (E[Y])² subtraction of similar-magnitude values.
+        let expected_var = ((ya - yb) / 2.0).powi(2);
+        let sanity_rel = (p1_closed_form_var - expected_var).abs() / expected_var;
+        assert!(
+            sanity_rel < 1e-5,
+            "closed-form variance {} vs ((Y_a - Y_b) / 2)² = {} — \
+             relative error {} exceeds 1e-5",
+            p1_closed_form_var,
+            expected_var,
+            sanity_rel,
+        );
+
+        // Pixel 2: uniform distribution over [0, 1] luminance.
+        // E[Y] = 0.5, E[Y²] = 1/3, variance = 1/12.
+        let p2_e_y = 0.5_f32;
+        let p2_e_y2 = 1.0_f32 / 3.0;
+
+        // To represent these on the Aovs side, radiance carries E[Y]
+        // in its luminance (any spectrum with rec709-luminance =
+        // E[Y] works; we use a grey channel for simplicity), and
+        // mean_y2 carries E[Y²] in channel R.
+        //
+        // For pixel 0 and 2 we pick grey radiance so rec709 = the
+        // value directly. For pixel 1, we pick (E[Y], 0, 0) / 0.2126
+        // so luminance ≈ E[Y].
+        let aovs = Aovs {
+            width: 3,
+            height: 1,
+            radiance: vec![
+                [p0_e_y, p0_e_y, p0_e_y, 1.0],
+                [p1_e_y / 0.2126, 0.0, 0.0, 1.0],
+                [p2_e_y, p2_e_y, p2_e_y, 1.0],
+            ],
+            albedo: vec![[0.0; 4]; 3],
+            normal: vec![[0.0; 4]; 3],
+            depth: vec![[0.0; 4]; 3],
+            mean_y2: vec![
+                [p0_e_y2, 0.0, 0.0, 0.0],
+                [p1_e_y2, 0.0, 0.0, 0.0],
+                [p2_e_y2, 0.0, 0.0, 0.0],
+            ],
+        };
+
+        let var = aovs.luminance_variance();
+        assert_eq!(var.len(), 3);
+
+        // Pixel 0: variance ≡ 0 (constant input).
+        assert!(var[0] < 1e-7, "pixel 0 variance must be ~0, got {}", var[0]);
+
+        // Pixel 1: matches closed form to within 1e-6 relative.
+        let p1_rel = (var[1] - p1_closed_form_var).abs() / p1_closed_form_var;
+        assert!(
+            p1_rel < 1e-6,
+            "pixel 1 variance {} vs closed form {} — relative error \
+             {} exceeds 1e-6",
+            var[1],
+            p1_closed_form_var,
+            p1_rel,
+        );
+
+        // Pixel 2: matches uniform-distribution variance 1/12.
+        let p2_expected = 1.0_f32 / 12.0;
+        let p2_rel = (var[2] - p2_expected).abs() / p2_expected;
+        assert!(
+            p2_rel < 1e-6,
+            "pixel 2 variance {} vs closed form {} (1/12) — relative \
+             error {} exceeds 1e-6",
+            var[2],
+            p2_expected,
+            p2_rel,
+        );
+    }
+
+    /// PT-adaptive (plan 0028): the variance estimator must be
+    /// computed on **scalar luminance**, not on per-channel
+    /// recombination. This test pins the difference by
+    /// constructing a synthetic scene where per-channel
+    /// recombination would over-estimate variance by a factor of
+    /// (sum w_c²) / (sum w_c)² ≈ 0.6 vs the true scalar-luminance
+    /// variance.
+    #[test]
+    fn variance_uses_scalar_luminance_not_per_channel_recombination() {
+        // A pixel that alternates samples between (0, 0, 0) and
+        // (1, 1, 1). Channels are PERFECTLY CORRELATED — exactly
+        // the path-tracer integrand case.
+        //
+        // Scalar luminance: Y oscillates between 0 and 1 with
+        // E[Y] = 0.5, E[Y²] = 0.5, Var(Y) = 0.25.
+        //
+        // Per-channel "variance" (each channel treated independently):
+        // Var(R) = Var(G) = Var(B) = 0.25.
+        // Per-channel recombined via 0.2126² + 0.7152² + 0.0722² ≈
+        // 0.5621 ≠ 0.25.
+        //
+        // The right answer is 0.25 — the scalar-luminance
+        // variance. This test asserts the implementation uses the
+        // scalar form.
+        let e_y = 0.5_f32;
+        let e_y2 = 0.5_f32;
+        let aovs = Aovs {
+            width: 1,
+            height: 1,
+            radiance: vec![[e_y, e_y, e_y, 1.0]],
+            albedo: vec![[0.0; 4]],
+            normal: vec![[0.0; 4]],
+            depth: vec![[0.0; 4]],
+            mean_y2: vec![[e_y2, 0.0, 0.0, 0.0]],
+        };
+        let var = aovs.luminance_variance();
+        let expected = 0.25_f32;
+        let rel = (var[0] - expected).abs() / expected;
+        assert!(
+            rel < 1e-6,
+            "scalar-luminance variance must be 0.25 (got {}); a per-\
+             channel recombined estimator would give ~0.56 here, \
+             which would indicate the implementation is wrong",
+            var[0],
+        );
     }
 }

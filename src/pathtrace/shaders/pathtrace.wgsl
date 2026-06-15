@@ -2296,6 +2296,11 @@ struct PathTraceOut {
     @location(1) albedo: vec4<f32>,
     @location(2) normal: vec4<f32>,
     @location(3) depth: vec4<f32>,
+    // PT-adaptive (plan 0028): scalar luminance² of this path's
+    // sample, packed in channel R. The accumulate pass mixes it
+    // into a running mean E[Y²]; readback derives per-pixel
+    // variance as E[Y²] - (E[Y])². See AOV_MEAN_Y2 in pathtrace.rs.
+    @location(4) mean_y2: vec4<f32>,
 };
 
 @fragment
@@ -2312,5 +2317,8 @@ fn fs_main(in: VsOut) -> PathTraceOut {
     out.normal = vec4<f32>(sample.normal, 1.0);
     let mask = select(0.0, 1.0, sample.hit);
     out.depth = vec4<f32>(sample.depth, 0.0, 0.0, mask);
+    // Scalar luminance squared for variance estimation.
+    let y = dot(sample.radiance, vec3<f32>(0.2126, 0.7152, 0.0722));
+    out.mean_y2 = vec4<f32>(y * y, 0.0, 0.0, 0.0);
     return out;
 }

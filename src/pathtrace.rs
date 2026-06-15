@@ -87,7 +87,14 @@ pub const AOV_RADIANCE: usize = 0;
 pub const AOV_ALBEDO: usize = 1;
 pub const AOV_NORMAL: usize = 2;
 pub const AOV_DEPTH: usize = 3;
-pub const NUM_AOVS: usize = 4;
+/// PT-adaptive (plan 0028): running mean of per-pixel luminance²
+/// — `E[Y²]` after the accumulated samples. The path-trace pass
+/// writes `luminance(radiance)²` to channel R; the accumulate
+/// pass mixes it into the running mean the same way as the
+/// other AOVs. Per-pixel variance is then `E[Y²] - (E[Y])²`,
+/// computed at readback. Channels G/B/A are unused.
+pub const AOV_MEAN_Y2: usize = 4;
+pub const NUM_AOVS: usize = 5;
 
 /// Small uniform for the accumulate pass. 16 bytes — must match WGSL `AccumU`.
 #[repr(C)]
@@ -1565,6 +1572,7 @@ mod tests {
         assert_eq!(AOV_ALBEDO, 1);
         assert_eq!(AOV_NORMAL, 2);
         assert_eq!(AOV_DEPTH, 3);
-        assert_eq!(NUM_AOVS, 4);
+        assert_eq!(AOV_MEAN_Y2, 4);
+        assert_eq!(NUM_AOVS, 5);
     }
 }
