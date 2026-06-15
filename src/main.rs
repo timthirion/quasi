@@ -684,8 +684,7 @@ mod tests {
     /// effective ceiling when `--max-spp` is unset.
     #[test]
     fn min_spp_above_spp_errors_under_adaptive() {
-        let err = parse(&["--adaptive", "--spp", "32", "--min-spp", "64"])
-            .expect_err("must error");
+        let err = parse(&["--adaptive", "--spp", "32", "--min-spp", "64"]).expect_err("must error");
         assert!(err.contains("--min-spp"));
     }
 }

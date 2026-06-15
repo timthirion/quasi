@@ -333,8 +333,7 @@ mod tests {
     fn exr_contains_variance_channel() {
         use exr::prelude::*;
 
-        let tmp =
-            std::env::temp_dir().join(format!("quasi-exr-variance-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("quasi-exr-variance-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let path = tmp.join("rt.exr");
