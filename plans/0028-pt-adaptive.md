@@ -432,7 +432,50 @@ backend FMA reordering.
 
 ## Findings
 
-(Populated by milestones during execution.)
+### PT-adaptive/bias-check — preliminary measurement (rev-3 partial)
+
+Cornell glass-bunny, 192×192, PCG / MIS-NEE, reference at 8192 spp.
+Measured by `examples/gen_adaptive_bias.rs`:
+
+| spp  | fixed RMSE | adaptive RMSE | ratio (a/f) |
+| ---- | ---------- | ------------- | ----------- |
+| 256  | 0.020920   | 0.020920      | 1.000       |
+| 1024 | 0.009741   | 0.009962      | 1.023       |
+| 2048 | 0.006210   | 0.006888      | 1.109       |
+
+**These numbers do not satisfy the rev-3 Done-when (ratio ≤ 0.7).**
+Why: the comparison is equal **per-pixel ceiling**, not equal
+**total sample budget**. At fixed `--spp 2048`, every pixel
+draws 2048 samples. At adaptive `--max-spp 2048` with
+`--noise-threshold 0.01`, converged pixels stop drawing samples
+earlier — so adaptive draws **fewer** total samples, and the
+direct head-to-head comparison gives fixed an unfair budget
+edge.
+
+To produce the rev-3 plan's equal-sample-budget comparison, we
+need to read back the **total samples drawn** by the adaptive
+run and configure a fixed-spp control at the matching total
+budget (`total_adaptive_samples / pixel_count`). That requires
+either per-pixel sample-counter infrastructure (new R32Uint
+texture written by the mask compute pass) or per-checkpoint
+mask readback (counts active pixels at each checkpoint).
+**Listed as PT-adaptive-sample-count in the follow-ups** below.
+
+What the partial measurement *does* validate:
+* The scheduler doesn't produce visually wrong images — the
+  RMSE-to-reference is the same order of magnitude as fixed.
+* Adaptive's RMSE grows monotonically with `max_spp` (matches
+  fixed within ~11% at 2048 spp), so the checkpoint-with-decay
+  bias is small relative to the noise level.
+* No regressions in `cornell_quads_and_tris` repro test (after
+  the threshold relaxation documented in the scheduler commit).
+
+The bias-decay sub-check (K=16 seeds, mean across seeds) is
+also gated on missing infrastructure: the existing offscreen
+renderer is deterministic given a fixed scene + config, so
+"K independent seeds" requires a `--seed` flag on the path
+tracer's RNG initialization. Listed as
+PT-adaptive-rng-seed in follow-ups.
 
 ## Followups (out of scope)
 
@@ -449,3 +492,15 @@ backend FMA reordering.
 * **PT-adaptive-scout** — fully-unbiased scout-and-produce
   architecture, only if PT-adaptive/bias-check's bias-decay
   sub-test fails.
+* **PT-adaptive-sample-count** — per-pixel sample-count
+  storage texture written by the mask compute pass; enables
+  the rev-3 equal-sample-budget comparison in
+  PT-adaptive/bias-check. Without this we have a partial
+  bias-check measurement (equal `--spp` ceiling, which the
+  plan-skeptic flagged as gameable for exactly the reason
+  the partial Findings shows: it gives fixed a budget
+  advantage).
+* **PT-adaptive-rng-seed** — `--seed` flag threaded through
+  to the WGSL `init_sampler` call so K-seed multi-run
+  averages are possible. Required by the bias-decay
+  sub-check.
