@@ -402,6 +402,7 @@ fn run_render(args: &[String]) {
     );
     println!("wrote {}", paths.png.display());
     println!("wrote {}", paths.exr.display());
+    println!("wrote {}", paths.variance.display());
 
     if cli.denoise {
         let denoise_start = std::time::Instant::now();
