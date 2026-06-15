@@ -477,6 +477,44 @@ renderer is deterministic given a fixed scene + config, so
 tracer's RNG initialization. Listed as
 PT-adaptive-rng-seed in follow-ups.
 
+### PT-adaptive/sponza-rerender — qualitative validation
+
+Sponza re-rendered at the iconic camera (`--camera-pos -10,2,0
+--look-at 10,4,0 --fov 55`) with the plan-rev-3 spec:
+
+```
+--adaptive --noise-threshold 0.005 --min-spp 64 --max-spp 4096
+--sun-dir 0.1,1.0,0.1 --sun-color 1.0,0.95,0.82 --sun-intensity 18
+--width 1024 --height 768 --spp 2048
+```
+
+Outputs at `data/output/sponza_adaptive_reference{.png,.exr}`
++ `_variance.png`. Visual comparison against the existing
+fixed-spp `sponza_sunlit_reference.png`:
+
+* Atrium framing, sun pool on the long-axis floor, banner
+  colours, and vault detail are visually indistinguishable
+  between adaptive and fixed at this render budget — the
+  scheduler scales to a 262 K-triangle production scene
+  without introducing visible artifacts.
+* The variance overlay (`sponza_adaptive_reference_variance.png`)
+  shows yellow / green (still-noisy) regions concentrated on
+  the banners (translucent / specular material), the vault
+  interior (low-light, hard-to-converge indirect bounces),
+  and architectural detail edges. The atrium floor and
+  side walls are largely purple (converged) — exactly
+  where the scheduler should be saving compute by stopping
+  early.
+
+What this milestone does **not** deliver:
+* The plan-rev-3 numeric Done-when ("≥ 1.43× lower RMSE on
+  sun-pool-edge 256×256 crop" + "≤ 5% pixels clamped without
+  convergence") requires the same sample-count infrastructure
+  the bias-check stalls on (PT-adaptive-sample-count
+  follow-up). The qualitative comparison validates the
+  scheduler integration; the numeric quality-win story comes
+  with the sample-count work.
+
 ## Followups (out of scope)
 
 * **PT-adaptive-tile-scheduler** — strategy (2) from
