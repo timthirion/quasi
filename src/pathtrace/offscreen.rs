@@ -51,6 +51,16 @@ pub struct Aovs {
     /// the value; G/B/A are unused. Used to derive per-pixel variance
     /// via [`Aovs::luminance_variance`].
     pub mean_y2: Vec<[f32; 4]>,
+    /// PT-adaptive-sample-count (plan 0028 follow-up): per-pixel
+    /// final sample count. With `adaptive` disabled, this is
+    /// uniformly `cfg.samples`. With adaptive enabled, each pixel
+    /// holds its actual count at the last checkpoint at which it
+    /// was active (so converged/clamped pixels carry the count at
+    /// which they stopped sampling). Sum across all pixels gives
+    /// the **total samples drawn** — the quantity needed to
+    /// configure an equal-budget fixed-spp control for the
+    /// bias-check measurement.
+    pub sample_counts: Vec<u32>,
 }
 
 impl Aovs {
@@ -90,6 +100,27 @@ impl Aovs {
     /// `n/(n-1)` is irrelevant for thresholding decisions at the
     /// sample counts we care about (≥ 64). The unit test compares
     /// against the population-variance closed form.
+    /// PT-adaptive-sample-count: total samples drawn across the
+    /// frame. Sum of [`Aovs::sample_counts`]. For a fixed-spp
+    /// render of `samples` per pixel, equals `width × height ×
+    /// samples`. For an adaptive render, reports the actual budget
+    /// the scheduler spent — used by the bias-check harness to
+    /// configure an equal-budget fixed-spp control via
+    /// `fixed_spp_equivalent = total_samples_drawn / pixel_count`.
+    pub fn total_samples_drawn(&self) -> u64 {
+        self.sample_counts.iter().copied().map(u64::from).sum()
+    }
+
+    /// PT-adaptive-sample-count: equivalent fixed-spp count for an
+    /// equal-sample-budget bias-check comparison. Rounds up to the
+    /// nearest integer so the fixed-spp control draws at least as
+    /// many total samples as the adaptive run did.
+    pub fn fixed_spp_equivalent(&self) -> u32 {
+        let total = self.total_samples_drawn();
+        let pixels = self.pixel_count() as u64;
+        total.div_ceil(pixels.max(1)) as u32
+    }
+
     pub fn luminance_variance(&self) -> Vec<f32> {
         let pixels = self.pixel_count();
         let mut out = Vec::with_capacity(pixels);
@@ -432,6 +463,55 @@ async fn render_offscreen_async(
         );
     }
 
+    // PT-adaptive-sample-count: per-pixel sample-count storage
+    // texture. Initialized to `cfg.samples` so that the fixed-spp
+    // path (adaptive disabled) reports `samples` per pixel without
+    // any compute work. With adaptive enabled, the mask compute
+    // pass overwrites this with each pixel's actual checkpoint
+    // value, freezing on convergence/clamp. Read back at render
+    // end for the equal-sample-budget bias-check comparison.
+    let sample_count_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("offscreen-sample-count"),
+        size: wgpu::Extent3d {
+            width: cfg.width,
+            height: cfg.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R32Uint,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::STORAGE_BINDING
+            | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let sample_count_view = sample_count_texture.create_view(&Default::default());
+    {
+        let pixels = (cfg.width as usize) * (cfg.height as usize);
+        let init: Vec<u32> = vec![cfg.samples; pixels];
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &sample_count_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&init),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(cfg.width * 4),
+                rows_per_image: Some(cfg.height),
+            },
+            wgpu::Extent3d {
+                width: cfg.width,
+                height: cfg.height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
     let pathtrace_bg =
         build_pathtrace_bg(&device, &pathtrace_bgl, &scene_buffers, &active_mask_view);
 
@@ -566,6 +646,19 @@ async fn render_offscreen_async(
                 },
                 count: None,
             },
+            // PT-adaptive-sample-count: per-pixel sample-count
+            // storage texture. WriteOnly because the shader doesn't
+            // need to read the prior value to update it.
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::R32Uint,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            },
         ],
     });
     let mask_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -615,6 +708,10 @@ async fn render_offscreen_async(
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: wgpu::BindingResource::TextureView(&active_mask_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&sample_count_view),
                 },
             ],
         })
@@ -759,6 +856,17 @@ async fn render_offscreen_async(
         })
     });
 
+    // PT-adaptive-sample-count: separate staging buffer for the
+    // per-pixel sample-count texture (4 bytes/pixel, not 16 like
+    // the f32 AOVs), so its row-stride is computed independently.
+    let sample_count_bpr = align_up(cfg.width * 4, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+    let sample_count_staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("staging-sample-count"),
+        size: (sample_count_bpr as u64) * (cfg.height as u64),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("offscreen-readback"),
     });
@@ -785,12 +893,36 @@ async fn render_offscreen_async(
             },
         );
     }
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &sample_count_texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &sample_count_staging,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(sample_count_bpr),
+                rows_per_image: Some(cfg.height),
+            },
+        },
+        wgpu::Extent3d {
+            width: cfg.width,
+            height: cfg.height,
+            depth_or_array_layers: 1,
+        },
+    );
     queue.submit(std::iter::once(encoder.finish()));
 
     for buf in &staging {
         buf.slice(..)
             .map_async(wgpu::MapMode::Read, |r| r.expect("map_async failed"));
     }
+    sample_count_staging
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, |r| r.expect("map_async failed"));
     device
         .poll(wgpu::PollType::wait_indefinitely())
         .expect("device.poll failed");
@@ -817,6 +949,22 @@ async fn render_offscreen_async(
     let depth = read_aov(&staging[AOV_DEPTH]);
     let mean_y2 = read_aov(&staging[AOV_MEAN_Y2]);
 
+    let sample_counts: Vec<u32> = {
+        let unpadded = (cfg.width * 4) as usize;
+        let padded = sample_count_bpr as usize;
+        let raw = sample_count_staging.slice(..).get_mapped_range();
+        let mut out: Vec<u32> = Vec::with_capacity(cfg.width as usize * cfg.height as usize);
+        for y in 0..cfg.height as usize {
+            let start = y * padded;
+            let row = &raw[start..start + unpadded];
+            let pixels: &[u32] = bytemuck::cast_slice(row);
+            out.extend_from_slice(pixels);
+        }
+        drop(raw);
+        sample_count_staging.unmap();
+        out
+    };
+
     Aovs {
         width: cfg.width,
         height: cfg.height,
@@ -825,6 +973,7 @@ async fn render_offscreen_async(
         normal,
         depth,
         mean_y2,
+        sample_counts,
     }
 }
 
@@ -852,6 +1001,7 @@ mod tests {
             normal: vec![[3.0; 4]; n],
             depth: vec![[4.0; 4]; n],
             mean_y2: vec![[5.0, 0.0, 0.0, 0.0]; n],
+            sample_counts: vec![64; n],
         };
         assert_eq!(a.aov(AOV_RADIANCE)[0][0], 1.0);
         assert_eq!(a.aov(AOV_ALBEDO)[0][0], 2.0);
@@ -859,6 +1009,57 @@ mod tests {
         assert_eq!(a.aov(AOV_DEPTH)[0][0], 4.0);
         assert_eq!(a.aov(AOV_MEAN_Y2)[0][0], 5.0);
         assert_eq!(a.pixel_count(), 4);
+    }
+
+    /// PT-adaptive-sample-count: `total_samples_drawn` sums per-
+    /// pixel sample counts, and `fixed_spp_equivalent` rounds that
+    /// total up to the nearest equivalent fixed-spp count.
+    #[test]
+    fn sample_count_helpers_compute_total_and_equivalent() {
+        let a = Aovs {
+            width: 4,
+            height: 2,
+            radiance: vec![[0.0; 4]; 8],
+            albedo: vec![[0.0; 4]; 8],
+            normal: vec![[0.0; 4]; 8],
+            depth: vec![[0.0; 4]; 8],
+            mean_y2: vec![[0.0; 4]; 8],
+            // 4 converged at 64, 2 active at 256, 2 clamped at 256:
+            // total = 4·64 + 4·256 = 256 + 1024 = 1280.
+            sample_counts: vec![64, 64, 64, 64, 256, 256, 256, 256],
+        };
+        assert_eq!(a.total_samples_drawn(), 1280);
+        // 1280 samples / 8 pixels = 160 spp exact.
+        assert_eq!(a.fixed_spp_equivalent(), 160);
+    }
+
+    /// PT-adaptive-sample-count: a non-divisible total rounds up
+    /// (the fixed-spp control should draw *at least* as many
+    /// samples as adaptive did so we don't accidentally give
+    /// adaptive a budget advantage).
+    #[test]
+    fn fixed_spp_equivalent_rounds_up() {
+        let a = Aovs {
+            width: 3,
+            height: 1,
+            radiance: vec![[0.0; 4]; 3],
+            albedo: vec![[0.0; 4]; 3],
+            normal: vec![[0.0; 4]; 3],
+            depth: vec![[0.0; 4]; 3],
+            mean_y2: vec![[0.0; 4]; 3],
+            // 1 + 2 + 3 = 6 samples / 3 pixels = 2.0 → 2.
+            sample_counts: vec![1, 2, 3],
+        };
+        assert_eq!(a.total_samples_drawn(), 6);
+        assert_eq!(a.fixed_spp_equivalent(), 2);
+
+        // 1 + 2 + 4 = 7 samples / 3 pixels = 2.33… → 3.
+        let b = Aovs {
+            sample_counts: vec![1, 2, 4],
+            ..a
+        };
+        assert_eq!(b.total_samples_drawn(), 7);
+        assert_eq!(b.fixed_spp_equivalent(), 3);
     }
 
     /// PT-adaptive (plan 0028) buffers milestone:
@@ -939,6 +1140,7 @@ mod tests {
                 [p1_e_y2, 0.0, 0.0, 0.0],
                 [p2_e_y2, 0.0, 0.0, 0.0],
             ],
+            sample_counts: vec![64; 3],
         };
 
         let var = aovs.luminance_variance();
@@ -1005,6 +1207,7 @@ mod tests {
             normal: vec![[0.0; 4]],
             depth: vec![[0.0; 4]],
             mean_y2: vec![[e_y2, 0.0, 0.0, 0.0]],
+            sample_counts: vec![64],
         };
         let var = aovs.luminance_variance();
         let expected = 0.25_f32;

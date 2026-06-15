@@ -270,6 +270,7 @@ mod tests {
             normal: vec![[0.0, 1.0, 0.0, 0.0]; n],
             depth: vec![[2.5, 0.0, 0.0, 1.0]; n],
             mean_y2: vec![[0.25, 0.0, 0.0, 0.0]; n],
+            sample_counts: vec![256; n],
         }
     }
 

@@ -77,21 +77,24 @@ fn main() {
     let reference = render("reference", base, &scene);
 
     eprintln!();
-    eprintln!("[budget sweep]");
+    eprintln!("[equal-sample-budget sweep]");
     println!();
     println!(
-        "{:>8}  {:>14}  {:>14}  {:>10}",
-        "spp", "fixed RMSE", "adaptive RMSE", "ratio (a/f)"
+        "Equal-sample-budget comparison: each row picks an adaptive\n\
+         max-spp ceiling, runs adaptive, reads back the total samples\n\
+         drawn, then runs fixed-spp at that equivalent budget. The\n\
+         ratio is the apples-to-apples efficiency the plan rev-3\n\
+         Done-when targets (≤ 0.7 on ≥ 2 of 3 tiers).\n",
     );
     println!(
-        "{:>8}  {:>14}  {:>14}  {:>10}",
-        "--------", "----------", "-------------", "-----------"
+        "{:>10}  {:>10}  {:>10}  {:>14}  {:>14}  {:>10}",
+        "max-spp", "adapt-spp", "fixed-spp", "fixed RMSE", "adaptive RMSE", "ratio (a/f)",
+    );
+    println!(
+        "{:>10}  {:>10}  {:>10}  {:>14}  {:>14}  {:>10}",
+        "----------", "----------", "----------", "----------", "-------------", "-----------",
     );
     for &spp in &test_spp_values {
-        let mut fixed_cfg = base;
-        fixed_cfg.samples = spp;
-        fixed_cfg.adaptive = None;
-
         let mut adapt_cfg = base;
         adapt_cfg.samples = spp;
         adapt_cfg.adaptive = Some(AdaptiveConfig {
@@ -99,18 +102,33 @@ fn main() {
             min_spp: 64,
             max_spp: spp,
         });
+        let adapt_aovs = render(&format!("adaptive @ max-spp {spp}"), adapt_cfg, &scene);
+        let adapt_equiv = adapt_aovs.fixed_spp_equivalent().max(1);
 
-        let fixed_aovs = render(&format!("fixed @ {spp} spp"), fixed_cfg, &scene);
-        let adapt_aovs = render(&format!("adaptive @ {spp} spp"), adapt_cfg, &scene);
+        // Configure the fixed-spp control at the *adaptive equivalent*
+        // budget — this is the equal-sample-budget comparison the
+        // plan rev-3 specifies. The fixed control draws roughly the
+        // same total samples as adaptive did across the frame.
+        let mut fixed_cfg = base;
+        fixed_cfg.samples = adapt_equiv;
+        fixed_cfg.adaptive = None;
+        let fixed_aovs = render(
+            &format!("fixed @ {} spp (equiv)", adapt_equiv),
+            fixed_cfg,
+            &scene,
+        );
 
         let fixed_rmse = rmse(&fixed_aovs, &reference);
         let adapt_rmse = rmse(&adapt_aovs, &reference);
         let ratio = adapt_rmse / fixed_rmse.max(1e-9);
-        println!("{spp:>8}  {fixed_rmse:>14.6}  {adapt_rmse:>14.6}  {ratio:>10.3}",);
+        println!(
+            "{spp:>10}  {:>10}  {adapt_equiv:>10}  {fixed_rmse:>14.6}  {adapt_rmse:>14.6}  {ratio:>10.3}",
+            spp,
+        );
     }
 
     println!();
     println!("Plan-0028 PT-adaptive/bias-check sample-efficiency target:");
-    println!("  ratio ≤ 0.7 on ≥ 2 of 3 spp tiers indicates adaptive wins.");
+    println!("  ratio ≤ 0.7 on ≥ 2 of 3 tiers indicates adaptive wins.");
     println!("  Numbers above go into plan 0028 `Findings` section.");
 }

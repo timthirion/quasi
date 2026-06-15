@@ -11,6 +11,16 @@
 //
 // Pixels whose mask is already 0 or 2 are left alone — terminations
 // are sticky.
+//
+// PT-adaptive-sample-count follow-up: the same compute pass now also
+// writes the per-pixel sample count to a parallel R32Uint texture.
+// For every pixel that is *currently active* at this checkpoint
+// (mask == 1u), we write `U.sample_count` — the total samples this
+// pixel has drawn so far. Pixels that converge or clamp this
+// checkpoint inherit that count (sticky); pixels that stay active
+// will have their count overwritten next checkpoint. Final readback
+// at render end gives the exact per-pixel sample budget — the
+// quantity the equal-sample-budget bias-check needs.
 
 struct MaskU {
     // Total accumulated samples so far (== AccumU.frame_count + 1
@@ -29,6 +39,7 @@ struct MaskU {
 @group(0) @binding(1) var radiance: texture_2d<f32>;
 @group(0) @binding(2) var mean_y2: texture_2d<f32>;
 @group(0) @binding(3) var active_mask: texture_storage_2d<r32uint, read_write>;
+@group(0) @binding(4) var sample_count_tex: texture_storage_2d<r32uint, write>;
 
 @compute @workgroup_size(8, 8, 1)
 fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -38,6 +49,18 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     let cur = textureLoad(active_mask, coord).r;
     if (cur != 1u) { return; }
+
+    // PT-adaptive-sample-count: this pixel is still active at this
+    // checkpoint, so it has drawn `sample_count` samples so far.
+    // Record that. If we converge or clamp below, the count stays
+    // at this checkpoint's value; if we remain active, next
+    // checkpoint will overwrite.
+    textureStore(
+        sample_count_tex,
+        coord,
+        vec4<u32>(U.sample_count, 0u, 0u, 0u),
+    );
+
     if (U.sample_count < U.min_spp) { return; }
 
     let r = textureLoad(radiance, coord, 0);

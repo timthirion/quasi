@@ -432,43 +432,66 @@ backend FMA reordering.
 
 ## Findings
 
-### PT-adaptive/bias-check — preliminary measurement (rev-3 partial)
+### PT-adaptive/bias-check — equal-sample-budget measurement (rev-3, post-sample-count follow-up)
 
 Cornell glass-bunny, 192×192, PCG / MIS-NEE, reference at 8192 spp.
-Measured by `examples/gen_adaptive_bias.rs`:
+Measured by `examples/gen_adaptive_bias.rs` after the
+PT-adaptive-sample-count follow-up landed the per-pixel
+sample-count infrastructure that lets us configure a true
+equal-budget fixed-spp control:
 
-| spp  | fixed RMSE | adaptive RMSE | ratio (a/f) |
-| ---- | ---------- | ------------- | ----------- |
-| 256  | 0.020920   | 0.020920      | 1.000       |
-| 1024 | 0.009741   | 0.009962      | 1.023       |
-| 2048 | 0.006210   | 0.006888      | 1.109       |
+| max-spp | adapt-spp | fixed-spp | fixed RMSE | adaptive RMSE | ratio (a/f) |
+| ------- | --------- | --------- | ---------- | ------------- | ----------- |
+| 256     | 256       | 254       | 0.020962   | 0.020920      | 0.998       |
+| 1024    | 1024      | 1002      | 0.009877   | 0.009962      | 1.009       |
+| 2048    | 2048      | 1913      | 0.006587   | 0.006888      | 1.046       |
 
-**These numbers do not satisfy the rev-3 Done-when (ratio ≤ 0.7).**
-Why: the comparison is equal **per-pixel ceiling**, not equal
-**total sample budget**. At fixed `--spp 2048`, every pixel
-draws 2048 samples. At adaptive `--max-spp 2048` with
-`--noise-threshold 0.01`, converged pixels stop drawing samples
-earlier — so adaptive draws **fewer** total samples, and the
-direct head-to-head comparison gives fixed an unfair budget
-edge.
+**The rev-3 Done-when (ratio ≤ 0.7) is NOT met.** At equal
+total sample budget, adaptive sampling on Cornell glass-bunny
+is essentially tied with fixed-spp — saving 2-7% of samples by
+stopping converged pixels early but paying a roughly equivalent
+RMSE penalty from the checkpoint-bias (converged pixels are
+frozen at their early-checkpoint mean, which is noisier than
+the full-budget mean would be).
 
-To produce the rev-3 plan's equal-sample-budget comparison, we
-need to read back the **total samples drawn** by the adaptive
-run and configure a fixed-spp control at the matching total
-budget (`total_adaptive_samples / pixel_count`). That requires
-either per-pixel sample-counter infrastructure (new R32Uint
-texture written by the mask compute pass) or per-checkpoint
-mask readback (counts active pixels at each checkpoint).
-**Listed as PT-adaptive-sample-count in the follow-ups** below.
+**Honest interpretation:** the plan's "1.5–3× RMSE win" was
+literature-extrapolated from scenes with much higher
+variance heterogeneity than Cornell glass-bunny. On a scene
+where every pixel has similar convergence rate (Cornell is
+roughly this: the bunny has caustics but they cover a small
+fraction of the frame), there isn't a big disparity between
+"easy" and "hard" pixels for the scheduler to redistribute
+budget across. The savings from skipping the 5-10% of
+trivially-converged pixels are dwarfed by the noise floor.
 
-What the partial measurement *does* validate:
-* The scheduler doesn't produce visually wrong images — the
-  RMSE-to-reference is the same order of magnitude as fixed.
+**Where adaptive *would* shine** (untested in this run):
+* Sponza with hard-edge sun pool + flat diffuse arches +
+  smooth background sky — large fraction of pixels converge
+  fast, small fraction need 10×+ more samples. The
+  redistribution gain should dominate the checkpoint-bias
+  penalty.
+* A caustic-heavy scene (Cornell glass bunny is borderline;
+  the GGX-reflector test scene from PT-ggx would be closer
+  to ideal).
+
+The sample-count infrastructure now lets us measure this
+without rebuilding anything; we just run
+`examples/gen_adaptive_bias.rs` against a different scene.
+The honest claim shipped with the plan is **"the scheduler
+is correctly integrated and the equal-budget comparison is
+honest; the measured gain on Cornell glass-bunny is zero;
+gain on heterogeneous scenes is unmeasured."**
+
+What the measurement *does* validate:
+* The scheduler doesn't produce visually wrong images.
 * Adaptive's RMSE grows monotonically with `max_spp` (matches
-  fixed within ~11% at 2048 spp), so the checkpoint-with-decay
+  fixed within ~5% at 2048 spp), so the checkpoint-with-decay
   bias is small relative to the noise level.
 * No regressions in `cornell_quads_and_tris` repro test (after
   the threshold relaxation documented in the scheduler commit).
+* Per-pixel sample-count readback works end-to-end; the
+  equal-budget comparison is now reproducible against any
+  scene.
 
 The bias-decay sub-check (K=16 seeds, mean across seeds) is
 also gated on missing infrastructure: the existing offscreen
