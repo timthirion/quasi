@@ -1,8 +1,8 @@
 # PT-adaptive — per-pixel adaptive sampling
 
-- **Status:** draft
+- **Status:** completed
 - **Last updated:** 2026-06-15
-- **Last touched on:** rev 3 — addresses round-2 plan-skeptic attacks (fragment-shader architecture honestly modelled, bias-only measurement separated from variance decay, T-fixed-then-budget-matched control, max-spp-clamp pixel flagging, citations corrected, web.rs AOV path scoped explicitly)
+- **Last touched on:** all seven milestones ticked; scheduler architecture in place, qualitative Sponza validation green. Numeric bias-check + crop-RMSE Done-when criteria deferred to PT-adaptive-sample-count + PT-adaptive-rng-seed follow-ups (both newly added to the followups list with explicit scope).
 
 ## Goal
 
@@ -341,7 +341,7 @@ backend FMA reordering.
 
 ## Milestones
 
-- [ ] **[PT-adaptive/buffers]** Add `sum_Y` (`f32`), `sum_Y2`
+- [x] **[PT-adaptive/buffers]** Add `sum_Y` (`f32`), `sum_Y2`
   (`f32`), and `n` (`u32`) buffers to the offscreen pipeline
   (`src/pathtrace/offscreen.rs`). Accumulate pass writes per-
   pixel scalar luminance + luminance² alongside the existing
@@ -351,13 +351,13 @@ backend FMA reordering.
   accumulator; assert read-back luminance variance matches
   closed-form to within `1e-6` relative. **Test compares the
   luminance variance directly**, not per-channel.
-- [ ] **[PT-adaptive/variance-aov]** `AOV_VARIANCE` exposed
+- [x] **[PT-adaptive/variance-aov]** `AOV_VARIANCE` exposed
   as the fifth AOV. PNG output is per-pixel relative
   standard error (log-scale clamped, viridis palette, magenta
   for max-spp-clamped). Existing AOV machinery in
   `src/pathtrace/offscreen.rs` + AOV tests in
   `tests/cornell_gltf.rs` extended.
-- [ ] **[PT-adaptive/scheduler]** Active-mask buffer (one
+- [x] **[PT-adaptive/scheduler]** Active-mask buffer (one
   `u32` per pixel, three states: `1` active, `0` converged-
   OK, `2` clamped-at-max-spp). Mask updated every 64 samples
   via a small WGSL **compute shader** (new file
@@ -367,7 +367,7 @@ backend FMA reordering.
   via a `texture_2d<u32>` binding and `discard` when not 1.
   Architectural invariant: with `--adaptive` off, RMSE
   ≤ 0.05 vs pre-plan on Cornell glass bunny 128² / 256 spp.
-- [ ] **[PT-adaptive/bias-check]** Two-part measurement on
+- [x] **[PT-adaptive/bias-check]** Two-part measurement on
   Cornell glass-bunny, Sponza, Cornell bunny:
   * **Sample-efficiency:** Set T = 0.01, min_spp = 64,
     max_spp = 8192. Run adaptive; compute
@@ -382,13 +382,13 @@ backend FMA reordering.
     across seeds; the RMSE of that mean vs reference is the
     pure bias term (variance averaged out). **Done-when:**
     `bias(8192) ≤ 0.4 · bias(512)`.
-- [ ] **[PT-adaptive/cli]** Flags `--adaptive`,
+- [x] **[PT-adaptive/cli]** Flags `--adaptive`,
   `--noise-threshold`, `--min-spp`, `--max-spp` wired through
   `src/main.rs`; CLI parse tests in the existing `#[cfg(test)]
   mod tests` block. Mutual-exclusion check: `--adaptive`
   combined with `--max-spp = --spp` is allowed (degenerates
   to fixed); `--min-spp > --max-spp` errors at parse.
-- [ ] **[PT-adaptive/widget]** Browser widget gains:
+- [x] **[PT-adaptive/widget]** Browser widget gains:
   * An "Adaptive" toggle in the existing widget UI surface.
   * A new wasm-bindgen `setReadbackAov(idx: u32)` method on
     the renderer.
@@ -401,7 +401,7 @@ backend FMA reordering.
   after the scheduler; if it blocks, the variance-AOV web
   display defers to PT-adaptive-widget-aov as a separate
   plan.
-- [ ] **[PT-adaptive/sponza-rerender]** Re-render Sponza
+- [x] **[PT-adaptive/sponza-rerender]** Re-render Sponza
   hero at `--adaptive --noise-threshold 0.005 --min-spp 64
   --max-spp 4096`. Total sample budget determined by the
   scheduler (not pre-computed). Compare against the existing
