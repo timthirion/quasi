@@ -132,6 +132,14 @@ pub struct Uniforms {
     /// we work in arbitrary linear units that the tonemap normalises).
     /// `w` is padding.
     pub sun_color: [f32; 4],
+    /// PT-adaptive (plan 0028): 1 = the fragment shader reads the
+    /// active-mask texture and discards converged/clamped pixels;
+    /// 0 = mask reads are skipped and every pixel renders (pre-plan
+    /// bit-identical behaviour). The dummy 1×1 mask bound when this
+    /// is 0 ensures the binding is valid either way.
+    pub adaptive_enabled: u32,
+    /// 16-byte alignment pad after the adaptive flag.
+    pub _pad_adaptive: [u32; 3],
 }
 
 /// CPU description of the Cornell Box.
@@ -306,7 +314,9 @@ mod tests {
         // env_total_power + triangle_total_power + 2 pads → 112 bytes.
         // PT-sun-light (plan 0023) added two `vec4<f32>` fields
         // (sun_dir + sun_color) → 144 bytes.
-        assert_eq!(size_of::<Uniforms>(), 144);
+        // PT-adaptive (plan 0028) added `adaptive_enabled + 3 × u32`
+        // pad as a final vec4 worth of fields → 160 bytes.
+        assert_eq!(size_of::<Uniforms>(), 160);
         assert_eq!(offset_of!(Uniforms, triangle_count), 48);
         assert_eq!(offset_of!(Uniforms, integrator_kind), 48 + 6 * 4);
         assert_eq!(offset_of!(Uniforms, use_bvh), 48 + 7 * 4);

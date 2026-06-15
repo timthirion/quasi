@@ -20,8 +20,8 @@ use crate::pathtrace::sampler::SamplerKind;
 use crate::pathtrace::scene;
 use crate::pathtrace::{
     build_accumulate_bgl, build_pathtrace_bg, build_pathtrace_bgl, build_scene_buffers,
-    make_pipeline, mrt_pass, AccumUniform, AOV_ALBEDO, AOV_DEPTH, AOV_MEAN_Y2, AOV_NORMAL,
-    AOV_RADIANCE, NUM_AOVS,
+    make_pipeline, mrt_pass, AccumUniform, MaskUniform, AOV_ALBEDO, AOV_DEPTH, AOV_MEAN_Y2,
+    AOV_NORMAL, AOV_RADIANCE, NUM_AOVS,
 };
 
 /// `Rgba32Float`: 16 bytes per pixel; trivially round-trips through host
@@ -106,6 +106,37 @@ impl Aovs {
     }
 }
 
+/// PT-adaptive (plan 0028): per-pixel adaptive sampling parameters.
+/// `None` on [`RenderConfig::adaptive`] disables adaptive scheduling
+/// — pre-plan bit-identical behaviour. `Some(_)` enables the
+/// scheduler: per-pixel relative standard error is computed at
+/// checkpoint boundaries (every 64 samples after `min_spp`); pixels
+/// whose error falls below `noise_threshold` are masked out and
+/// skipped by the path-trace + accumulate passes.
+#[derive(Clone, Copy, Debug)]
+pub struct AdaptiveConfig {
+    /// Per-pixel relative standard error below which the pixel is
+    /// marked converged. Typical default 0.01 (1% relative).
+    pub noise_threshold: f32,
+    /// Per-pixel sample floor before the convergence test is
+    /// trusted. Heavy-tailed integrands need ~64 samples before
+    /// the sample variance is a reliable estimator.
+    pub min_spp: u32,
+    /// Per-pixel sample ceiling. Pixels that hit this without
+    /// converging are flagged as "clamped" (state 2) in the
+    /// active mask.
+    pub max_spp: u32,
+}
+
+impl AdaptiveConfig {
+    /// Plan-0028 documented defaults.
+    pub const DEFAULT: Self = Self {
+        noise_threshold: 0.01,
+        min_spp: 64,
+        max_spp: u32::MAX,
+    };
+}
+
 /// Camera + sampling configuration for an offscreen render.
 #[derive(Clone, Copy, Debug)]
 pub struct RenderConfig {
@@ -132,6 +163,9 @@ pub struct RenderConfig {
     /// Defaults to `[1, 1, 1]` when `sun_dir` is set; override for
     /// warmer / cooler suns or stronger intensity.
     pub sun_color: [f32; 3],
+    /// PT-adaptive (plan 0028): adaptive sampling parameters.
+    /// `None` keeps fixed-spp behaviour (pre-plan bit-identical).
+    pub adaptive: Option<AdaptiveConfig>,
 }
 
 impl Default for RenderConfig {
@@ -151,6 +185,7 @@ impl Default for RenderConfig {
             fov: 40.0,
             sun_dir: None,
             sun_color: [1.0, 1.0, 1.0],
+            adaptive: None,
         }
     }
 }
@@ -322,6 +357,11 @@ async fn render_offscreen_async(
         uniforms.sun_dir = [dir[0] / len, dir[1] / len, dir[2] / len, 1.0];
         uniforms.sun_color = [cfg.sun_color[0], cfg.sun_color[1], cfg.sun_color[2], 0.0];
     }
+    // PT-adaptive (plan 0028): flag the shader to read the active
+    // mask. When `cfg.adaptive.is_none()` this stays 0 and the
+    // shader skips the mask read entirely — pre-plan bit-identical.
+    uniforms.adaptive_enabled = u32::from(cfg.adaptive.is_some());
+    uniforms._pad_adaptive = [0; 3];
 
     let scene_buffers = match (cloud_grid, env_map) {
         (Some(g), None) => {
@@ -346,7 +386,54 @@ async fn render_offscreen_async(
         mapped_at_creation: false,
     });
 
-    let pathtrace_bg = build_pathtrace_bg(&device, &pathtrace_bgl, &scene_buffers);
+    // PT-adaptive (plan 0028): per-pixel active mask. R32Uint
+    // texture sized to the framebuffer; 1 = active, 0 = converged,
+    // 2 = clamped-at-max-spp. Initialized to all 1u. Updated only
+    // when `cfg.adaptive.is_some()` via CPU-side variance computation
+    // at checkpoint boundaries.
+    let active_mask_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("offscreen-active-mask"),
+        size: wgpu::Extent3d {
+            width: cfg.width,
+            height: cfg.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R32Uint,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::STORAGE_BINDING
+            | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let active_mask_view = active_mask_texture.create_view(&Default::default());
+    {
+        let pixels = (cfg.width as usize) * (cfg.height as usize);
+        let init: Vec<u32> = vec![1u32; pixels];
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &active_mask_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&init),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(cfg.width * 4),
+                rows_per_image: Some(cfg.height),
+            },
+            wgpu::Extent3d {
+                width: cfg.width,
+                height: cfg.height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    let pathtrace_bg =
+        build_pathtrace_bg(&device, &pathtrace_bgl, &scene_buffers, &active_mask_view);
 
     // --- Targets ---
     let sample_textures: [wgpu::Texture; NUM_AOVS] = std::array::from_fn(|i| {
@@ -400,7 +487,7 @@ async fn render_offscreen_async(
     });
 
     let make_accum_bg = |prev: usize| {
-        let mut entries: Vec<wgpu::BindGroupEntry> = Vec::with_capacity(1 + NUM_AOVS * 2);
+        let mut entries: Vec<wgpu::BindGroupEntry> = Vec::with_capacity(2 + NUM_AOVS * 2);
         entries.push(wgpu::BindGroupEntry {
             binding: 0,
             resource: accum_uniform_buf.as_entire_binding(),
@@ -417,6 +504,11 @@ async fn render_offscreen_async(
                 resource: wgpu::BindingResource::TextureView(view),
             });
         }
+        // PT-adaptive: active_mask at binding 11.
+        entries.push(wgpu::BindGroupEntry {
+            binding: 1 + (2 * NUM_AOVS) as u32,
+            resource: wgpu::BindingResource::TextureView(&active_mask_view),
+        });
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("offscreen-accumulate-bg"),
             layout: &accumulate_bgl,
@@ -424,6 +516,110 @@ async fn render_offscreen_async(
         })
     };
     let accumulate_bg = [make_accum_bg(0), make_accum_bg(1)];
+
+    // PT-adaptive (plan 0028): compute pipeline + bind groups for
+    // the active-mask update. Built unconditionally — when
+    // `cfg.adaptive.is_none()` the pipeline is never dispatched.
+    // Two bind groups (one per ping-pong accumulator) so we can
+    // bind whichever holds the current accumulated state at the
+    // checkpoint.
+    let mask_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("adaptive-mask-bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::ReadWrite,
+                    format: wgpu::TextureFormat::R32Uint,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            },
+        ],
+    });
+    let mask_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("adaptive-mask-shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/adaptive_mask.wgsl").into()),
+    });
+    let mask_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("adaptive-mask-pipeline-layout"),
+        bind_group_layouts: &[Some(&mask_bgl)],
+        immediate_size: 0,
+    });
+    let mask_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("adaptive-mask-pipeline"),
+        layout: Some(&mask_pipeline_layout),
+        module: &mask_shader,
+        entry_point: Some("cs_main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let mask_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("adaptive-mask-uniform"),
+        size: std::mem::size_of::<MaskUniform>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let make_mask_bg = |accum_idx: usize| -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("adaptive-mask-bg"),
+            layout: &mask_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: mask_uniform_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(
+                        &accum_views[accum_idx][AOV_RADIANCE],
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(
+                        &accum_views[accum_idx][AOV_MEAN_Y2],
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&active_mask_view),
+                },
+            ],
+        })
+    };
+    let mask_bg = [make_mask_bg(0), make_mask_bg(1)];
 
     // --- Render loop ---
     //
@@ -436,6 +632,16 @@ async fn render_offscreen_async(
     // sync points per render, which keeps the throughput cost in the
     // noise on long jobs.
     let sync_every = (cfg.samples / 100).max(1);
+    // PT-adaptive (plan 0028): checkpoint every 64 samples once
+    // `min_spp` is reached. At each checkpoint the CPU reads back the
+    // running radiance + mean_y2, derives per-pixel relative standard
+    // error, and uploads an updated active-mask texture. With
+    // `cfg.adaptive.is_none()` the entire branch is skipped — the
+    // shader's `adaptive_enabled` flag also stays 0, so the per-frame
+    // cost is exactly pre-plan.
+    const CHECKPOINT_INTERVAL: u32 = 64;
+    let accum_adaptive_flag: u32 = u32::from(cfg.adaptive.is_some());
+
     let mut read_idx = 0usize;
     for frame in 0..cfg.samples {
         uniforms.frame_count = frame;
@@ -445,7 +651,8 @@ async fn render_offscreen_async(
             0,
             bytemuck::bytes_of(&AccumUniform {
                 frame_count: frame,
-                _pad: [0; 3],
+                adaptive_enabled: accum_adaptive_flag,
+                _pad: [0; 2],
             }),
         );
 
@@ -472,6 +679,43 @@ async fn render_offscreen_async(
         );
         queue.submit(std::iter::once(encoder.finish()));
         read_idx = dst;
+
+        // PT-adaptive (plan 0028): every CHECKPOINT_INTERVAL samples
+        // (after `min_spp` is reached), dispatch the mask-update
+        // compute pass to mark converged / clamped pixels. The
+        // shader reads the current accumulators (which now hold the
+        // post-frame-`frame` running mean) via `accum_views[read_idx]`
+        // and updates `active_mask_texture` in place.
+        if let Some(adapt) = cfg.adaptive {
+            let n = frame + 1;
+            let max_spp_eff = adapt.max_spp.min(cfg.samples);
+            if n >= adapt.min_spp && n.is_multiple_of(CHECKPOINT_INTERVAL) {
+                let mask_u = MaskUniform {
+                    sample_count: n,
+                    min_spp: adapt.min_spp,
+                    max_spp: max_spp_eff,
+                    _pad: 0,
+                    noise_threshold: adapt.noise_threshold,
+                    eps_dark: 0.001,
+                    _pad2: 0.0,
+                    _pad3: 0.0,
+                };
+                queue.write_buffer(&mask_uniform_buf, 0, bytemuck::bytes_of(&mask_u));
+                let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("offscreen-mask-update"),
+                });
+                {
+                    let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("offscreen-mask-compute"),
+                        timestamp_writes: None,
+                    });
+                    cp.set_pipeline(&mask_pipeline);
+                    cp.set_bind_group(0, &mask_bg[read_idx], &[]);
+                    cp.dispatch_workgroups(cfg.width.div_ceil(8), cfg.height.div_ceil(8), 1);
+                }
+                queue.submit(std::iter::once(enc.finish()));
+            }
+        }
 
         let last = frame + 1 == cfg.samples;
         if let Some(p) = progress.as_mut() {

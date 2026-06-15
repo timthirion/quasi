@@ -10,7 +10,9 @@
 
 struct AccumU {
     frame_count: u32,
-    _pad0: u32,
+    // PT-adaptive (plan 0028): 1 = read active_mask + discard
+    // converged pixels; 0 = pre-plan behaviour.
+    adaptive_enabled: u32,
     _pad1: u32,
     _pad2: u32,
 };
@@ -28,6 +30,11 @@ struct AccumU {
 @group(0) @binding(8) var prev_nor: texture_2d<f32>;
 @group(0) @binding(9) var prev_dep: texture_2d<f32>;
 @group(0) @binding(10) var prev_my2: texture_2d<f32>;
+
+// PT-adaptive: same active_mask the path-trace shader reads.
+// Discarding here preserves the prev accumulator so converged
+// pixels stop changing once they're marked.
+@group(0) @binding(11) var active_mask: texture_2d<u32>;
 
 struct VsOut {
     @builtin(position) position: vec4<f32>,
@@ -54,6 +61,29 @@ struct AccumOut {
 @fragment
 fn fs_main(in: VsOut) -> AccumOut {
     let coord = vec2<i32>(in.position.xy);
+
+    // PT-adaptive: when the pixel is converged or clamped, the
+    // path-trace pass discarded this fragment, so the sample_*
+    // textures hold stale values that must not contribute to the
+    // accumulator. We can't `discard` here either, because the
+    // ping-pong destination at this coord still has the old
+    // (two-frames-back) accumulator value and that would create
+    // visible holes. Pass `prev_*` through unchanged — equivalent
+    // to weight-zero accumulation — so the converged mean persists
+    // and the ping-pong stays consistent.
+    if (A.adaptive_enabled != 0u) {
+        let mask = textureLoad(active_mask, coord, 0).r;
+        if (mask != 1u) {
+            var passthrough: AccumOut;
+            passthrough.rad = textureLoad(prev_rad, coord, 0);
+            passthrough.alb = textureLoad(prev_alb, coord, 0);
+            passthrough.nor = textureLoad(prev_nor, coord, 0);
+            passthrough.dep = textureLoad(prev_dep, coord, 0);
+            passthrough.my2 = textureLoad(prev_my2, coord, 0);
+            return passthrough;
+        }
+    }
+
     let w = 1.0 / f32(A.frame_count + 1u);
 
     var out: AccumOut;

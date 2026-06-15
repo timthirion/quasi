@@ -388,6 +388,17 @@ fn run_render(args: &[String]) {
             cli.sun_color[2] * cli.sun_intensity,
         ];
     }
+    // PT-adaptive (plan 0028): wire CLI flags into the optional
+    // AdaptiveConfig. With `--adaptive` unset, `cfg.adaptive` stays
+    // None and the offscreen pipeline takes the pre-plan
+    // bit-identical path.
+    if cli.adaptive {
+        cfg.adaptive = Some(quasi::pathtrace::offscreen::AdaptiveConfig {
+            noise_threshold: cli.noise_threshold,
+            min_spp: cli.min_spp,
+            max_spp: cli.max_spp.unwrap_or(cli.samples),
+        });
+    }
     log::info!(
         "rendering {}x{} @ {} spp ({:?} / {:?})",
         cfg.width,

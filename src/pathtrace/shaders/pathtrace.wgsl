@@ -141,6 +141,10 @@ struct Uniforms {
     // PT-sun-light: emitted radiance per steradian, linear units.
     // `w` is padding.
     sun_color: vec4<f32>,
+    // PT-adaptive (plan 0028): 1 = read active_mask and discard
+    // converged/clamped pixels; 0 = skip mask reads (pre-plan
+    // behaviour). yzw are padding.
+    adaptive: vec4<u32>,
 };
 
 struct BvhNode {
@@ -182,6 +186,13 @@ struct EmissiveLight {
 @group(0) @binding(12) var env_texture: texture_2d<f32>;
 @group(0) @binding(13) var env_sampler: sampler;
 @group(0) @binding(14) var<storage, read> env_data: array<f32>;
+// PT-adaptive (plan 0028): per-pixel active mask. R32Uint storage:
+//   1 = active (sample this pixel)
+//   0 = converged (relative-std-error < noise_threshold)
+//   2 = clamped (hit max_spp without converging)
+// Read only when `U.adaptive.x != 0`. With adaptive off, a 1×1
+// dummy texture (containing 1u) is bound so the binding is valid.
+@group(0) @binding(15) var active_mask: texture_2d<u32>;
 
 struct VsOut {
     @builtin(position) position: vec4<f32>,
@@ -2306,6 +2317,13 @@ struct PathTraceOut {
 @fragment
 fn fs_main(in: VsOut) -> PathTraceOut {
     let pixel = vec2<u32>(in.position.xy);
+    // PT-adaptive (plan 0028): skip pixels marked converged or
+    // clamped. Mask is sized to the framebuffer; reads use the
+    // same integer pixel coords as the AOV writes.
+    if (U.adaptive.x != 0u) {
+        let mask = textureLoad(active_mask, vec2<i32>(pixel), 0).r;
+        if (mask != 1u) { discard; }
+    }
     var s = init_sampler(pixel, U.frame_count, U.viewport_width);
 
     let ray = get_camera_ray(in.uv, &s);

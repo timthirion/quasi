@@ -101,7 +101,31 @@ pub const NUM_AOVS: usize = 5;
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub(crate) struct AccumUniform {
     pub frame_count: u32,
-    pub _pad: [u32; 3],
+    /// PT-adaptive (plan 0028): 1 = the accumulate shader reads
+    /// `active_mask` and discards converged pixels; 0 = pre-plan
+    /// bit-identical behaviour. The accumulate-side discard is
+    /// what actually keeps converged pixels stable: the path-trace
+    /// pass also discards, but the sample textures hold stale
+    /// values from prior writes, so accumulate's discard prevents
+    /// those stale values from drifting `prev_*`.
+    pub adaptive_enabled: u32,
+    pub _pad: [u32; 2],
+}
+
+/// PT-adaptive (plan 0028): uniform passed to the
+/// `adaptive_mask.wgsl` compute shader. 32 bytes — must match the
+/// WGSL `MaskU` layout exactly.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub(crate) struct MaskUniform {
+    pub sample_count: u32,
+    pub min_spp: u32,
+    pub max_spp: u32,
+    pub _pad: u32,
+    pub noise_threshold: f32,
+    pub eps_dark: f32,
+    pub _pad2: f32,
+    pub _pad3: f32,
 }
 
 /// Per-resolution render targets and their bind groups.
@@ -140,6 +164,13 @@ pub struct State {
     uniform_buf: wgpu::Buffer,
     accum_uniform_buf: wgpu::Buffer,
     pathtrace_bg: wgpu::BindGroup,
+
+    // PT-adaptive (plan 0028): the windowed pipeline never enables
+    // adaptive sampling, but the binding is required, so a 1×1
+    // dummy R32Uint texture filled with `1u` is held here so the
+    // view stays live across resizes.
+    _dummy_mask_tex: wgpu::Texture,
+    dummy_mask_view: wgpu::TextureView,
 
     // Scene storage buffers — held to extend their lifetime past the
     // bind group's internal Arc references.
@@ -221,6 +252,7 @@ fn build_targets(
     accumulate_bgl: &wgpu::BindGroupLayout,
     present_bgl: &wgpu::BindGroupLayout,
     accum_uniform_buf: &wgpu::Buffer,
+    active_mask_view: &wgpu::TextureView,
 ) -> Targets {
     let sample_views = make_aov_views(device, w, h, "sample");
     let accum_views = [
@@ -229,7 +261,7 @@ fn build_targets(
     ];
 
     let make_accumulate_bg = |prev: usize| {
-        let mut entries: Vec<wgpu::BindGroupEntry> = Vec::with_capacity(1 + NUM_AOVS * 2);
+        let mut entries: Vec<wgpu::BindGroupEntry> = Vec::with_capacity(2 + NUM_AOVS * 2);
         entries.push(wgpu::BindGroupEntry {
             binding: 0,
             resource: accum_uniform_buf.as_entire_binding(),
@@ -246,6 +278,11 @@ fn build_targets(
                 resource: wgpu::BindingResource::TextureView(view),
             });
         }
+        // PT-adaptive: active_mask at binding 11.
+        entries.push(wgpu::BindGroupEntry {
+            binding: 1 + (2 * NUM_AOVS) as u32,
+            resource: wgpu::BindingResource::TextureView(active_mask_view),
+        });
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("accumulate-bg"),
             layout: accumulate_bgl,
@@ -369,6 +406,20 @@ pub(crate) fn build_pathtrace_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayou
             // PT-env: marginal + conditional CDF/PDF tables packed into
             // one storage buffer. Layout doc lives on `build_env_storage`.
             storage(14),
+            // PT-adaptive (plan 0028): per-pixel active mask (R32Uint).
+            // When `U.adaptive.x = 0`, a 1×1 dummy texture filled with
+            // `1u` is bound so the binding is valid but the shader's
+            // gated read never fires.
+            wgpu::BindGroupLayoutEntry {
+                binding: 15,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Uint,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
         ],
     })
 }
@@ -1013,6 +1064,7 @@ pub(crate) fn build_pathtrace_bg(
     device: &wgpu::Device,
     bgl: &wgpu::BindGroupLayout,
     buffers: &SceneBuffers,
+    active_mask_view: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     let _ = &buffers.textures; // hold reference live across the bind group's Arc.
     device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1079,8 +1131,59 @@ pub(crate) fn build_pathtrace_bg(
                 binding: 14,
                 resource: buffers.env_data.as_entire_binding(),
             },
+            wgpu::BindGroupEntry {
+                binding: 15,
+                resource: wgpu::BindingResource::TextureView(active_mask_view),
+            },
         ],
     })
+}
+
+/// PT-adaptive (plan 0028): a 1×1 R32Uint texture filled with `1u`,
+/// bound when adaptive sampling is off. The fragment shader's
+/// `U.adaptive.x` flag gates the actual read so the value is
+/// irrelevant in practice — but the binding still needs to be
+/// well-formed.
+pub(crate) fn make_dummy_active_mask(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("dummy-active-mask"),
+        size: wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R32Uint,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let one: u32 = 1;
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        bytemuck::bytes_of(&one),
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4),
+            rows_per_image: Some(1),
+        },
+        wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+    );
+    let view = texture.create_view(&Default::default());
+    (texture, view)
 }
 
 pub(crate) fn build_accumulate_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
@@ -1094,7 +1197,7 @@ pub(crate) fn build_accumulate_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayo
         },
         count: None,
     };
-    let mut entries: Vec<wgpu::BindGroupLayoutEntry> = Vec::with_capacity(1 + 2 * NUM_AOVS);
+    let mut entries: Vec<wgpu::BindGroupLayoutEntry> = Vec::with_capacity(2 + 2 * NUM_AOVS);
     entries.push(wgpu::BindGroupLayoutEntry {
         binding: 0,
         visibility: wgpu::ShaderStages::FRAGMENT,
@@ -1108,6 +1211,19 @@ pub(crate) fn build_accumulate_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayo
     for i in 0..(2 * NUM_AOVS) as u32 {
         entries.push(tex(1 + i));
     }
+    // PT-adaptive (plan 0028): active_mask at binding 11 (after the
+    // 10 sample/prev AOV textures). R32Uint — same view as the one
+    // bound to the path-trace pass.
+    entries.push(wgpu::BindGroupLayoutEntry {
+        binding: 1 + (2 * NUM_AOVS) as u32,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Uint,
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    });
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("accumulate-bgl"),
         entries: &entries,
@@ -1272,7 +1388,11 @@ impl State {
         uniforms.triangle_total_power = triangle_scene.triangle_total_power;
 
         let scene_buffers = build_scene_buffers(&device, &queue, &triangle_scene);
-        let pathtrace_bg = build_pathtrace_bg(&device, &pathtrace_bgl, &scene_buffers);
+        // PT-adaptive: windowed pipeline never enables adaptive
+        // sampling, so a 1×1 dummy mask suffices for the binding.
+        let (_dummy_mask_tex, dummy_mask_view) = make_dummy_active_mask(&device, &queue);
+        let pathtrace_bg =
+            build_pathtrace_bg(&device, &pathtrace_bgl, &scene_buffers, &dummy_mask_view);
         let SceneBuffers {
             uniform: uniform_buf,
             vertex: vertex_buf,
@@ -1310,6 +1430,7 @@ impl State {
             &accumulate_bgl,
             &present_bgl,
             &accum_uniform_buf,
+            &dummy_mask_view,
         );
 
         State {
@@ -1325,6 +1446,8 @@ impl State {
             uniform_buf,
             accum_uniform_buf,
             pathtrace_bg,
+            _dummy_mask_tex,
+            dummy_mask_view,
             _vertex_buf: vertex_buf,
             _index_buf: index_buf,
             _material_buf: material_buf,
@@ -1359,6 +1482,7 @@ impl State {
                 &self.accumulate_bgl,
                 &self.present_bgl,
                 &self.accum_uniform_buf,
+                &self.dummy_mask_view,
             );
             self.frame_count = 0;
             self.read_idx = 0;
@@ -1447,7 +1571,8 @@ impl State {
             0,
             bytemuck::bytes_of(&AccumUniform {
                 frame_count: self.frame_count,
-                _pad: [0; 3],
+                adaptive_enabled: 0,
+                _pad: [0; 2],
             }),
         );
 
