@@ -55,22 +55,89 @@ fn render(label: &str, cfg: RenderConfig, scene: &quasi::pathtrace::mesh::Triang
     aovs
 }
 
-fn main() {
-    let scene = mesh::load_glb(Path::new("data/gltf/cornell_glass_bunny.gltf"))
-        .unwrap_or_else(|_| default_triangle_scene());
+fn normalize3(v: [f32; 3]) -> [f32; 3] {
+    let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-6);
+    [v[0] / n, v[1] / n, v[2] / n]
+}
 
-    // 192×192 is small enough that the 8192-spp reference fits in
-    // ~30 s on M-series. Plenty for a bias-check measurement.
-    let w = 192;
-    let h = 192;
-    let reference_spp = 8192;
-    let test_spp_values = [256_u32, 1024, 2048];
+/// Per-scene render preset. Cornell is the default; passing
+/// "sponza" on the command line swaps in the iconic sun-lit
+/// camera + lower spp budgets to keep wall-clock manageable on
+/// a 262K-triangle scene.
+struct Preset {
+    label: &'static str,
+    scene_path: &'static str,
+    w: u32,
+    h: u32,
+    reference_spp: u32,
+    test_spp_values: Vec<u32>,
+    cfg: RenderConfig,
+}
+
+fn cornell_preset() -> Preset {
+    Preset {
+        label: "cornell-glass-bunny",
+        scene_path: "data/gltf/cornell_glass_bunny.gltf",
+        w: 192,
+        h: 192,
+        reference_spp: 8192,
+        test_spp_values: vec![256, 1024, 2048],
+        cfg: RenderConfig::default(),
+    }
+}
+
+fn sponza_preset() -> Preset {
+    let camera_pos = [-10.0, 2.0, 0.0];
+    let look_at = [10.0, 4.0, 0.0];
+    let dir = normalize3([
+        look_at[0] - camera_pos[0],
+        look_at[1] - camera_pos[1],
+        look_at[2] - camera_pos[2],
+    ]);
+    let intensity = 18.0_f32;
+    let sun_color = [1.0 * intensity, 0.95 * intensity, 0.82 * intensity];
+    Preset {
+        label: "sponza",
+        scene_path: "data/gltf/sponza/Sponza.gltf",
+        // 128×128 + reference 2048 spp keeps wall-clock under
+        // ~3 minutes on M-series; enough to see variance
+        // heterogeneity but not lock the machine.
+        w: 128,
+        h: 128,
+        reference_spp: 2048,
+        test_spp_values: vec![128, 512, 1024],
+        cfg: RenderConfig {
+            camera_pos,
+            camera_dir: dir,
+            fov: 55.0,
+            sun_dir: Some([0.1, 1.0, 0.1]),
+            sun_color,
+            ..RenderConfig::default()
+        },
+    }
+}
+
+fn main() {
+    let preset_name: String = std::env::args().nth(1).unwrap_or_else(|| "cornell".into());
+    let preset = match preset_name.as_str() {
+        "sponza" => sponza_preset(),
+        _ => cornell_preset(),
+    };
+    eprintln!("[preset: {}]", preset.label);
+
+    let scene =
+        mesh::load_glb(Path::new(preset.scene_path)).unwrap_or_else(|_| default_triangle_scene());
+
+    let w = preset.w;
+    let h = preset.h;
+    let reference_spp = preset.reference_spp;
+    let test_spp_values = preset.test_spp_values.clone();
 
     let base = RenderConfig {
         width: w,
         height: h,
         samples: reference_spp,
-        ..RenderConfig::default()
+        ..preset.cfg
     };
 
     eprintln!("[reference]");
@@ -94,11 +161,23 @@ fn main() {
         "{:>10}  {:>10}  {:>10}  {:>14}  {:>14}  {:>10}",
         "----------", "----------", "----------", "----------", "-------------", "-----------",
     );
+    // PT-adaptive: noise threshold. The plan-default `0.01` is
+    // tight enough that few pixels converge within typical
+    // test-budget windows, so the redistribution gain is small.
+    // Setting `ADAPT_BIAS_THRESHOLD` env var lets a measurement
+    // run loosen the threshold to see if the win shows up under
+    // more aggressive early-termination.
+    let noise_threshold: f32 = std::env::var("ADAPT_BIAS_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.01);
+    eprintln!("[noise_threshold: {noise_threshold}]");
+
     for &spp in &test_spp_values {
         let mut adapt_cfg = base;
         adapt_cfg.samples = spp;
         adapt_cfg.adaptive = Some(AdaptiveConfig {
-            noise_threshold: 0.01,
+            noise_threshold,
             min_spp: 64,
             max_spp: spp,
         });

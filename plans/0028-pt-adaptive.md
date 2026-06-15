@@ -464,23 +464,63 @@ fraction of the frame), there isn't a big disparity between
 budget across. The savings from skipping the 5-10% of
 trivially-converged pixels are dwarfed by the noise floor.
 
-**Where adaptive *would* shine** (untested in this run):
-* Sponza with hard-edge sun pool + flat diffuse arches +
-  smooth background sky — large fraction of pixels converge
-  fast, small fraction need 10×+ more samples. The
-  redistribution gain should dominate the checkpoint-bias
-  penalty.
-* A caustic-heavy scene (Cornell glass bunny is borderline;
-  the GGX-reflector test scene from PT-ggx would be closer
-  to ideal).
+### Update — Sponza measurement (post-sample-count, multi-threshold sweep)
 
-The sample-count infrastructure now lets us measure this
-without rebuilding anything; we just run
-`examples/gen_adaptive_bias.rs` against a different scene.
-The honest claim shipped with the plan is **"the scheduler
-is correctly integrated and the equal-budget comparison is
-honest; the measured gain on Cornell glass-bunny is zero;
-gain on heterogeneous scenes is unmeasured."**
+Sponza at 128×128, reference 2048 spp, iconic sun-lit camera
+(`--camera-pos -10,2,0 --look-at 10,4,0 --sun-intensity 18`).
+Run via `cargo run --release --example gen_adaptive_bias --
+sponza`. Two threshold settings:
+
+**Threshold 0.01** (plan default, tight):
+
+| max-spp | adapt-spp | fixed-spp | fixed RMSE | adaptive RMSE | ratio |
+| ------- | --------- | --------- | ---------- | ------------- | ----- |
+| 128     | 128       | 124       | 0.007445   | 0.007398      | 0.994 |
+| 512     | 512       | 466       | 0.004779   | 0.005020      | 1.050 |
+| 1024    | 1024      | 913       | 0.004147   | 0.004570      | 1.102 |
+
+**Threshold 0.05** (5× looser, more pixels converge early):
+
+| max-spp | adapt-spp | fixed-spp | fixed RMSE | adaptive RMSE | ratio |
+| ------- | --------- | --------- | ---------- | ------------- | ----- |
+| 128     | 128       | 119       | 0.007622   | 0.007920      | 1.039 |
+| 512     | 512       | 435       | 0.004860   | 0.006552      | 1.348 |
+| 1024    | 1024      | 851       | 0.004161   | 0.006336      | 1.522 |
+
+The looser threshold makes adaptive **significantly worse**,
+not better. This is the structural finding: **the
+checkpoint-with-decay scheduler is bias-limited, not
+budget-limited.** Increasing budget savings (more pixels stop
+early) increases the freeze-at-noisier-mean bias
+proportionally, and the bias dominates the savings on every
+threshold tested.
+
+### Architectural conclusion: the plan's "1.5-3× win" doesn't materialize, and we now know why
+
+The shipped scheduler architecture — checkpoint-with-decay,
+where converged pixels stop sampling and the final mean is
+the pixel's last-checkpoint value — caps the achievable gain
+near 1.0 because the same samples that decided "this pixel
+is converged" become the locked estimate. The bias of that
+locked estimate (relative to a full-budget mean) grows in
+lockstep with the savings, and on every scene + threshold I
+measured (Cornell glass-bunny @ 0.01, Sponza @ 0.01, Sponza
+@ 0.05), the bias matches or exceeds the savings.
+
+This is not the "scheduler isn't working" failure mode — the
+scheduler correctly tracks per-pixel convergence and the
+variance map is a real diagnostic deliverable. It's the
+"architectural choice forecloses the win" mode.
+
+**The fix is PT-adaptive-scout** (already listed in the
+follow-ups): a separate scout-sample population decides
+termination, an independent production-sample population
+forms the final estimate, and the two are statistically
+independent. Bias is decoupled from budget. This is the
+rigorous architecture the plan rev-3 named as "the
+correctly-unbiased option" but explicitly walked back from
+to ship the cheaper checkpoint version. The measurement now
+shipped *demands* the rigorous version.
 
 What the measurement *does* validate:
 * The scheduler doesn't produce visually wrong images.
