@@ -171,6 +171,12 @@ pub struct State {
     // view stays live across resizes.
     _dummy_mask_tex: wgpu::Texture,
     dummy_mask_view: wgpu::TextureView,
+    // PT-adaptive: present-uniform buffer carrying the display-mode
+    // selector. `display_mode = 0` → radiance, `1` → variance.
+    present_uniform_buf: wgpu::Buffer,
+    /// Current display-mode for the windowed/web renderer. Default
+    /// 0 (radiance). `set_display_mode` toggles this and re-uploads.
+    pub display_mode: u32,
 
     // Scene storage buffers — held to extend their lifetime past the
     // bind group's internal Arc references.
@@ -245,6 +251,7 @@ fn make_aov_views(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_targets(
     device: &wgpu::Device,
     w: u32,
@@ -253,6 +260,7 @@ fn build_targets(
     present_bgl: &wgpu::BindGroupLayout,
     accum_uniform_buf: &wgpu::Buffer,
     active_mask_view: &wgpu::TextureView,
+    present_uniform_buf: &wgpu::Buffer,
 ) -> Targets {
     let sample_views = make_aov_views(device, w, h, "sample");
     let accum_views = [
@@ -294,10 +302,20 @@ fn build_targets(
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("present-bg"),
             layout: present_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&accum_views[idx][AOV_RADIANCE]),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&accum_views[idx][AOV_RADIANCE]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&accum_views[idx][AOV_MEAN_Y2]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: present_uniform_buf.as_entire_binding(),
+                },
+            ],
         })
     };
 
@@ -1341,16 +1359,42 @@ impl State {
         let accumulate_bgl = build_accumulate_bgl(&device);
         let present_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("present-bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                // PT-adaptive (plan 0028): mean_y2 accumulator for the
+                // variance display mode.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // PT-adaptive: display-mode uniform (0 = radiance,
+                // 1 = variance).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
         });
 
         // --- Pipelines ---
@@ -1423,6 +1467,21 @@ impl State {
             mapped_at_creation: false,
         });
 
+        // PT-adaptive (plan 0028): 16-byte uniform carrying the
+        // present-pass display-mode selector.
+        let present_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("present-uniform"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // Initialize to display_mode = 0 (radiance).
+        queue.write_buffer(
+            &present_uniform_buf,
+            0,
+            bytemuck::bytes_of(&[0u32, 0, 0, 0]),
+        );
+
         let targets = build_targets(
             &device,
             config.width,
@@ -1431,6 +1490,7 @@ impl State {
             &present_bgl,
             &accum_uniform_buf,
             &dummy_mask_view,
+            &present_uniform_buf,
         );
 
         State {
@@ -1448,6 +1508,8 @@ impl State {
             pathtrace_bg,
             _dummy_mask_tex,
             dummy_mask_view,
+            present_uniform_buf,
+            display_mode: 0,
             _vertex_buf: vertex_buf,
             _index_buf: index_buf,
             _material_buf: material_buf,
@@ -1483,6 +1545,7 @@ impl State {
                 &self.present_bgl,
                 &self.accum_uniform_buf,
                 &self.dummy_mask_view,
+                &self.present_uniform_buf,
             );
             self.frame_count = 0;
             self.read_idx = 0;
@@ -1515,6 +1578,28 @@ impl State {
     pub fn reset_accumulation(&mut self) {
         self.frame_count = 0;
         self.read_idx = 0;
+    }
+
+    /// PT-adaptive (plan 0028): toggle the present pass between
+    /// radiance and variance display.
+    ///
+    /// `mode = 0` → tonemapped radiance (default; what the renderer
+    /// has always displayed). `mode = 1` → per-pixel luminance
+    /// standard deviation log-scaled through a viridis colour-map.
+    /// Other values are coerced to 0. Does **not** reset the
+    /// accumulator — switching to the variance view mid-render shows
+    /// the current convergence state and back-and-forth toggling has
+    /// no cost beyond a single uniform write.
+    pub fn set_display_mode(&mut self, mode: u32) {
+        let clamped = if mode == 1 { 1 } else { 0 };
+        if self.display_mode != clamped {
+            self.display_mode = clamped;
+            self.queue.write_buffer(
+                &self.present_uniform_buf,
+                0,
+                bytemuck::bytes_of(&[clamped, 0u32, 0, 0]),
+            );
+        }
     }
 
     /// Toggle between BVH traversal (the T2 default) and the linear

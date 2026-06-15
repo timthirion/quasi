@@ -171,6 +171,26 @@ impl QuasiInstance {
         self.inner.borrow_mut().state.reset_accumulation();
     }
 
+    /// PT-adaptive (plan 0028): switches the on-screen tonemap
+    /// between radiance and the variance display. `name` is one of
+    /// `"radiance"` (default) or `"variance"` (per-pixel luminance
+    /// standard deviation, log-scaled, viridis colour-mapped).
+    /// Case-insensitive. Does NOT reset accumulation.
+    #[wasm_bindgen(js_name = setDisplayMode)]
+    pub fn set_display_mode(&self, name: &str) -> Result<(), JsValue> {
+        let mode = match name.to_ascii_lowercase().as_str() {
+            "radiance" => 0u32,
+            "variance" => 1u32,
+            other => {
+                return Err(JsValue::from_str(&format!(
+                    "unknown display mode '{other}' — expected 'radiance' or 'variance'",
+                )));
+            }
+        };
+        self.inner.borrow_mut().state.set_display_mode(mode);
+        Ok(())
+    }
+
     /// Current accumulated sample count, for an embedder running its own UI.
     #[wasm_bindgen(js_name = frameCount)]
     pub fn frame_count(&self) -> u32 {
