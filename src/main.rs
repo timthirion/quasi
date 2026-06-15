@@ -59,6 +59,7 @@ fn main() {
 // ---------------------------------------------------------------------------
 
 #[cfg(not(target_arch = "wasm32"))]
+#[cfg_attr(test, derive(Debug))]
 struct RenderArgs {
     out: PathBuf,
     width: u32,
@@ -109,6 +110,28 @@ struct RenderArgs {
     /// `--sun-color`. Defaults to 1.0. Common values: 1-3 for soft
     /// ambient, 5-30 for strong direct sun, 50+ for blown-out sky.
     sun_intensity: f32,
+    /// `--adaptive` (PT-adaptive, plan 0028) enables per-pixel
+    /// adaptive sampling: pixels stop sampling once their per-pixel
+    /// relative standard error drops below `--noise-threshold`. The
+    /// `--spp` flag becomes the per-pixel ceiling (`max_spp`) when
+    /// `--adaptive` is set; the actual total sample budget is
+    /// determined by the scheduler. Off by default — pre-plan
+    /// behaviour preserved.
+    adaptive: bool,
+    /// `--noise-threshold T` (PT-adaptive) is the per-pixel
+    /// relative-standard-error threshold below which a pixel is
+    /// considered converged. Default 0.01 (1% relative). Lower
+    /// values are stricter and produce more samples on hard pixels.
+    noise_threshold: f32,
+    /// `--min-spp N` (PT-adaptive) is the per-pixel sample floor
+    /// before the convergence check is trusted. Default 64. Heavy-
+    /// tailed integrands need ≥ 64 samples before the sample
+    /// variance is a reliable estimator.
+    min_spp: u32,
+    /// `--max-spp M` (PT-adaptive) is the per-pixel sample ceiling.
+    /// When unset, defaults to `--spp`. Pixels that hit this
+    /// ceiling without converging are flagged in the variance map.
+    max_spp: Option<u32>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -132,6 +155,10 @@ impl Default for RenderArgs {
             sun_dir: None,
             sun_color: [1.0, 1.0, 1.0],
             sun_intensity: 1.0,
+            adaptive: false,
+            noise_threshold: 0.01,
+            min_spp: 64,
+            max_spp: None,
         }
     }
 }
@@ -250,6 +277,34 @@ fn parse_render_args(args: &[String]) -> Result<RenderArgs, String> {
                     .ok_or_else(|| "--sun-intensity needs a number".to_string())?;
                 r.sun_intensity = v.parse().map_err(|e| format!("--sun-intensity: {e}"))?;
             }
+            "--adaptive" => {
+                r.adaptive = true;
+            }
+            "--noise-threshold" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| "--noise-threshold needs a number".to_string())?;
+                r.noise_threshold = v.parse().map_err(|e| format!("--noise-threshold: {e}"))?;
+                if r.noise_threshold <= 0.0 {
+                    return Err(format!(
+                        "--noise-threshold must be > 0; got {}",
+                        r.noise_threshold,
+                    ));
+                }
+            }
+            "--min-spp" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| "--min-spp needs a number".to_string())?;
+                r.min_spp = v.parse().map_err(|e| format!("--min-spp: {e}"))?;
+            }
+            "--max-spp" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| "--max-spp needs a number".to_string())?;
+                let n: u32 = v.parse().map_err(|e| format!("--max-spp: {e}"))?;
+                r.max_spp = Some(n);
+            }
             "--help" | "-?" => {
                 println!(
                     "render options:\n\
@@ -271,12 +326,27 @@ fn parse_render_args(args: &[String]) -> Result<RenderArgs, String> {
                      \t--fov degrees       override vertical FOV\n\
                      \t--sun-dir x,y,z     enable delta-distribution sun (vector toward sun)\n\
                      \t--sun-color r,g,b   sun radiance per steradian (default 1,1,1)\n\
-                     \t--sun-intensity I   scalar multiplier on --sun-color (default 1.0)"
+                     \t--sun-intensity I   scalar multiplier on --sun-color (default 1.0)\n\
+                     \t--adaptive          PT-adaptive: per-pixel adaptive sampling (default off)\n\
+                     \t--noise-threshold T relative-error stop criterion (default 0.01)\n\
+                     \t--min-spp N         per-pixel sample floor (default 64)\n\
+                     \t--max-spp M         per-pixel sample ceiling (default = --spp)"
                 );
                 std::process::exit(0);
             }
             other => return Err(format!("unknown render option: {other}")),
         }
+    }
+    // PT-adaptive: --min-spp must not exceed --max-spp (or --spp if
+    // --max-spp is not set). Catches user-intent confusion at parse
+    // rather than at render time.
+    let effective_max = r.max_spp.unwrap_or(r.samples);
+    if r.adaptive && r.min_spp > effective_max {
+        return Err(format!(
+            "--min-spp {} exceeds --max-spp / --spp ceiling {}; the floor cannot \
+             be above the ceiling",
+            r.min_spp, effective_max,
+        ));
     }
     Ok(r)
 }
@@ -545,3 +615,77 @@ fn run_converge(args: &[String]) {
 
 #[cfg(target_arch = "wasm32")]
 fn main() {}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<RenderArgs, String> {
+        let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        parse_render_args(&owned)
+    }
+
+    /// PT-adaptive/cli: `--adaptive` flag toggles the adaptive
+    /// scheduler on. Default off.
+    #[test]
+    fn adaptive_flag_defaults_off_and_parses() {
+        let r = parse(&[]).expect("empty parse");
+        assert!(!r.adaptive, "default should be --adaptive off");
+
+        let r = parse(&["--adaptive"]).expect("--adaptive parse");
+        assert!(r.adaptive);
+    }
+
+    /// PT-adaptive/cli: `--noise-threshold` accepts a positive
+    /// float; rejects zero or negative.
+    #[test]
+    fn noise_threshold_accepts_positive_floats() {
+        let r = parse(&["--noise-threshold", "0.005"]).expect("0.005 parse");
+        assert!((r.noise_threshold - 0.005).abs() < 1e-9);
+
+        assert!(parse(&["--noise-threshold", "0"]).is_err());
+        assert!(parse(&["--noise-threshold", "-1"]).is_err());
+        assert!(parse(&["--noise-threshold"]).is_err()); // missing value
+    }
+
+    /// PT-adaptive/cli: `--min-spp` and `--max-spp` parse into
+    /// concrete values.
+    #[test]
+    fn min_max_spp_parse() {
+        let r = parse(&["--min-spp", "32", "--max-spp", "4096"]).expect("parse");
+        assert_eq!(r.min_spp, 32);
+        assert_eq!(r.max_spp, Some(4096));
+
+        // Defaults
+        let r = parse(&[]).expect("empty parse");
+        assert_eq!(r.min_spp, 64);
+        assert!(r.max_spp.is_none()); // unset -> defaults to --spp at apply time
+    }
+
+    /// PT-adaptive/cli: `--min-spp` > `--max-spp` errors at parse
+    /// when `--adaptive` is set. Without `--adaptive` the validation
+    /// is skipped (the flags have no effect on fixed-spp render).
+    #[test]
+    fn min_spp_above_max_spp_errors_under_adaptive() {
+        let err = parse(&["--adaptive", "--min-spp", "1000", "--max-spp", "100"])
+            .expect_err("must error");
+        assert!(
+            err.contains("--min-spp") && err.contains("1000") && err.contains("100"),
+            "error message must mention both flags + values; got: {err}",
+        );
+
+        // Without --adaptive the same combination is benign (the
+        // flags are inert on a fixed-spp render).
+        assert!(parse(&["--min-spp", "1000", "--max-spp", "100"]).is_ok());
+    }
+
+    /// PT-adaptive/cli: `--min-spp` > `--spp` (no explicit
+    /// `--max-spp`) also errors under adaptive — `--spp` is the
+    /// effective ceiling when `--max-spp` is unset.
+    #[test]
+    fn min_spp_above_spp_errors_under_adaptive() {
+        let err = parse(&["--adaptive", "--spp", "32", "--min-spp", "64"])
+            .expect_err("must error");
+        assert!(err.contains("--min-spp"));
+    }
+}
