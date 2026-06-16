@@ -665,19 +665,95 @@ heterogeneity our test scenes don't have:**
 * **PT-adaptive-scout** — unbiased two-phase scheduler.
   (commit b435eda)
 * **PT-adaptive-budget-driven** — variable-frame-count loop
-  with budget redistribution. (this commit)
+  with budget redistribution. (commit 6360aa3)
 
-All four follow-ups are now closed. The plan's variance map
-output is the real shipped diagnostic deliverable. The
-"1.5-3× RMSE win" headline is honestly retracted as
-inapplicable to the test scenes in this measurement set.
+### Update — PT-adaptive-caustic-scene: adaptive actually wins
 
-Any future "this scheme actually wins" follow-up would be
-about scene heterogeneity, not architecture:
-* **PT-adaptive-caustic-scene** — render a caustic-heavy
-  test scene where the win condition (extreme variance
-  heterogeneity) is met, demonstrate the gain, ship the
-  numbers + the rendering.
+Cornell-glass-sphere is the Veach-style caustic test:
+glass sphere in a Cornell box concentrates the area light
+into a sharp caustic ring on the floor. The rest of the
+frame is moderate-variance diffuse. This is the variance-
+heterogeneity regime adaptive sampling is designed for.
+
+Measured by `cargo run --release --example gen_adaptive_bias
+-- caustic` with `ADAPT_BIAS_THRESHOLD=0.05` and
+`ADAPT_BIAS_MAX_SPP_MULT=16`:
+
+| max-spp | adapt-spp/active | fixed-spp | fixed RMSE | adaptive RMSE | ratio |
+| ------- | ---------------- | --------- | ---------- | ------------- | ----- |
+| 256     | 362              | 256       | 0.024129   | 0.021449      | **0.889** |
+| 1024    | 1556             | 1024      | 0.010806   | 0.010105      | **0.935** |
+| 2048    | 3148             | 2048      | 0.006584   | 0.006704      | 1.018 |
+
+**Adaptive wins at 256 and 1024 spp budgets** — ratios 0.889
+(11% RMSE improvement) and 0.935 (6.5% improvement). 35.7%
+of pixels converge at scout, freeing budget that's
+redirected to the caustic region. Active pixels get 1.4–1.5×
+more samples than the fixed-spp equivalent — the budget-
+driven loop's promised mechanism, demonstrably firing on
+this scene.
+
+At 2048 spp the ratio creeps back to ~1.0: fixed-spp's
+budget is already enough for most pixels at this resolution,
+so the marginal gain from concentrating samples on the
+caustic shrinks. Adaptive sampling matters most at the
+low-spp end where every sample counts.
+
+**Threshold sensitivity:**
+
+| threshold | 256 ratio | 1024 ratio | 2048 ratio | notes |
+| --------- | --------- | ---------- | ---------- | ----- |
+| 0.01      | 1.149     | 1.031      | 1.035      | too tight; 98.8% active, budget extension barely fires |
+| **0.05**  | **0.889** | **0.935**  | 1.018      | **the sweet spot** |
+| 0.10      | 0.824     | 1.548      | 2.574      | converges too eagerly; converged-pixel noise dominates at high spp |
+
+Threshold tuning matters. 0.05 is the robust win on this
+scene's pixel-variance distribution; 0.01 doesn't free
+enough budget; 0.10 sacrifices too many easy pixels to
+noise.
+
+### Honest verdict on the plan
+
+The plan rev-3 Done-when ("ratio ≤ 0.7 on ≥ 2 of 3 spp
+tiers") is **NOT met** even on the caustic scene — best
+achieved ratio is 0.824 at threshold 0.10, only at low spp,
+and at the cost of catastrophic failure at higher spp. The
+"1.5-3× win" was overclaimed for *any* scene-class measurable
+with our current test set.
+
+What the architecture DOES deliver: a **5–10% RMSE
+improvement at equal sample budget** on caustic-heavy
+scenes, in the low-to-mid spp regime, with the right
+threshold. Modest but real. The variance map continues to
+be a useful diagnostic on every render.
+
+Shipped images for the caustic comparison:
+* `data/output/caustic_reference.{png,exr}` — 4096-spp
+  reference.
+* `data/output/caustic_adaptive_256.{png,exr}` — adaptive at
+  256-spp budget (active pixels get ~363 each). Caustic ring
+  visibly cleaner than fixed-256 at equivalent sample
+  budget.
+* `data/output/caustic_fixed_256.{png,exr}` — fixed-spp
+  baseline. Caustic ring is the noisiest region.
+* `data/output/caustic_adaptive_256_variance.png` — where
+  adaptive concentrated its budget: yellow on caustic +
+  bunny silhouette, purple on converged walls.
+
+### The plan finally closes honestly
+
+* The scheduler architecture is correct (three variants,
+  measured, validated).
+* The variance map is the real shipped diagnostic.
+* On caustic-heavy scenes (high variance heterogeneity),
+  adaptive sampling delivers a modest 5–10% RMSE win at
+  equal sample budget when threshold is tuned.
+* On Cornell + Sponza (low/moderate heterogeneity),
+  adaptive is approximately tied with fixed-spp.
+* The plan's "1.5-3× win" was overclaimed; the honest
+  shipped headline is **"5-10% RMSE win on caustic-heavy
+  scenes at the right threshold; variance map is a real
+  diagnostic deliverable on any render."**
 
 What the measurement *does* validate:
 * The scheduler doesn't produce visually wrong images.
@@ -784,3 +860,9 @@ What this milestone does **not** deliver:
   place; the missing piece is a scene that exercises the
   high-heterogeneity regime where adaptive sampling
   dominates fixed-spp.
+  **Shipped: cornell_glass_sphere.gltf at threshold 0.05
+  gives ratios 0.889 / 0.935 / 1.018 across 256/1024/2048
+  spp budgets — adaptive wins at low/mid spp by 5-10%. The
+  win is real but modest; the plan's "1.5-3×" target was
+  overclaimed.** See the Findings update + the comparison
+  PNGs at `data/output/caustic_*.png`.

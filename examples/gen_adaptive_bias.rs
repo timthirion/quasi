@@ -86,6 +86,29 @@ fn cornell_preset() -> Preset {
     }
 }
 
+/// Cornell-glass-sphere preset: the classic Veach-style caustic
+/// test scene. A glass sphere in a Cornell box concentrates the
+/// area light into a sharp caustic on the floor. The bulk of the
+/// frame is moderate-variance diffuse, but the caustic region is
+/// pathologically high-variance (rare specular paths from light →
+/// glass refraction → eye). This is the regime where PT-adaptive's
+/// budget redirection should pay off — most pixels converge at
+/// `min_spp` and free up the budget for the small caustic region.
+fn caustic_preset() -> Preset {
+    Preset {
+        label: "cornell-glass-sphere",
+        scene_path: "data/gltf/cornell_glass_sphere.gltf",
+        // 128×128 keeps the reference fast; 4096-spp reference is
+        // enough to see the caustic's true mean without massive
+        // wall-clock cost.
+        w: 128,
+        h: 128,
+        reference_spp: 4096,
+        test_spp_values: vec![256, 1024, 2048],
+        cfg: RenderConfig::default(),
+    }
+}
+
 fn sponza_preset() -> Preset {
     let camera_pos = [-10.0, 2.0, 0.0];
     let look_at = [10.0, 4.0, 0.0];
@@ -121,6 +144,7 @@ fn main() {
     let preset_name: String = std::env::args().nth(1).unwrap_or_else(|| "cornell".into());
     let preset = match preset_name.as_str() {
         "sponza" => sponza_preset(),
+        "caustic" => caustic_preset(),
         _ => cornell_preset(),
     };
     eprintln!("[preset: {}]", preset.label);
