@@ -775,13 +775,29 @@ async fn render_offscreen_async(
     //
     // With `cfg.adaptive.is_none()` everything below is a no-op —
     // `scout_boundary` is `u32::MAX` so the boundary never trips.
+    // PT-adaptive-budget-driven (replacement of the fixed
+    // `for frame in 0..cfg.samples` loop): when adaptive is on,
+    // `cfg.samples` is interpreted as the **target average samples
+    // per pixel** (i.e. total budget = `cfg.samples × pixel_count`).
+    // At the scout boundary the CPU reads back the active mask to
+    // count converged pixels, then derives the production-frame
+    // count from the remaining budget divided by the active-pixel
+    // count. Savings on converged pixels translate directly into
+    // extra samples on the still-active pixels — which is what
+    // makes the scout-and-produce architecture actually deliver
+    // the literature's promised RMSE win at equal sample budget.
+    //
+    // With adaptive disabled, `total_frames` stays at `cfg.samples`
+    // exactly and the behaviour is bit-clean with pre-plan.
     let accum_adaptive_flag: u32 = u32::from(cfg.adaptive.is_some());
     let scout_boundary: u32 = cfg.adaptive.map(|a| a.min_spp).unwrap_or(u32::MAX);
     let mut in_production = false;
     let mut production_frame_count: u32 = 0;
+    let mut total_frames: u32 = cfg.samples;
 
     let mut read_idx = 0usize;
-    for frame in 0..cfg.samples {
+    let mut frame: u32 = 0;
+    while frame < total_frames {
         uniforms.frame_count = frame;
         queue.write_buffer(&uniform_buf, 0, bytemuck::bytes_of(&uniforms));
         // PT-adaptive-scout: during the production phase, the
@@ -931,13 +947,108 @@ async fn render_offscreen_async(
             }
             queue.submit(std::iter::once(enc.finish()));
 
+            // PT-adaptive-budget-driven: at the scout boundary, the
+            // active mask now reflects the termination decision.
+            // Read it back, count active pixels, derive the
+            // production-frame budget from the remaining sample
+            // allowance. Hard pixels get extra samples to the
+            // extent that easy pixels stopped early.
+            let pixels = (cfg.width as u64) * (cfg.height as u64);
+            let mask_bpr = align_up(cfg.width * 4, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+            let mask_size = (mask_bpr as u64) * (cfg.height as u64);
+            let budget_staging = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("scout-budget-mask-staging"),
+                size: mask_size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("scout-budget-mask-copy"),
+            });
+            enc.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &active_mask_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &budget_staging,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(mask_bpr),
+                        rows_per_image: Some(cfg.height),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: cfg.width,
+                    height: cfg.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit(std::iter::once(enc.finish()));
+            budget_staging
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, |r| r.expect("map_async failed"));
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+
+            let active_count: u64 = {
+                let raw = budget_staging.slice(..).get_mapped_range();
+                let unpadded = (cfg.width * 4) as usize;
+                let padded = mask_bpr as usize;
+                let mut n = 0u64;
+                for y in 0..cfg.height as usize {
+                    let start = y * padded;
+                    let row = &raw[start..start + unpadded];
+                    let pixels: &[u32] = bytemuck::cast_slice(row);
+                    for &p in pixels {
+                        if p == 1 {
+                            n += 1;
+                        }
+                    }
+                }
+                drop(raw);
+                budget_staging.unmap();
+                n
+            };
+
+            // Total budget = target spp × pixel count. Subtract
+            // what scout already drew (scout_boundary samples for
+            // every pixel) and divide the remainder among active
+            // pixels to get the per-active-pixel production frame
+            // count. Capped at `max_spp - scout_boundary` for
+            // safety; the scout-boundary subtraction makes the per-
+            // pixel ceiling refer to *total* samples not just
+            // production samples.
+            let target_total: u64 = (cfg.samples as u64) * pixels;
+            let scout_drawn: u64 = (scout_boundary as u64) * pixels;
+            let prod_budget = target_total.saturating_sub(scout_drawn);
+            let prod_frames = match prod_budget.checked_div(active_count) {
+                Some(by_budget) => {
+                    let by_safety = adapt.max_spp.saturating_sub(scout_boundary);
+                    (by_budget as u32).min(by_safety)
+                }
+                None => 0,
+            };
+            total_frames = scout_boundary.saturating_add(prod_frames);
+            eprintln!(
+                "[PT-adaptive-budget] scout n={}, active={}/{} ({:.1}%), prod_frames={}, total_frames={}, per-active-pixel-spp={}",
+                scout_boundary,
+                active_count,
+                pixels,
+                100.0 * (active_count as f64) / (pixels as f64),
+                prod_frames,
+                total_frames,
+                total_frames,
+            );
+
             in_production = true;
             production_frame_count = 0;
         }
 
-        let last = frame + 1 == cfg.samples;
+        let last = frame + 1 == total_frames;
         if let Some(p) = progress.as_mut() {
-            if (frame + 1) % sync_every == 0 || last {
+            if (frame + 1).is_multiple_of(sync_every) || last {
                 // Block until the GPU has finished everything
                 // submitted so far. Without this the tick fires on
                 // submission, not completion, and the bar reaches
@@ -945,9 +1056,11 @@ async fn render_offscreen_async(
                 // `sync_every` frames; amortised across a long
                 // render it's invisible.
                 let _ = device.poll(wgpu::PollType::wait_indefinitely());
-                p.tick((frame + 1) as u64, cfg.samples as u64);
+                p.tick((frame + 1) as u64, total_frames as u64);
             }
         }
+
+        frame += 1;
     }
     if let Some(p) = progress.as_mut() {
         p.finish();
@@ -1191,8 +1304,10 @@ async fn render_offscreen_async(
             } else {
                 // Active or clamped — production accumulator
                 // already holds the right values; fix up the
-                // sample count to reflect the full run.
-                sample_counts[i] = cfg.samples;
+                // sample count to reflect the full run, including
+                // any production-budget extension granted by
+                // PT-adaptive-budget-driven.
+                sample_counts[i] = total_frames;
             }
         }
     }

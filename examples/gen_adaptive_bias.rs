@@ -173,13 +173,23 @@ fn main() {
         .unwrap_or(0.01);
     eprintln!("[noise_threshold: {noise_threshold}]");
 
+    // PT-adaptive-budget-driven: lift max_spp well above the
+    // average target so the budget extension can actually fire.
+    // The scheduler is supposed to redistribute the budget freed
+    // by converged pixels onto hard pixels — that only happens if
+    // the per-pixel ceiling is above the target average.
+    let max_spp_multiplier: u32 = std::env::var("ADAPT_BIAS_MAX_SPP_MULT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16);
+
     for &spp in &test_spp_values {
         let mut adapt_cfg = base;
         adapt_cfg.samples = spp;
         adapt_cfg.adaptive = Some(AdaptiveConfig {
             noise_threshold,
             min_spp: 64,
-            max_spp: spp,
+            max_spp: spp.saturating_mul(max_spp_multiplier),
         });
         let adapt_aovs = render(&format!("adaptive @ max-spp {spp}"), adapt_cfg, &scene);
         let adapt_equiv = adapt_aovs.fixed_spp_equivalent().max(1);
