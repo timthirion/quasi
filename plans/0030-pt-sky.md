@@ -1,6 +1,6 @@
 # PT-sky — procedural atmospheric scattering sky
 
-- **Status:** draft
+- **Status:** in-flight (PT-sky/hosek-cpu math + scripts shipped; data vendor + validation gated on user run)
 - **Last updated:** 2026-06-15
 - **Last touched on:** rev 2.1 — round-2 skeptic patches: corrects Hosek-Wilkie 2013 solar-radiance paper citation (rev-2 cited the wrong paper), specifies reference C++ fork explicitly, tightens calibration-constant procedure (was hand-wavy "eyeballed"), adds dawn/sunset RMSE checks to catch 180° azimuth flip
 
@@ -256,28 +256,26 @@ above).
 
 ## Milestones
 
-- [ ] **[PT-sky/hosek-cpu]** Pure-Rust implementation of
-  Hosek-Wilkie 2012 in `src/pathtrace/sky.rs`. Uses the
-  vendored `data/sky/ArHosekSkyModelData_RGB.h` coefficient
-  tables. Interpolation matches the reference C++ code:
-  linear in turbidity, quintic Bezier in solar elevation,
-  linear in ground albedo. **Held-out validation test
-  (the load-bearing correctness check):**
-  * Generate 200 (sun-zenith, view-zenith, azimuth, turbidity)
-    quadruples on a uniform grid that **does not** coincide
-    with the tabulated dataset nodes (e.g. half-integer
-    turbidity values and off-grid angles).
-  * For each, compute the reference output by running the
-    Hosek/Wilkie reference C++ code on the same inputs (we
-    vendor this once into `tests/sky/reference_outputs.csv`
-    so the test doesn't depend on a C++ build).
-  * Assert ≤ 0.5% relative error on ≥ 95% of the held-out
-    set. Failing samples must lie in the [0°, 5°] solar-
-    elevation horizon band (documented poor-fit region).
-  * Tabulated-node-only validation (the rev-1 spec) is
-    **also** included but only as a secondary sanity check;
-    pass criterion ≤ 0.05% on 100% of nodes (trivial — these
-    are direct table lookups in the interpolation scheme).
+- [/] **[PT-sky/hosek-cpu]** Pure-Rust implementation of
+  Hosek-Wilkie 2012 in `src/pathtrace/sky.rs`.
+  **Shipped in this session:** the math (quintic Bezier in
+  elevation, linear lerp in turbidity + albedo, Perez-style
+  radiance formula), the `SkyParams` + `sky_radiance` public
+  API, 16 unit tests covering Bezier eval (endpoints,
+  partition-of-unity, half-point closed form, constancy),
+  elevation-to-Bezier warp, lerp, formula finiteness at
+  pathological inputs, below-horizon clamps. Plus
+  `scripts/sky/fetch_hosek_data.py` to vendor the official
+  cgg.mff.cuni.cz coefficient tables.
+  **Gated on a follow-up step (the user runs the vendor
+  script with the official zip):**
+  * Held-out validation: 200 off-grid (sun-zenith,
+    view-zenith, azimuth, turbidity) quadruples, reference
+    outputs from running the upstream C++, ≤ 0.5% relative
+    error on ≥ 95% with failures restricted to the [0°, 5°]
+    horizon band.
+  * Tabulated-node sanity check: ≤ 0.05% relative error on
+    100% of dataset nodes (trivial after vendor).
 - [ ] **[PT-sky/bake]** `Sky::bake_to_equirect(width, height)
   -> EnvironmentMap` produces a baked HDR equirect compatible
   with `src/pathtrace/env.rs`'s

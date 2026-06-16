@@ -32,6 +32,7 @@ pub mod mesh;
 pub mod phase;
 pub mod sampler;
 pub mod scene;
+pub mod sky;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod env;
