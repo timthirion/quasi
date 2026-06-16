@@ -111,6 +111,34 @@ impl Aovs {
         self.sample_counts.iter().copied().map(u64::from).sum()
     }
 
+    /// PT-bloom (plan 0029): the soft-knee extract formula in CPU
+    /// reference form, matching the WGSL `soft_knee_extract` in
+    /// `bloom_extract.wgsl`. Used by the unit tests below to pin
+    /// the math — the load-bearing property is that sub-threshold
+    /// pixels produce weight 0 (not negative), so bloom doesn't
+    /// darken midtones near bright sources.
+    #[cfg(test)]
+    pub fn soft_knee_extract_reference(rgb: [f32; 3], threshold: f32, knee: f32) -> [f32; 3] {
+        // Firefly guard (matches the shader's `is_finite && is_bounded`).
+        let is_finite = rgb[0].is_finite() && rgb[1].is_finite() && rgb[2].is_finite();
+        let is_bounded = rgb[0] < 1.0e6 && rgb[1] < 1.0e6 && rgb[2] < 1.0e6;
+        let safe = if is_finite && is_bounded {
+            rgb
+        } else {
+            [0.0, 0.0, 0.0]
+        };
+
+        let brightness = safe[0].max(safe[1]).max(safe[2]);
+        let b_safe = brightness.max(1e-6);
+
+        let curve_x = (brightness - threshold + knee).clamp(0.0, 2.0 * knee);
+        let curve = curve_x * curve_x * 0.25 / knee.max(1e-6);
+        let linear = brightness - threshold;
+
+        let weight = curve.max(linear).max(0.0) / b_safe;
+        [safe[0] * weight, safe[1] * weight, safe[2] * weight]
+    }
+
     /// PT-adaptive-sample-count: equivalent fixed-spp count for an
     /// equal-sample-budget bias-check comparison. Rounds up to the
     /// nearest integer so the fixed-spp control draws at least as
@@ -168,6 +196,46 @@ impl AdaptiveConfig {
     };
 }
 
+/// PT-bloom (plan 0029): HDR bloom post-process parameters.
+/// `None` on [`RenderConfig::bloom`] disables bloom — pre-plan
+/// bit-identical behaviour. `Some(_)` enables the bloom pass: an
+/// extract pass writes bright pixels (via a Unity-correct soft-
+/// knee) to a mip-chain texture, a Kawase 4-tap dual-filter
+/// down/upsample chain spreads them, and a final composite adds
+/// `intensity × bloom` back into the radiance buffer before the
+/// CPU readback + tonemap.
+///
+/// Citation for the algorithm: Marius Bjørge, "Bandwidth-Efficient
+/// Rendering" (SIGGRAPH 2015) §3.4 dual-filter blur; Jorge Jimenez,
+/// "Next Generation Post Processing in Call of Duty: Advanced
+/// Warfare" (SIGGRAPH 2014) for the progressive-downsample bloom
+/// reference.
+#[derive(Clone, Copy, Debug)]
+pub struct BloomConfig {
+    /// Composite multiplier — `bloom_intensity * bloom_mip0` is
+    /// added back into the radiance. Tuned per scene; the plan
+    /// notes 0.04 as a conservative default that adds a visible
+    /// halo without softening normal-bright objects.
+    pub intensity: f32,
+    /// Soft-knee threshold: pixels brighter than this contribute
+    /// to bloom; pixels dimmer than `threshold - knee` contribute
+    /// nothing.
+    pub threshold: f32,
+    /// Soft-knee width: the smooth quadratic ramp covers
+    /// `[threshold - knee, threshold + knee]` to avoid banding at
+    /// a hard cutoff.
+    pub knee: f32,
+}
+
+impl BloomConfig {
+    /// Plan-0029 documented defaults.
+    pub const DEFAULT: Self = Self {
+        intensity: 0.04,
+        threshold: 1.0,
+        knee: 0.5,
+    };
+}
+
 /// Camera + sampling configuration for an offscreen render.
 #[derive(Clone, Copy, Debug)]
 pub struct RenderConfig {
@@ -197,6 +265,11 @@ pub struct RenderConfig {
     /// PT-adaptive (plan 0028): adaptive sampling parameters.
     /// `None` keeps fixed-spp behaviour (pre-plan bit-identical).
     pub adaptive: Option<AdaptiveConfig>,
+    /// PT-bloom (plan 0029): HDR bloom post-process. `None`
+    /// disables bloom (pre-plan bit-identical); `Some(_)` runs
+    /// the GPU bloom passes on the radiance buffer before the
+    /// CPU tonemap so the saved PNG carries the bloom.
+    pub bloom: Option<BloomConfig>,
 }
 
 impl Default for RenderConfig {
@@ -217,6 +290,7 @@ impl Default for RenderConfig {
             sun_dir: None,
             sun_color: [1.0, 1.0, 1.0],
             adaptive: None,
+            bloom: None,
         }
     }
 }
@@ -588,7 +662,7 @@ async fn render_offscreen_async(
                 cfg.width,
                 cfg.height,
                 name,
-                wgpu::TextureUsages::COPY_SRC,
+                wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
             )
         })
     });
@@ -1066,6 +1140,460 @@ async fn render_offscreen_async(
         p.finish();
     }
 
+    // PT-bloom (plan 0029): GPU bloom pass over the accumulated
+    // radiance. Runs once per render (not per sample) after the
+    // accumulator settles. Extract pass → mip-0 of a Rgba16Float
+    // mip chain; Kawase 4-tap downsample fills each subsequent
+    // level; 9-tap tent upsample additively blends back upward;
+    // composite adds `intensity × bloom_mip0` to the radiance in
+    // the *other* ping-pong slot and we bump read_idx so the
+    // existing readback picks up the bloomed image.
+    if let Some(bloom_cfg) = cfg.bloom {
+        // Mip chain: cap at 5 levels, stop when a side would
+        // shrink below 16 px so the 4-tap kernels stay sane.
+        let mut levels: Vec<(u32, u32)> = vec![(cfg.width, cfg.height)];
+        {
+            let mut w = cfg.width;
+            let mut h = cfg.height;
+            while levels.len() < 5 {
+                w = (w / 2).max(1);
+                h = (h / 2).max(1);
+                if w < 16 || h < 16 {
+                    break;
+                }
+                levels.push((w, h));
+            }
+        }
+        let bloom_format = wgpu::TextureFormat::Rgba16Float;
+        let mip_textures: Vec<wgpu::Texture> = levels
+            .iter()
+            .enumerate()
+            .map(|(i, &(w, h))| {
+                device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some(&format!("bloom-mip-{i}")),
+                    size: wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: bloom_format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+            })
+            .collect();
+        let mip_views: Vec<wgpu::TextureView> = mip_textures
+            .iter()
+            .map(|t| t.create_view(&Default::default()))
+            .collect();
+
+        let bloom_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("bloom-linear-clamp"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+
+        // --- Bind group layouts ---
+        let nonfiltering_tex = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let filtering_tex = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let sampler_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: None,
+        };
+        let uniform_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+
+        let extract_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bloom-extract-bgl"),
+            entries: &[nonfiltering_tex(0), uniform_entry(1)],
+        });
+        let kernel_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bloom-kernel-bgl"),
+            entries: &[filtering_tex(0), sampler_entry(1), uniform_entry(2)],
+        });
+        let composite_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bloom-composite-bgl"),
+            entries: &[nonfiltering_tex(0), nonfiltering_tex(1), uniform_entry(2)],
+        });
+
+        // --- Pipelines ---
+        let make_render_pipeline = |label: &str,
+                                    src: &str,
+                                    bgl: &wgpu::BindGroupLayout,
+                                    format: wgpu::TextureFormat,
+                                    additive: bool| {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(src.into()),
+            });
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(label),
+                bind_group_layouts: &[Some(bgl)],
+                immediate_size: 0,
+            });
+            let blend = if additive {
+                Some(wgpu::BlendState {
+                    color: wgpu::BlendComponent {
+                        src_factor: wgpu::BlendFactor::One,
+                        dst_factor: wgpu::BlendFactor::One,
+                        operation: wgpu::BlendOperation::Add,
+                    },
+                    alpha: wgpu::BlendComponent {
+                        src_factor: wgpu::BlendFactor::One,
+                        dst_factor: wgpu::BlendFactor::One,
+                        operation: wgpu::BlendOperation::Add,
+                    },
+                })
+            } else {
+                None
+            };
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+
+        let extract_pipeline = make_render_pipeline(
+            "bloom-extract",
+            include_str!("shaders/bloom_extract.wgsl"),
+            &extract_bgl,
+            bloom_format,
+            false,
+        );
+        let downsample_pipeline = make_render_pipeline(
+            "bloom-downsample",
+            include_str!("shaders/bloom_downsample.wgsl"),
+            &kernel_bgl,
+            bloom_format,
+            false,
+        );
+        let upsample_pipeline = make_render_pipeline(
+            "bloom-upsample",
+            include_str!("shaders/bloom_upsample.wgsl"),
+            &kernel_bgl,
+            bloom_format,
+            true, // additive blend onto the existing (downsampled) mip
+        );
+        let composite_pipeline = make_render_pipeline(
+            "bloom-composite",
+            include_str!("shaders/bloom_composite.wgsl"),
+            &composite_bgl,
+            OFFSCREEN_FORMAT,
+            false,
+        );
+
+        // --- Uniform buffers ---
+        let extract_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bloom-extract-uniform"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let extract_u: [f32; 4] = [bloom_cfg.threshold, bloom_cfg.knee, 0.0, 0.0];
+        queue.write_buffer(&extract_uniform, 0, bytemuck::bytes_of(&extract_u));
+
+        let composite_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bloom-composite-uniform"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let composite_u: [f32; 4] = [bloom_cfg.intensity, 0.0, 0.0, 0.0];
+        queue.write_buffer(&composite_uniform, 0, bytemuck::bytes_of(&composite_u));
+
+        // One kernel uniform per level transition (src texel size
+        // differs per pass — its source is the mip *being read*).
+        let make_kernel_uniform = |src_w: u32, src_h: u32| {
+            let data: [f32; 4] = [1.0 / (src_w as f32), 1.0 / (src_h as f32), 0.0, 0.0];
+            let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("bloom-kernel-uniform"),
+                size: 16,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            queue.write_buffer(&buf, 0, bytemuck::bytes_of(&data));
+            buf
+        };
+
+        // The source for the extract pass: the just-completed
+        // radiance accumulator.
+        let extract_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bloom-extract-bg"),
+            layout: &extract_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(
+                        &accum_views[read_idx][AOV_RADIANCE],
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: extract_uniform.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("bloom-encoder"),
+        });
+
+        // Extract → mip 0
+        {
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("bloom-extract-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &mip_views[0],
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+            rp.set_pipeline(&extract_pipeline);
+            rp.set_bind_group(0, &extract_bg, &[]);
+            rp.draw(0..3, 0..1);
+        }
+
+        // Downsample chain: mip[i] → mip[i+1]
+        let mut kernel_uniforms: Vec<wgpu::Buffer> = Vec::new();
+        for i in 0..(levels.len() - 1) {
+            let (src_w, src_h) = levels[i];
+            let u = make_kernel_uniform(src_w, src_h);
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("bloom-downsample-bg"),
+                layout: &kernel_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&mip_views[i]),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&bloom_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: u.as_entire_binding(),
+                    },
+                ],
+            });
+            kernel_uniforms.push(u);
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("bloom-downsample-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &mip_views[i + 1],
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+            rp.set_pipeline(&downsample_pipeline);
+            rp.set_bind_group(0, &bg, &[]);
+            rp.draw(0..3, 0..1);
+        }
+
+        // Upsample chain: mip[i+1] → mip[i] (additive blend)
+        for i in (0..(levels.len() - 1)).rev() {
+            let (src_w, src_h) = levels[i + 1];
+            let u = make_kernel_uniform(src_w, src_h);
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("bloom-upsample-bg"),
+                layout: &kernel_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&mip_views[i + 1]),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&bloom_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: u.as_entire_binding(),
+                    },
+                ],
+            });
+            kernel_uniforms.push(u);
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("bloom-upsample-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &mip_views[i],
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        // Load existing content of mip[i] (from the
+                        // earlier downsample) so the additive blend
+                        // accumulates the upsample contribution.
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+            rp.set_pipeline(&upsample_pipeline);
+            rp.set_bind_group(0, &bg, &[]);
+            rp.draw(0..3, 0..1);
+        }
+
+        // Composite: accum[read_idx] + intensity × mip0 →
+        // accum[1 - read_idx]. The other ping-pong slot is the
+        // destination; readback then bumps to it.
+        let composite_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bloom-composite-bg"),
+            layout: &composite_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(
+                        &accum_views[read_idx][AOV_RADIANCE],
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&mip_views[0]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: composite_uniform.as_entire_binding(),
+                },
+            ],
+        });
+        {
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("bloom-composite-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &accum_views[1 - read_idx][AOV_RADIANCE],
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+            rp.set_pipeline(&composite_pipeline);
+            rp.set_bind_group(0, &composite_bg, &[]);
+            rp.draw(0..3, 0..1);
+        }
+        queue.submit(std::iter::once(enc.finish()));
+        let _ = kernel_uniforms; // keep alive through submission
+
+        // The bloomed radiance now lives in the *other* ping-pong
+        // slot. Bump read_idx so the readback fetches it. The
+        // other AOVs (albedo, normal, depth, mean_y2) are still
+        // in their original ping-pong slot — bloom only affects
+        // the radiance channel, so we need to also copy those
+        // through to the new slot for the readback. Use
+        // texture-to-texture copies for the other AOVs.
+        let mut copy_enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("bloom-post-aov-copy"),
+        });
+        for aov in [AOV_ALBEDO, AOV_NORMAL, AOV_DEPTH, AOV_MEAN_Y2] {
+            copy_enc.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &accum_textures[read_idx][aov],
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &accum_textures[1 - read_idx][aov],
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: cfg.width,
+                    height: cfg.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        queue.submit(std::iter::once(copy_enc.finish()));
+        read_idx = 1 - read_idx;
+        let _ = mip_textures; // keep alive past submission
+    }
+
     // --- Readback ---
     let bytes_per_row = align_up(
         cfg.width * BYTES_PER_PIXEL,
@@ -1378,6 +1906,54 @@ mod tests {
         assert_eq!(a.total_samples_drawn(), 1280);
         // 1280 samples / 8 pixels = 160 spp exact.
         assert_eq!(a.fixed_spp_equivalent(), 160);
+    }
+
+    /// PT-bloom (plan 0029) — the load-bearing soft-knee math
+    /// pinned by the plan-skeptic's strongest single attack. A
+    /// sub-threshold pixel **must** produce weight 0 (not
+    /// negative) — otherwise bloom would *subtract* dim radiance
+    /// and darken midtones near bright sources, the opposite of
+    /// what bloom is supposed to do.
+    #[test]
+    fn bloom_soft_knee_sub_threshold_extracts_to_zero() {
+        // Pixel at brightness 0.3 with threshold 1.0, knee 0.5.
+        // brightness - threshold + knee = 0.3 - 1.0 + 0.5 = -0.2.
+        // clamp(-0.2, 0, 1.0) = 0 → curve = 0.
+        // linear = 0.3 - 1.0 = -0.7.
+        // max(0, -0.7, 0) = 0. weight = 0.
+        let out = Aovs::soft_knee_extract_reference([0.3, 0.2, 0.1], 1.0, 0.5);
+        assert_eq!(out, [0.0, 0.0, 0.0]);
+    }
+
+    /// PT-bloom: well above threshold passes through scaled by
+    /// `(b - threshold) / b`.
+    #[test]
+    fn bloom_soft_knee_above_threshold_scales_linearly() {
+        // Brightness = 5.0 (max of channels), threshold = 1.0,
+        // knee = 0.5. linear = 4.0. curve = (0.5 + 0.5) * 0.5 ≈ ?
+        // Actually curve_x = clamp(5 - 1 + 0.5, 0, 1) = 1.0
+        // (clamped). curve = 1 * 0.25 / 0.5 = 0.5.
+        // max(0.5, 4.0, 0) = 4.0. weight = 4 / 5 = 0.8.
+        let out = Aovs::soft_knee_extract_reference([5.0, 0.5, 1.5], 1.0, 0.5);
+        let expected = [5.0 * 0.8, 0.5 * 0.8, 1.5 * 0.8];
+        for c in 0..3 {
+            assert!((out[c] - expected[c]).abs() < 1e-6);
+        }
+    }
+
+    /// PT-bloom: NaN / Inf / firefly pixels are clamped to zero
+    /// before any math runs — preventing them from propagating
+    /// through the mip chain.
+    #[test]
+    fn bloom_soft_knee_clamps_fireflies() {
+        let out = Aovs::soft_knee_extract_reference([f32::NAN, 0.5, 1.5], 1.0, 0.5);
+        assert_eq!(out, [0.0, 0.0, 0.0]);
+
+        let out = Aovs::soft_knee_extract_reference([1.0e7, 0.5, 1.5], 1.0, 0.5);
+        assert_eq!(out, [0.0, 0.0, 0.0]);
+
+        let out = Aovs::soft_knee_extract_reference([f32::INFINITY, 0.5, 1.5], 1.0, 0.5);
+        assert_eq!(out, [0.0, 0.0, 0.0]);
     }
 
     /// PT-adaptive-sample-count: a non-divisible total rounds up

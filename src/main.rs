@@ -132,6 +132,27 @@ struct RenderArgs {
     /// When unset, defaults to `--spp`. Pixels that hit this
     /// ceiling without converging are flagged in the variance map.
     max_spp: Option<u32>,
+    /// `--bloom` (PT-bloom, plan 0029) enables the HDR bloom
+    /// post-process. A Kawase 4-tap dual-filter chain spreads
+    /// bright pixels into a halo before the CPU tonemap, so saved
+    /// PNGs show the iconic glow around sun glint, lamp filaments,
+    /// emissives, etc. Off by default — pre-plan behaviour
+    /// preserved.
+    bloom: bool,
+    /// `--bloom-intensity I` (PT-bloom): composite multiplier
+    /// applied to the bloom contribution. Defaults to 0.04 — a
+    /// conservative value that produces a visible halo without
+    /// softening normal-bright objects.
+    bloom_intensity: f32,
+    /// `--bloom-threshold T` (PT-bloom): soft-knee threshold.
+    /// Pixels brighter than this contribute to bloom; pixels
+    /// dimmer than `threshold - knee` don't. Default 1.0 — just
+    /// above what Reinhard tonemap maps to white.
+    bloom_threshold: f32,
+    /// `--bloom-knee K` (PT-bloom): width of the soft-knee
+    /// quadratic ramp covering `[threshold - knee, threshold +
+    /// knee]`. Default 0.5.
+    bloom_knee: f32,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -159,6 +180,10 @@ impl Default for RenderArgs {
             noise_threshold: 0.01,
             min_spp: 64,
             max_spp: None,
+            bloom: false,
+            bloom_intensity: 0.04,
+            bloom_threshold: 1.0,
+            bloom_knee: 0.5,
         }
     }
 }
@@ -305,6 +330,36 @@ fn parse_render_args(args: &[String]) -> Result<RenderArgs, String> {
                 let n: u32 = v.parse().map_err(|e| format!("--max-spp: {e}"))?;
                 r.max_spp = Some(n);
             }
+            "--bloom" => {
+                r.bloom = true;
+            }
+            "--bloom-intensity" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| "--bloom-intensity needs a number".to_string())?;
+                r.bloom_intensity = v.parse().map_err(|e| format!("--bloom-intensity: {e}"))?;
+                if r.bloom_intensity < 0.0 {
+                    return Err(format!(
+                        "--bloom-intensity must be ≥ 0; got {}",
+                        r.bloom_intensity,
+                    ));
+                }
+            }
+            "--bloom-threshold" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| "--bloom-threshold needs a number".to_string())?;
+                r.bloom_threshold = v.parse().map_err(|e| format!("--bloom-threshold: {e}"))?;
+            }
+            "--bloom-knee" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| "--bloom-knee needs a number".to_string())?;
+                r.bloom_knee = v.parse().map_err(|e| format!("--bloom-knee: {e}"))?;
+                if r.bloom_knee <= 0.0 {
+                    return Err(format!("--bloom-knee must be > 0; got {}", r.bloom_knee));
+                }
+            }
             "--help" | "-?" => {
                 println!(
                     "render options:\n\
@@ -397,6 +452,16 @@ fn run_render(args: &[String]) {
             noise_threshold: cli.noise_threshold,
             min_spp: cli.min_spp,
             max_spp: cli.max_spp.unwrap_or(cli.samples),
+        });
+    }
+    // PT-bloom (plan 0029): wire CLI flags into the optional
+    // BloomConfig. With `--bloom` unset, `cfg.bloom` stays None
+    // and the offscreen pipeline skips the entire bloom pass.
+    if cli.bloom {
+        cfg.bloom = Some(quasi::pathtrace::offscreen::BloomConfig {
+            intensity: cli.bloom_intensity,
+            threshold: cli.bloom_threshold,
+            knee: cli.bloom_knee,
         });
     }
     log::info!(
