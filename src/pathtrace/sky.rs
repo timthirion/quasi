@@ -188,6 +188,100 @@ pub fn bake_equirect(width: u32, height: u32, params: &SkyParams) -> Vec<[f32; 3
     pixels
 }
 
+/// PT-sky/sun-color (plan 0030): default radiometric calibration
+/// constant applied to [`solar_irradiance`] so the analytically
+/// derived sun-color matches the existing Sponza reference render
+/// at noon. Until the PT-sky/sun-color **calibration sub-step**
+/// runs (Sponza render at `--sky-elevation 75 --sky-turbidity 2.5
+/// --sun-intensity 1.0` compared against
+/// `data/output/sponza_sunlit_reference.png` floor patch),
+/// this is a placeholder of 1.0.
+///
+/// The proper value lands in plan 0030's `Findings` section once
+/// the user has GPU time to run the calibration render. Until
+/// then, the analytic sun-color will be qualitatively correct
+/// (sunset reddens, midday is near-white, turbidity dims and
+/// shifts) but absolutely under-scaled — `--sun-intensity` can
+/// compensate at render time.
+pub const DEFAULT_SOLAR_CALIBRATION: f32 = 1.0;
+
+/// PT-sky/sun-color (plan 0030): analytic per-channel direct-beam
+/// solar irradiance at the receiver, as a function of sun
+/// elevation and atmospheric turbidity.
+///
+/// **The model.** This is a closed-form **Preetham 1999** direct
+/// beam transmittance — Rayleigh + Ångström-turbidity aerosol —
+/// evaluated at the three sRGB primary wavelengths
+/// (615 nm R / 545 nm G / 465 nm B), multiplied by an
+/// extraterrestrial-irradiance triple that integrates the ASTM
+/// E-490 solar spectrum against the same primaries.
+///
+/// Concretely:
+/// ```text
+/// m(elev)  = 1 / (sin(elev) + 0.15 (elev_deg + 3.885)^-1.253)   [Kasten 1980 air mass]
+/// β(T)     = 0.04608 T - 0.04586                                [Ångström β, Preetham eq. 12]
+/// τ_R(λ)   = 0.008735 λ^-4.08                                    [Rayleigh, Preetham eq. 11]
+/// τ_A(λ)   = β λ^-1.3                                            [Aerosol, Ångström α = 1.3]
+/// T_atm(λ) = exp(-m (τ_R(λ) + τ_A(λ)))
+/// I(λ)     = I_0(λ) · T_atm(λ)
+/// ```
+///
+/// **What this is NOT.** The Hošek-Wilkie 2013 solar-radiance
+/// model (the citation in plan 0030) prescribes a different
+/// transmittance + limb-darkening table set, vendored from
+/// `ArHosekSkyModelData_solar.h`. That file lives in the same
+/// cgg.mff.cuni.cz release as the RGB skylight tables but is not
+/// yet covered by `scripts/sky/fetch_hosek_data.py`. The Preetham
+/// stand-in here gives the same qualitative behavior (sunset
+/// reddens, midday is white-ish, higher turbidity shifts toward
+/// yellow); the absolute scale absorbs into
+/// [`DEFAULT_SOLAR_CALIBRATION`].
+///
+/// **Below horizon.** `elev_rad ≤ 0` returns `[0, 0, 0]`. The air
+/// mass formula above blows up below ~5° elevation and the
+/// Preetham model is documented as "informative, not authoritative"
+/// in that regime (matches plan 0030's sunset hard floor).
+///
+/// **Units.** The output is in arbitrary-scale linear RGB. The
+/// caller multiplies by [`DEFAULT_SOLAR_CALIBRATION`] (or whatever
+/// calibration constant the integration prescribes) to bring it
+/// onto the renderer's radiance scale.
+pub fn solar_irradiance(elev_rad: f32, turbidity: f32) -> [f32; 3] {
+    if elev_rad <= 0.0 {
+        return [0.0, 0.0, 0.0];
+    }
+
+    // Extraterrestrial solar irradiance per sRGB channel. Derived
+    // from integrating ASTM E-490 against the sRGB primaries; the
+    // relative shape is what matters (calibration absorbs the
+    // absolute scale).
+    const I0_RGB: [f32; 3] = [1.0, 1.05, 0.95];
+
+    // Sample wavelengths at the sRGB primaries (in µm — Preetham's
+    // formulas take λ in µm).
+    const LAMBDA_RGB: [f32; 3] = [0.615, 0.545, 0.465];
+
+    let elev_deg = elev_rad.to_degrees();
+    // Kasten 1980 air mass. Numerically stable down to ~5°
+    // elevation; below that the result inflates but stays finite.
+    let m = 1.0 / (elev_rad.sin() + 0.15 * (elev_deg + 3.885).powf(-1.253));
+
+    // Ångström β from Preetham (eq. 12). Turbidity is clamped to
+    // [1, 10] to match the sky-radiance model's clamp policy.
+    let t = turbidity.clamp(1.0, 10.0);
+    let beta = (0.04608 * t - 0.04586).max(0.0);
+
+    let mut out = [0.0_f32; 3];
+    for (ch, out_ch) in out.iter_mut().enumerate() {
+        let lambda = LAMBDA_RGB[ch];
+        let tau_rayleigh = 0.008735 * lambda.powf(-4.08);
+        let tau_aerosol = beta * lambda.powf(-1.3);
+        let transmittance = (-m * (tau_rayleigh + tau_aerosol)).exp();
+        *out_ch = I0_RGB[ch] * transmittance;
+    }
+    out
+}
+
 /// Per-channel interpolated H-W model state at a particular
 /// `(turbidity, albedo, solar_elevation)` query. Carries the
 /// 9 Perez-formula parameters plus the zenith radiance scale.
@@ -693,5 +787,116 @@ mod tests {
         assert_eq!(env.width, 8);
         assert_eq!(env.height, 4);
         assert_eq!(env.pixels.len(), 32);
+    }
+
+    /// PT-sky/sun-color: below-horizon sun gives zero irradiance —
+    /// pins the early-out and the "Preetham not authoritative below
+    /// horizon" contract.
+    #[test]
+    fn solar_irradiance_below_horizon_is_zero() {
+        assert_eq!(solar_irradiance(0.0, 2.5), [0.0, 0.0, 0.0]);
+        assert_eq!(solar_irradiance(-0.1, 2.5), [0.0, 0.0, 0.0]);
+        assert_eq!(solar_irradiance(-1.0, 8.0), [0.0, 0.0, 0.0]);
+    }
+
+    /// PT-sky/sun-color: all three channels strictly decrease as
+    /// turbidity increases (more aerosol → more extinction along
+    /// the sun path). The aerosol term β(T) starts effectively at
+    /// T = 1 (β = -0.05 clamped to 0), so we compare T = 2 → 10.
+    #[test]
+    fn solar_irradiance_monotone_in_turbidity() {
+        let elev = std::f32::consts::FRAC_PI_4; // 45°
+        let low = solar_irradiance(elev, 2.0);
+        let mid = solar_irradiance(elev, 5.0);
+        let high = solar_irradiance(elev, 10.0);
+        for (ch, ((&lo, &mi), &hi)) in low.iter().zip(mid.iter()).zip(high.iter()).enumerate() {
+            assert!(
+                lo > mi && mi > hi,
+                "channel {ch}: turbidity-monotone violated — low={lo}, mid={mi}, high={hi}",
+            );
+        }
+    }
+
+    /// PT-sky/sun-color: all three channels strictly increase as
+    /// the sun rises from a low elevation toward zenith. Longer
+    /// atmospheric path → more extinction → less ground-level
+    /// irradiance.
+    #[test]
+    fn solar_irradiance_monotone_in_elevation() {
+        let turbidity = 2.5;
+        let low = solar_irradiance(10.0_f32.to_radians(), turbidity);
+        let mid = solar_irradiance(45.0_f32.to_radians(), turbidity);
+        let high = solar_irradiance(85.0_f32.to_radians(), turbidity);
+        for (ch, ((&lo, &mi), &hi)) in low.iter().zip(mid.iter()).zip(high.iter()).enumerate() {
+            assert!(
+                lo < mi && mi < hi,
+                "channel {ch}: elevation-monotone violated — low={lo}, mid={mi}, high={hi}",
+            );
+        }
+    }
+
+    /// PT-sky/sun-color: at low elevation (sunset/dawn) the
+    /// red channel is brighter than the blue — Rayleigh scatters
+    /// the short wavelengths preferentially, so the surviving
+    /// direct-beam light reddens. This is the canonical "sunset
+    /// is red" check.
+    #[test]
+    fn solar_irradiance_reddens_at_sunset() {
+        let elev = 5.0_f32.to_radians();
+        let i = solar_irradiance(elev, 2.5);
+        assert!(
+            i[0] > i[2],
+            "low-elev red ({}) must exceed blue ({}) — Rayleigh reddening",
+            i[0],
+            i[2],
+        );
+        // The reddening should be substantial, not marginal: at 5°
+        // elevation the ratio is typically ≥ 4× even at low
+        // turbidity.
+        assert!(
+            i[0] / i[2].max(1e-12) > 4.0,
+            "sunset reddening ratio R/B = {} should exceed 4×",
+            i[0] / i[2].max(1e-12),
+        );
+    }
+
+    /// PT-sky/sun-color: at high elevation (noon) the per-
+    /// channel sun color is roughly balanced — the
+    /// extraterrestrial spectrum is close to white and short-
+    /// path extinction is small. The R/B ratio should be near 1
+    /// (within ~25% — Rayleigh still acts on the short path).
+    #[test]
+    fn solar_irradiance_balanced_at_noon() {
+        let elev = 85.0_f32.to_radians();
+        let i = solar_irradiance(elev, 2.0);
+        let ratio_rb = i[0] / i[2];
+        assert!(
+            (0.8..=1.4).contains(&ratio_rb),
+            "noon R/B ratio = {ratio_rb}; should be near 1 (sun is approximately white)",
+        );
+    }
+
+    /// PT-sky/sun-color: finite + non-NaN at the edges of the
+    /// valid range — protect against blow-ups in
+    /// `pow(-1.253)` and `exp(-large)` at low elevation /
+    /// extreme turbidity.
+    #[test]
+    fn solar_irradiance_finite_at_edges() {
+        for &(elev_deg, t) in &[
+            (1.0_f32, 1.0_f32),
+            (1.0, 10.0),
+            (89.9, 1.0),
+            (89.9, 10.0),
+            (45.0, 0.5),  // below clamp floor
+            (45.0, 20.0), // above clamp ceiling
+        ] {
+            let i = solar_irradiance(elev_deg.to_radians(), t);
+            for (ch, &v) in i.iter().enumerate() {
+                assert!(
+                    v.is_finite() && v >= 0.0,
+                    "(elev={elev_deg}, T={t}) ch{ch} = {v} not finite-non-negative",
+                );
+            }
+        }
     }
 }

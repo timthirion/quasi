@@ -322,11 +322,38 @@ above).
   elevation-azimuth-to-dir conversion matches the env.rs
   coordinate convention at zenith / +X horizon / +Z horizon
   + unit-length check at three off-axis pairs.
-- [ ] **[PT-sky/sun-color]** When `--sky` is set, derive
-  `--sun-color` from Hošek-Wilkie 2013 analytic solar
-  irradiance computed at the current
-  (elevation, turbidity). **Calibration procedure (not
-  eyeballed):**
+- [/] **[PT-sky/sun-color]** When `--sky` is set, derive
+  `--sun-color` from an analytic atmospheric-transmittance
+  irradiance computed at the current (elevation, turbidity).
+  **Shipped in this session:**
+  * `sky::solar_irradiance(elev_rad, turbidity) → [f32; 3]` —
+    a closed-form Preetham 1999 direct-beam transmittance
+    (Rayleigh + Ångström-turbidity aerosol at 615 / 545 /
+    465 nm) multiplied through an extraterrestrial RGB
+    constant. Stands in for the Hošek-Wilkie 2013 solar
+    irradiance until `ArHosekSkyModelData_solar.h` is
+    covered by `scripts/sky/fetch_hosek_data.py`. The
+    qualitative behavior matches (sunset reddens, midday is
+    near-white, turbidity dims); absolute scale absorbs
+    into the calibration constant `k`.
+  * `DEFAULT_SOLAR_CALIBRATION = 1.0` — placeholder; lives
+    in the same module so the wire in `main.rs` and the
+    bake module share one source of truth.
+  * `RenderArgs.sun_color: Option<[f32; 3]>` — the parser
+    leaves the user-explicit case as `Some(...)` and the
+    "use the derived sky color" case as `None`. `run_render`
+    matches `(cli.sky, cli.sun_color)`: `(_, Some(c)) → c`,
+    `(true, None) → irradiance × k`, `(false, None) → white`.
+  * 6 sky-module unit tests: below-horizon → zero, monotone
+    in turbidity, monotone in elevation, sunset reddens
+    (R/B ≥ 4× at 5° elevation), balanced at noon (R/B ∈
+    [0.8, 1.4] at 85°), finite-non-negative at the
+    (elev, turbidity) edges.
+  * 2 CLI tests: `--sun-color` defaults to `None` and
+    round-trips when set; `--sky` alone leaves `sun_color`
+    as `None` so the wire's analytic arm fires.
+  **Gated on a follow-up step (the user runs the Sponza
+  calibration render):**
   * Bounding box: directly-sunlit floor patch in
     `data/output/sponza_sunlit_reference.png`, pixel rect
     `(384, 480) – (640, 640)` — central atrium floor,
@@ -339,7 +366,7 @@ above).
     bbox: `Y_sky`.
   * Calibration constant `k = Y_ref / Y_sky`.
   * Numeric value of `k` + per-channel breakdown land in
-    `Findings`.
+    `Findings`. Replaces `DEFAULT_SOLAR_CALIBRATION`.
 - [ ] **[PT-sky/time-of-day]** Sponza rendered at three
   times of day:
   * Dawn: `--sky-elevation 8 --sky-azimuth 90 --sky-turbidity 3`

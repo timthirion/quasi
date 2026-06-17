@@ -104,8 +104,15 @@ struct RenderArgs {
     sun_dir: Option<[f32; 3]>,
     /// `--sun-color r,g,b` (PT-sun-light) sets the sun's emitted
     /// radiance per steradian. Linear, can exceed 1.0. Defaults to
-    /// white (1,1,1) when `--sun-dir` is provided.
-    sun_color: [f32; 3],
+    /// white (1,1,1) when `--sun-dir` is provided. When `--sky` is
+    /// set and `--sun-color` is **not** explicitly passed, the
+    /// color is auto-derived from
+    /// [`quasi::pathtrace::sky::solar_irradiance`] at the configured
+    /// (elevation, turbidity) — PT-sky/sun-color, plan 0030.
+    /// `Option` here distinguishes "user passed `--sun-color X`"
+    /// from "default", so the auto-derivation only fires on the
+    /// latter.
+    sun_color: Option<[f32; 3]>,
     /// `--sun-intensity I` (PT-sun-light) is a scalar multiplier on
     /// `--sun-color`. Defaults to 1.0. Common values: 1-3 for soft
     /// ambient, 5-30 for strong direct sun, 50+ for blown-out sky.
@@ -193,7 +200,7 @@ impl Default for RenderArgs {
             look_at: None,
             fov: None,
             sun_dir: None,
-            sun_color: [1.0, 1.0, 1.0],
+            sun_color: None,
             sun_intensity: 1.0,
             adaptive: false,
             noise_threshold: 0.01,
@@ -334,7 +341,7 @@ fn parse_render_args(args: &[String]) -> Result<RenderArgs, String> {
                 let v = iter
                     .next()
                     .ok_or_else(|| "--sun-color needs r,g,b".to_string())?;
-                r.sun_color = parse_vec3(v).map_err(|e| format!("--sun-color: {e}"))?;
+                r.sun_color = Some(parse_vec3(v).map_err(|e| format!("--sun-color: {e}"))?);
             }
             "--sun-intensity" => {
                 let v = iter
@@ -448,7 +455,9 @@ fn parse_render_args(args: &[String]) -> Result<RenderArgs, String> {
                      \t--look-at x,y,z     override camera target (combine with --camera-pos)\n\
                      \t--fov degrees       override vertical FOV\n\
                      \t--sun-dir x,y,z     enable delta-distribution sun (vector toward sun)\n\
-                     \t--sun-color r,g,b   sun radiance per steradian (default 1,1,1)\n\
+                     \t--sun-color r,g,b   sun radiance per steradian (default 1,1,1; auto-\n\
+                     \t                    derived from PT-sky analytic irradiance when --sky\n\
+                     \t                    is set and this flag is omitted)\n\
                      \t--sun-intensity I   scalar multiplier on --sun-color (default 1.0)\n\
                      \t--adaptive          PT-adaptive: per-pixel adaptive sampling (default off)\n\
                      \t--noise-threshold T relative-error stop criterion (default 0.01)\n\
@@ -548,10 +557,25 @@ fn run_render(args: &[String]) {
     };
     if let Some(dir) = derived_sun_dir {
         cfg.sun_dir = Some(dir);
+        // PT-sky/sun-color (plan 0030): when --sky is on and the user
+        // did **not** pass --sun-color, derive the per-channel sun
+        // color from the analytic Preetham direct-beam irradiance at
+        // the configured (sky elevation, turbidity). Without --sky
+        // the historical white-when-unset default applies.
+        let base_color = match (cli.sky, cli.sun_color) {
+            (_, Some(c)) => c,
+            (true, None) => {
+                let elev_rad = cli.sky_elevation.to_radians();
+                let i = quasi::pathtrace::sky::solar_irradiance(elev_rad, cli.sky_turbidity);
+                let k = quasi::pathtrace::sky::DEFAULT_SOLAR_CALIBRATION;
+                [i[0] * k, i[1] * k, i[2] * k]
+            }
+            (false, None) => [1.0, 1.0, 1.0],
+        };
         cfg.sun_color = [
-            cli.sun_color[0] * cli.sun_intensity,
-            cli.sun_color[1] * cli.sun_intensity,
-            cli.sun_color[2] * cli.sun_intensity,
+            base_color[0] * cli.sun_intensity,
+            base_color[1] * cli.sun_intensity,
+            base_color[2] * cli.sun_intensity,
         ];
     }
     // PT-adaptive (plan 0028): wire CLI flags into the optional
@@ -986,6 +1010,38 @@ mod tests {
 
         // Without --sky the elevation is inert; out-of-range doesn't error.
         assert!(parse(&["--sky-elevation", "120"]).is_ok());
+    }
+
+    /// PT-sky/sun-color (plan 0030): the `--sun-color` flag is
+    /// stored as `Option<[f32;3]>` so the wire can distinguish
+    /// "user-explicit color" from "no user input → fall back to
+    /// analytic when --sky is on, or to white when --sky is off."
+    /// Default parse → `None`.
+    #[test]
+    fn sun_color_defaults_to_none() {
+        let r = parse(&[]).expect("empty parse");
+        assert!(r.sun_color.is_none(), "default --sun-color must be None");
+
+        let r = parse(&["--sun-color", "0.5,0.4,0.3"]).expect("parse");
+        assert_eq!(r.sun_color, Some([0.5, 0.4, 0.3]));
+    }
+
+    /// PT-sky/sun-color (plan 0030): when `--sky` is set and the
+    /// user omits `--sun-color`, the parse leaves it None — the
+    /// downstream wire (`run_render`) detects the None and substitutes
+    /// `sky::solar_irradiance × DEFAULT_SOLAR_CALIBRATION`. We can't
+    /// reach into the wire from a parse test, but we can pin that
+    /// parsing leaves None untouched when `--sky` is set, so the
+    /// wire's `match (cli.sky, cli.sun_color)` arm fires.
+    #[test]
+    fn sky_alone_leaves_sun_color_none() {
+        let r = parse(&["--sky"]).expect("--sky parse");
+        assert!(r.sky);
+        assert!(
+            r.sun_color.is_none(),
+            "--sky alone must not synthesize a --sun-color at parse time; \
+             the analytic derivation lives in run_render"
+        );
     }
 
     /// PT-sky/wire (plan 0030): `sky_dir_from_elev_azimuth` follows
