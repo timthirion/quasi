@@ -153,6 +153,25 @@ struct RenderArgs {
     /// quadratic ramp covering `[threshold - knee, threshold +
     /// knee]`. Default 0.5.
     bloom_knee: f32,
+    /// `--sky` (PT-sky, plan 0030) enables the analytic
+    /// Hosek-Wilkie procedural sky. At render start the sky is
+    /// baked into an equirect HDR pixel buffer and routed through
+    /// the same env-map path as `--env-map`. Mutually exclusive
+    /// with `--env-map` and `--sun-dir`. Off by default.
+    sky: bool,
+    /// `--sky-elevation DEG` (PT-sky): sun elevation above the
+    /// horizon, degrees. Valid range [0, 90]. Default 45.
+    sky_elevation: f32,
+    /// `--sky-azimuth DEG` (PT-sky): sun azimuth measured from
+    /// +X toward +Z, degrees. Wraps freely. Default 180.
+    sky_azimuth: f32,
+    /// `--sky-turbidity T` (PT-sky): atmospheric turbidity. The
+    /// model clamps to [1, 10] internally. Default 2.5.
+    sky_turbidity: f32,
+    /// `--sky-ground-albedo R,G,B` (PT-sky): ground albedo for
+    /// horizon tint. The model clamps each channel to [0, 1]
+    /// internally. Default 0.3,0.3,0.3.
+    sky_ground_albedo: [f32; 3],
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -184,8 +203,29 @@ impl Default for RenderArgs {
             bloom_intensity: 0.04,
             bloom_threshold: 1.0,
             bloom_knee: 0.5,
+            sky: false,
+            sky_elevation: 45.0,
+            sky_azimuth: 180.0,
+            sky_turbidity: 2.5,
+            sky_ground_albedo: [0.3, 0.3, 0.3],
         }
     }
+}
+
+/// PT-sky/wire (plan 0030): convert `(elevation_deg, azimuth_deg)` to
+/// a unit direction vector under the plan's coordinate convention
+/// (pinned against `env.rs` line 16):
+///   φ = azimuth, measured from +X toward +Z
+///   θ_zenith = π/2 - elevation
+///   dir = (sin θ cos φ, cos θ, sin θ sin φ)
+///       = (cos elev · cos azi, sin elev, cos elev · sin azi)
+#[cfg(not(target_arch = "wasm32"))]
+fn sky_dir_from_elev_azimuth(elevation_deg: f32, azimuth_deg: f32) -> [f32; 3] {
+    let elev = elevation_deg.to_radians();
+    let azi = azimuth_deg.to_radians();
+    let (sin_elev, cos_elev) = elev.sin_cos();
+    let (sin_azi, cos_azi) = azi.sin_cos();
+    [cos_elev * cos_azi, sin_elev, cos_elev * sin_azi]
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -360,6 +400,34 @@ fn parse_render_args(args: &[String]) -> Result<RenderArgs, String> {
                     return Err(format!("--bloom-knee must be > 0; got {}", r.bloom_knee));
                 }
             }
+            "--sky" => {
+                r.sky = true;
+            }
+            "--sky-elevation" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| "--sky-elevation needs a number".to_string())?;
+                r.sky_elevation = v.parse().map_err(|e| format!("--sky-elevation: {e}"))?;
+            }
+            "--sky-azimuth" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| "--sky-azimuth needs a number".to_string())?;
+                r.sky_azimuth = v.parse().map_err(|e| format!("--sky-azimuth: {e}"))?;
+            }
+            "--sky-turbidity" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| "--sky-turbidity needs a number".to_string())?;
+                r.sky_turbidity = v.parse().map_err(|e| format!("--sky-turbidity: {e}"))?;
+            }
+            "--sky-ground-albedo" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| "--sky-ground-albedo needs r,g,b".to_string())?;
+                r.sky_ground_albedo =
+                    parse_vec3(v).map_err(|e| format!("--sky-ground-albedo: {e}"))?;
+            }
             "--help" | "-?" => {
                 println!(
                     "render options:\n\
@@ -385,7 +453,13 @@ fn parse_render_args(args: &[String]) -> Result<RenderArgs, String> {
                      \t--adaptive          PT-adaptive: per-pixel adaptive sampling (default off)\n\
                      \t--noise-threshold T relative-error stop criterion (default 0.01)\n\
                      \t--min-spp N         per-pixel sample floor (default 64)\n\
-                     \t--max-spp M         per-pixel sample ceiling (default = --spp)"
+                     \t--max-spp M         per-pixel sample ceiling (default = --spp)\n\
+                     \t--sky               PT-sky: bake analytic Hosek-Wilkie sky as env map\n\
+                     \t                    (mutually exclusive with --env-map and --sun-dir)\n\
+                     \t--sky-elevation DEG sun elevation above horizon, [0, 90] (default 45)\n\
+                     \t--sky-azimuth DEG   sun azimuth +X→+Z (default 180)\n\
+                     \t--sky-turbidity T   atmospheric turbidity (default 2.5)\n\
+                     \t--sky-ground-albedo r,g,b  ground albedo for horizon tint (default 0.3,0.3,0.3)"
                 );
                 std::process::exit(0);
             }
@@ -401,6 +475,29 @@ fn parse_render_args(args: &[String]) -> Result<RenderArgs, String> {
             "--min-spp {} exceeds --max-spp / --spp ceiling {}; the floor cannot \
              be above the ceiling",
             r.min_spp, effective_max,
+        ));
+    }
+    // PT-sky/wire (plan 0030): --sky is the only env-light source
+    // when set, and derives sun_dir from elevation+azimuth. Combining
+    // it with --env-map or --sun-dir is a user-intent ambiguity —
+    // force the user to choose at parse time rather than picking one
+    // silently.
+    if r.sky && r.env_map.is_some() {
+        return Err(
+            "--sky and --env-map are mutually exclusive; --sky bakes its own env".to_string(),
+        );
+    }
+    if r.sky && r.sun_dir.is_some() {
+        return Err(
+            "--sky and --sun-dir are mutually exclusive; --sky derives sun_dir from \
+             --sky-elevation + --sky-azimuth"
+                .to_string(),
+        );
+    }
+    if r.sky && !(0.0..=90.0).contains(&r.sky_elevation) {
+        return Err(format!(
+            "--sky-elevation must be in [0, 90]; got {}",
+            r.sky_elevation,
         ));
     }
     Ok(r)
@@ -435,7 +532,21 @@ fn run_render(args: &[String]) {
     if let Some(f) = cli.fov {
         cfg.fov = f;
     }
-    if let Some(dir) = cli.sun_dir {
+    // PT-sky/wire (plan 0030): when --sky is set, the sun direction
+    // is derived from --sky-elevation + --sky-azimuth so the baked
+    // sky and the delta sun light agree on solar position. Parse
+    // guarantees --sky-dir and --env-map are not also set, so a
+    // single Option<[f32;3]> resolves the "where is the sun" answer
+    // ahead of the sun-light wire-up below.
+    let derived_sun_dir = if cli.sky {
+        Some(sky_dir_from_elev_azimuth(
+            cli.sky_elevation,
+            cli.sky_azimuth,
+        ))
+    } else {
+        cli.sun_dir
+    };
+    if let Some(dir) = derived_sun_dir {
         cfg.sun_dir = Some(dir);
         cfg.sun_color = [
             cli.sun_color[0] * cli.sun_intensity,
@@ -512,12 +623,47 @@ fn run_render(args: &[String]) {
             std::process::exit(1);
         })
     });
-    let env_map = cli.env_map.as_deref().map(|p| {
-        quasi::pathtrace::env::EnvironmentMap::from_hdr_file(p).unwrap_or_else(|e| {
-            eprintln!("failed to load --env-map {}: {e}", p.display());
-            std::process::exit(1);
+    // PT-sky/wire (plan 0030): when --sky is set, bake the analytic
+    // sky into an equirect pixel buffer and wrap it in the existing
+    // EnvironmentMap so the downstream miss-shader + CDF path is
+    // bit-identical to the --env-map flow. Bake resolution is 1024×512
+    // per plan default — PT-sky/perf-measure may dial this down for
+    // the live widget bake but the CLI render isn't latency-sensitive.
+    // Parse guarantees --sky and --env-map are not both set.
+    let env_map = if cli.sky {
+        // SAFETY: derived_sun_dir is Some when cli.sky is set.
+        let sun_dir = derived_sun_dir.expect("derived_sun_dir set when cli.sky is on");
+        let params = quasi::pathtrace::sky::SkyParams {
+            sun_dir,
+            turbidity: cli.sky_turbidity,
+            ground_albedo: cli.sky_ground_albedo,
+        };
+        let (sky_w, sky_h) = (1024_u32, 512_u32);
+        log::info!(
+            "baking PT-sky: elev={:.1}° azi={:.1}° turbidity={:.2} albedo=({:.2}, {:.2}, {:.2}) → {}×{}",
+            cli.sky_elevation,
+            cli.sky_azimuth,
+            cli.sky_turbidity,
+            cli.sky_ground_albedo[0],
+            cli.sky_ground_albedo[1],
+            cli.sky_ground_albedo[2],
+            sky_w,
+            sky_h,
+        );
+        let bake_start = std::time::Instant::now();
+        let pixels = quasi::pathtrace::sky::bake_equirect(sky_w, sky_h, &params);
+        log::info!("sky bake took {:.3}s", bake_start.elapsed().as_secs_f64());
+        Some(quasi::pathtrace::env::EnvironmentMap::new(
+            sky_w, sky_h, pixels,
+        ))
+    } else {
+        cli.env_map.as_deref().map(|p| {
+            quasi::pathtrace::env::EnvironmentMap::from_hdr_file(p).unwrap_or_else(|e| {
+                eprintln!("failed to load --env-map {}: {e}", p.display());
+                std::process::exit(1);
+            })
         })
-    });
+    };
     if let Some(env) = env_map.as_ref() {
         log::info!("env map: {} × {}", env.width, env.height);
     }
@@ -763,5 +909,118 @@ mod tests {
     fn min_spp_above_spp_errors_under_adaptive() {
         let err = parse(&["--adaptive", "--spp", "32", "--min-spp", "64"]).expect_err("must error");
         assert!(err.contains("--min-spp"));
+    }
+
+    /// PT-sky/cli (plan 0030): `--sky` flag defaults off, parses
+    /// when present, and the sky-* defaults match the plan.
+    #[test]
+    fn sky_flag_defaults_off_and_parses() {
+        let r = parse(&[]).expect("empty parse");
+        assert!(!r.sky, "default should be --sky off");
+        assert_eq!(r.sky_elevation, 45.0);
+        assert_eq!(r.sky_azimuth, 180.0);
+        assert_eq!(r.sky_turbidity, 2.5);
+        assert_eq!(r.sky_ground_albedo, [0.3, 0.3, 0.3]);
+
+        let r = parse(&["--sky"]).expect("--sky parse");
+        assert!(r.sky);
+    }
+
+    /// PT-sky/cli (plan 0030): the four sky parameter flags round-
+    /// trip to the parsed `RenderArgs`.
+    #[test]
+    fn sky_params_parse() {
+        let r = parse(&[
+            "--sky",
+            "--sky-elevation",
+            "75",
+            "--sky-azimuth",
+            "270",
+            "--sky-turbidity",
+            "4.0",
+            "--sky-ground-albedo",
+            "0.2,0.5,0.7",
+        ])
+        .expect("parse");
+        assert!(r.sky);
+        assert_eq!(r.sky_elevation, 75.0);
+        assert_eq!(r.sky_azimuth, 270.0);
+        assert_eq!(r.sky_turbidity, 4.0);
+        assert_eq!(r.sky_ground_albedo, [0.2, 0.5, 0.7]);
+    }
+
+    /// PT-sky/cli (plan 0030): `--sky` + `--env-map` must error.
+    /// Both inhabit the env-light channel and combining them is
+    /// user-intent ambiguity.
+    #[test]
+    fn sky_plus_env_map_errors() {
+        let err = parse(&["--sky", "--env-map", "anywhere.hdr"]).expect_err("must error");
+        assert!(
+            err.contains("--sky") && err.contains("--env-map"),
+            "error must mention both flags; got: {err}",
+        );
+    }
+
+    /// PT-sky/cli (plan 0030): `--sky` + `--sun-dir` must error.
+    /// `--sky` derives sun_dir from elevation+azimuth; an explicit
+    /// `--sun-dir` would silently override it.
+    #[test]
+    fn sky_plus_sun_dir_errors() {
+        let err = parse(&["--sky", "--sun-dir", "0,1,0"]).expect_err("must error");
+        assert!(
+            err.contains("--sky") && err.contains("--sun-dir"),
+            "error must mention both flags; got: {err}",
+        );
+    }
+
+    /// PT-sky/cli (plan 0030): `--sky-elevation` outside [0, 90]
+    /// errors at parse time when `--sky` is also set. Without `--sky`,
+    /// the value is inert.
+    #[test]
+    fn sky_elevation_out_of_range_errors() {
+        let err = parse(&["--sky", "--sky-elevation", "-5"]).expect_err("negative must error");
+        assert!(err.contains("--sky-elevation"), "got: {err}");
+
+        let err = parse(&["--sky", "--sky-elevation", "120"]).expect_err(">90 must error");
+        assert!(err.contains("--sky-elevation"), "got: {err}");
+
+        // Without --sky the elevation is inert; out-of-range doesn't error.
+        assert!(parse(&["--sky-elevation", "120"]).is_ok());
+    }
+
+    /// PT-sky/wire (plan 0030): `sky_dir_from_elev_azimuth` follows
+    /// the env.rs coordinate convention pinned in the plan
+    /// ("Coordinate convention" section). +Y is up; azimuth 0 sits
+    /// on +X; azimuth π/2 sits on +Z.
+    #[test]
+    fn sky_dir_from_elev_azimuth_matches_convention() {
+        // Zenith: elevation 90° → +Y, azimuth doesn't matter.
+        let dir = sky_dir_from_elev_azimuth(90.0, 0.0);
+        assert!((dir[0]).abs() < 1e-5);
+        assert!((dir[1] - 1.0).abs() < 1e-5);
+        assert!((dir[2]).abs() < 1e-5);
+
+        // Horizon east (+X): elevation 0°, azimuth 0°.
+        let dir = sky_dir_from_elev_azimuth(0.0, 0.0);
+        assert!((dir[0] - 1.0).abs() < 1e-5);
+        assert!((dir[1]).abs() < 1e-5);
+        assert!((dir[2]).abs() < 1e-5);
+
+        // Horizon "north" (+Z per the plan's convention):
+        // elevation 0°, azimuth 90°.
+        let dir = sky_dir_from_elev_azimuth(0.0, 90.0);
+        assert!((dir[0]).abs() < 1e-5);
+        assert!((dir[1]).abs() < 1e-5);
+        assert!((dir[2] - 1.0).abs() < 1e-5);
+
+        // Output is always unit length.
+        for (elev, azi) in [(45.0, 30.0), (10.0, 215.0), (75.0, 350.0)] {
+            let d = sky_dir_from_elev_azimuth(elev, azi);
+            let mag = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            assert!(
+                (mag - 1.0).abs() < 1e-5,
+                "(elev={elev}, azi={azi}) → {d:?}, |d|={mag}",
+            );
+        }
     }
 }

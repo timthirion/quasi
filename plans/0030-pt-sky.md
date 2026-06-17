@@ -304,14 +304,24 @@ above).
   forces the widget bake resolution down to 512×256 (and
   surfaces the trade-off explicitly: lower CDF resolution
   vs slider responsiveness).
-- [ ] **[PT-sky/wire]** `--sky`, `--sky-elevation`,
+- [x] **[PT-sky/wire]** `--sky`, `--sky-elevation`,
   `--sky-azimuth`, `--sky-turbidity`, `--sky-ground-albedo`
-  flags wired through `src/main.rs`. `--sky` baked equirect
-  fed through the existing `render_offscreen_full` path's
-  `env_map` argument (no new public function needed). CLI
-  parse tests cover: `--sky` alone, `--sky` + `--env-map`
-  (must error), `--sky` + `--sun-dir` (must error),
-  `--sky-elevation` out of [0, 90] (must error).
+  flags wired through `src/main.rs`. `--sky` bakes the analytic
+  sky at 1024×512 (plan default) and wraps the result in
+  `EnvironmentMap` for the existing `render_offscreen_full`
+  `env_map` argument — no new public function needed. When
+  `--sky` is set, sun_dir is derived from `--sky-elevation` +
+  `--sky-azimuth` via `sky_dir_from_elev_azimuth`, populating
+  `cfg.sun_dir` so the existing delta-sun path activates
+  alongside the sky (with `--sun-color` still defaulting to
+  white * intensity until PT-sky/sun-color lands).
+  **Tests (6, all passing):** default-off + parsing,
+  full-parameter round-trip, `--sky` + `--env-map` errors,
+  `--sky` + `--sun-dir` errors, `--sky-elevation` out of
+  [0, 90] errors only when `--sky` is set (otherwise inert),
+  elevation-azimuth-to-dir conversion matches the env.rs
+  coordinate convention at zenith / +X horizon / +Z horizon
+  + unit-length check at three off-axis pairs.
 - [ ] **[PT-sky/sun-color]** When `--sky` is set, derive
   `--sun-color` from Hošek-Wilkie 2013 analytic solar
   irradiance computed at the current
