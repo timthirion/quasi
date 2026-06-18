@@ -390,10 +390,19 @@ above).
     any two of {dawn, noon, sunset} ≥ 0.15 on full frame.
     Catches the failure mode "three nearly-identical noon-ish
     renders, one with the sun slightly lower."
-- [ ] **[PT-sky/noon-stability]** Bake at noon twice with
+- [x] **[PT-sky/noon-stability]** Bake at noon twice with
   identical parameters; produced equirect textures must be
-  byte-identical. Catches accidental nondeterminism in the
-  bake path (RNG seeded from clock, etc.).
+  bit-identical. Catches accidental nondeterminism in the
+  bake path (RNG seeded from clock, parallel-reduction order
+  drift, anything that lets two identical-input bakes diverge).
+  **Shipped:** `bake_equirect_noon_is_deterministic` in
+  `src/pathtrace/sky.rs` bakes 256×128 twice at the plan's
+  noon params (elev 75°, azi 180°, turbidity 2.5, default
+  ground albedo) and compares pixel-by-pixel via
+  `f32::to_bits` so even a sign-of-zero or NaN-payload drift
+  would surface. Trivially passes today (single-threaded,
+  table-driven, no RNG); locks the property against future
+  bake refactors.
 - [ ] **[PT-sky/widget]** Browser widget gains sky-elevation
   + sky-azimuth sliders + a sky-turbidity slider. Sliders use
   the same `change`-not-`input` debounce as

@@ -876,6 +876,56 @@ mod tests {
         );
     }
 
+    /// PT-sky/noon-stability (plan 0030): baking the equirect
+    /// twice at identical parameters must produce **bit-identical**
+    /// pixel buffers. The current bake is single-threaded and
+    /// table-driven, so the property holds trivially today — the
+    /// test exists as a tripwire for future refactors (parallel
+    /// row dispatch, SIMD reordering, RNG-seeded jitter, anything
+    /// that could quietly introduce nondeterminism).
+    ///
+    /// "Bit-identical" via `f32::to_bits` so positive/negative
+    /// zero and any NaN payload differences would surface as
+    /// failures (current bake produces neither, but the assertion
+    /// is the contract).
+    ///
+    /// Uses the plan's noon parameters: elevation 75°, azimuth
+    /// 180°, turbidity 2.5, default ground albedo.
+    #[test]
+    fn bake_equirect_noon_is_deterministic() {
+        // sun_dir from elevation+azimuth (plan 0030 coordinate
+        // convention, pinned to env.rs line 16):
+        //   dir = (cos(elev) cos(azi), sin(elev), cos(elev) sin(azi))
+        let elev = 75.0_f32.to_radians();
+        let azi = 180.0_f32.to_radians();
+        let (sin_elev, cos_elev) = elev.sin_cos();
+        let (sin_azi, cos_azi) = azi.sin_cos();
+        let params = SkyParams {
+            sun_dir: [cos_elev * cos_azi, sin_elev, cos_elev * sin_azi],
+            turbidity: 2.5,
+            ground_albedo: [0.3, 0.3, 0.3],
+        };
+
+        // 256×128 is large enough to exercise the inner loop on a
+        // non-trivial pixel count while staying fast (a few ms).
+        let pixels_a = bake_equirect(256, 128, &params);
+        let pixels_b = bake_equirect(256, 128, &params);
+        assert_eq!(pixels_a.len(), pixels_b.len(), "buffer lengths must match",);
+
+        for (i, (a, b)) in pixels_a.iter().zip(pixels_b.iter()).enumerate() {
+            for ch in 0..3 {
+                let bits_a = a[ch].to_bits();
+                let bits_b = b[ch].to_bits();
+                assert_eq!(
+                    bits_a, bits_b,
+                    "pixel {i} ch{ch} bit-mismatch: {bits_a:#010x} ≠ {bits_b:#010x} \
+                     ({} vs {})",
+                    a[ch], b[ch],
+                );
+            }
+        }
+    }
+
     /// PT-sky/sun-color: finite + non-NaN at the edges of the
     /// valid range — protect against blow-ups in
     /// `pow(-1.253)` and `exp(-large)` at low elevation /
