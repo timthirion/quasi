@@ -293,7 +293,7 @@ above).
   **Note:** the API returns `Vec<[f32; 3]>` not
   `EnvironmentMap` directly because `env` is native-only
   (it carries the HDR loader); the caller wraps explicitly.
-- [ ] **[PT-sky/perf-measure]** Measure end-to-end re-bake
+- [/] **[PT-sky/perf-measure]** Measure end-to-end re-bake
   latency on:
   * Native (Apple M-series, single-threaded CPU bake +
     sequential CDF build) at 512×256 and 1024×512.
@@ -304,6 +304,16 @@ above).
   forces the widget bake resolution down to 512×256 (and
   surfaces the trade-off explicitly: lower CDF resolution
   vs slider responsiveness).
+  **Shipped:** `examples/bench_sky_bake.rs` — wall-clock
+  harness with warm-up + N=5 repeats per stage (bake / CDF
+  build / combined) at both resolutions. Native numbers
+  recorded in `Findings`; Safari numbers deferred to
+  PT-sky/widget, where the harness compiles to wasm32 and
+  reports `performance.now()` deltas from the slider release
+  callback. The resolution decision below is provisional on
+  the native numbers + a conservative ≤10× wasm/JIT slowdown
+  ceiling; PT-sky/widget verifies and forces a 512×256
+  downgrade if the measured Safari number exceeds 250 ms.
 - [x] **[PT-sky/wire]** `--sky`, `--sky-elevation`,
   `--sky-azimuth`, `--sky-turbidity`, `--sky-ground-albedo`
   flags wired through `src/main.rs`. `--sky` bakes the analytic
@@ -425,9 +435,59 @@ above).
 
 ## Findings
 
+### PT-sky/perf-measure (2026-06-17)
+
+`cargo run --example bench_sky_bake --release`, MacBook Pro
+M-series, single-threaded. N=5 timed runs per stage after one
+warm-up run; min/median/max wall-clock. Two consecutive
+invocations (numbers are tight across both):
+
+| resolution | stage       | min(ms) | med(ms) | max(ms) |
+|------------|-------------|---------|---------|---------|
+|  512×256   | bake        |    2.55 |    2.65 |    2.96 |
+|  512×256   | CDF build   |    0.18 |    0.21 |    0.54 |
+|  512×256   | bake + CDF  |    2.74 |    2.83 |    3.51 |
+| 1024×512   | bake        |    8.94 |    9.11 |   10.65 |
+| 1024×512   | CDF build   |    0.71 |    0.74 |    1.37 |
+| 1024×512   | bake + CDF  |    9.68 |    9.84 |   12.02 |
+
+Notes:
+* Bake cost is dominated by the per-pixel quintic Bezier eval
+  + per-channel lerp in `interpolate_state`. It scales linearly
+  with pixel count, as the architecture predicted (4× the
+  pixels → ~3.5× the wall-clock).
+* CDF build is ~10× cheaper than bake at both resolutions —
+  the rate-limiting step is bake, not CDF, so any future
+  parallelization should target bake first.
+* Cold-cache (first invocation) numbers are ~30-40% slower
+  than warm-cache; reported numbers are after the warm-up.
+* Plan's a-priori estimate ("~30 ms at 1024×512 on M-series")
+  was conservative by ~3×. Bake is actually ~10 ms.
+
+**Provisional resolution decision: ship the widget at 1024×512.**
+The 1024×512 native median is ~10 ms. The plan's 250 ms Safari
+budget gives a 25× slowdown ceiling. Apple Silicon Safari's
+wasm/JIT performance on hot scalar f32 loops is typically
+3-6× slower than native release (varies with i-cache pressure
+and the JIT's tier-up behavior); a 10× headroom is the
+defensible bound. So 1024×512 in Safari is expected to come in
+≤ 100 ms, well under budget. PT-sky/widget verifies before
+locking, and forces a 512×256 downgrade if measured Safari
+exceeds 250 ms.
+
+Caveat: numbers measured against the **stub** Hosek-Wilkie
+tables (all zeros). The bake's cost is data-independent — the
+per-pixel Bezier + lerp do the same arithmetic on zeros or
+real coefficients — so post-vendor cost is expected to match
+this table. CDF build inputs an all-black equirect under the
+stubs; row-sum accumulation still runs, so the cost is
+representative as well.
+
+### Other Findings sections
+
 (Populated during execution: calibration constant for sun-
-color derivation, perf-measure latency table, attacker findings
-on the time-of-day triptych.)
+color derivation, attacker findings on the time-of-day
+triptych.)
 
 ## Followups (out of scope)
 
