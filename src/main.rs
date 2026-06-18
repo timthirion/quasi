@@ -179,6 +179,15 @@ struct RenderArgs {
     /// horizon tint. The model clamps each channel to [0, 1]
     /// internally. Default 0.3,0.3,0.3.
     sky_ground_albedo: [f32; 3],
+    /// `--emission-scale F` multiplies every loaded material's
+    /// emission RGB by `F` before the emissive-triangle CDF is
+    /// (re)built. Default 1.0 (no-op). Use case: Lumberyard Bistro
+    /// at night — the asset's emissives are calibrated to read as
+    /// "bright bulbs in daylight," not "lights that actually
+    /// illuminate the street," so a 10–100× boost is needed to get
+    /// the canonical lit-night-street look. Applied uniformly to
+    /// **all** materials in the loaded scene.
+    emission_scale: f32,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -215,6 +224,7 @@ impl Default for RenderArgs {
             sky_azimuth: 180.0,
             sky_turbidity: 2.5,
             sky_ground_albedo: [0.3, 0.3, 0.3],
+            emission_scale: 1.0,
         }
     }
 }
@@ -435,6 +445,18 @@ fn parse_render_args(args: &[String]) -> Result<RenderArgs, String> {
                 r.sky_ground_albedo =
                     parse_vec3(v).map_err(|e| format!("--sky-ground-albedo: {e}"))?;
             }
+            "--emission-scale" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| "--emission-scale needs a number".to_string())?;
+                r.emission_scale = v.parse().map_err(|e| format!("--emission-scale: {e}"))?;
+                if r.emission_scale < 0.0 {
+                    return Err(format!(
+                        "--emission-scale must be ≥ 0; got {}",
+                        r.emission_scale,
+                    ));
+                }
+            }
             "--help" | "-?" => {
                 println!(
                     "render options:\n\
@@ -468,7 +490,9 @@ fn parse_render_args(args: &[String]) -> Result<RenderArgs, String> {
                      \t--sky-elevation DEG sun elevation above horizon, [0, 90] (default 45)\n\
                      \t--sky-azimuth DEG   sun azimuth +X→+Z (default 180)\n\
                      \t--sky-turbidity T   atmospheric turbidity (default 2.5)\n\
-                     \t--sky-ground-albedo r,g,b  ground albedo for horizon tint (default 0.3,0.3,0.3)"
+                     \t--sky-ground-albedo r,g,b  ground albedo for horizon tint (default 0.3,0.3,0.3)\n\
+                     \t--emission-scale F  multiply all material emissions by F before\n\
+                     \t                    the emitter CDF is rebuilt (default 1.0; ≥ 0)"
                 );
                 std::process::exit(0);
             }
@@ -607,13 +631,29 @@ fn run_render(args: &[String]) {
         cfg.sampler,
         cfg.integrator,
     );
-    let scene = match cli.scene.as_deref() {
+    let mut scene = match cli.scene.as_deref() {
         Some(path) => quasi::pathtrace::mesh::load_glb(path).unwrap_or_else(|e| {
             eprintln!("failed to load --scene {}: {e}", path.display());
             std::process::exit(1);
         }),
         None => default_triangle_scene(),
     };
+    // `--emission-scale F` (≠ 1.0): multiply every material's
+    // emission by F, then rebuild the emitter-power CDF so NEE
+    // picks the boosted emitters in proportion to their new power.
+    if cli.emission_scale != 1.0 {
+        for m in scene.materials.iter_mut() {
+            m.emission[0] *= cli.emission_scale;
+            m.emission[1] *= cli.emission_scale;
+            m.emission[2] *= cli.emission_scale;
+        }
+        scene.recompute_emissive();
+        log::info!(
+            "scaled emission by {:.2}× — re-built emitter CDF over {} lights",
+            cli.emission_scale,
+            scene.emissive_lights.len(),
+        );
+    }
     log::info!(
         "scene: {} triangles, {} emissive",
         scene.triangle_count(),
@@ -1078,5 +1118,22 @@ mod tests {
                 "(elev={elev}, azi={azi}) → {d:?}, |d|={mag}",
             );
         }
+    }
+
+    /// `--emission-scale F` defaults to 1.0 (no-op), parses
+    /// positive values, and rejects negatives.
+    #[test]
+    fn emission_scale_parses() {
+        let r = parse(&[]).expect("empty parse");
+        assert_eq!(r.emission_scale, 1.0);
+
+        let r = parse(&["--emission-scale", "25"]).expect("parse 25");
+        assert_eq!(r.emission_scale, 25.0);
+
+        let r = parse(&["--emission-scale", "0"]).expect("zero is valid (kills emissives)");
+        assert_eq!(r.emission_scale, 0.0);
+
+        assert!(parse(&["--emission-scale", "-1"]).is_err());
+        assert!(parse(&["--emission-scale"]).is_err()); // missing value
     }
 }
