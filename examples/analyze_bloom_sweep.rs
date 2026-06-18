@@ -1,5 +1,5 @@
 //! PT-bloom/intensity-sweep (plan 0029): analyze the seven
-//! Cornell renders at `data/output/cornell_bloom_intensity_*.png`
+//! Cornell renders at `data/output/cornell_bloom_i*.png`
 //! and report the annular-ring mean luminance ratio vs the
 //! bloom-OFF baseline (`0.00`).
 //!
@@ -35,7 +35,15 @@ use std::path::PathBuf;
 use image::GenericImageView;
 
 #[cfg(not(target_arch = "wasm32"))]
-const INTENSITIES: &[f32] = &[0.00, 0.01, 0.02, 0.04, 0.06, 0.08, 0.12];
+const INTENSITIES: &[(u32, f32)] = &[
+    (0, 0.00),
+    (1, 0.01),
+    (2, 0.02),
+    (4, 0.04),
+    (6, 0.06),
+    (8, 0.08),
+    (12, 0.12),
+];
 
 #[cfg(not(target_arch = "wasm32"))]
 fn srgb_to_linear(c: f32) -> f32 {
@@ -122,10 +130,8 @@ fn mean_ring_luminance(img: &image::DynamicImage, cx: f32, cy: f32, r_min: f32, 
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn path_for(intensity: f32) -> PathBuf {
-    PathBuf::from(format!(
-        "data/output/cornell_bloom_intensity_{intensity:.2}.png"
-    ))
+fn path_for(idx: u32) -> PathBuf {
+    PathBuf::from(format!("data/output/cornell_bloom_i{idx:02}.png"))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -134,7 +140,7 @@ fn main() {
     // the centroid from it. Using the OFF image gives the
     // cleanest centroid since no bloom halo blurs the light's
     // boundary.
-    let baseline_path = path_for(INTENSITIES[0]);
+    let baseline_path = path_for(INTENSITIES[0].0);
     let baseline = image::open(&baseline_path).unwrap_or_else(|e| {
         eprintln!("failed to load {}: {e}", baseline_path.display());
         std::process::exit(1);
@@ -153,24 +159,24 @@ fn main() {
     println!("|-----------|------------|---------|");
 
     let mut rows: Vec<(f32, f32, f32)> = Vec::with_capacity(INTENSITIES.len());
-    for &i in INTENSITIES {
-        let path = path_for(i);
+    for &(idx, val) in INTENSITIES {
+        let path = path_for(idx);
         let img = image::open(&path).unwrap_or_else(|e| {
             eprintln!("failed to load {}: {e}", path.display());
             std::process::exit(1);
         });
         let ring = mean_ring_luminance(&img, cx, cy, 8.0, 16.0);
         let ratio = ring / baseline_ring.max(1e-12);
-        rows.push((i, ring, ratio));
-        println!("| {i:.2}      | {ring:.6}   | {ratio:6.3}× |");
+        rows.push((val, ring, ratio));
+        println!("| {val:.2}      | {ring:.6}   | {ratio:6.3}× |");
     }
 
     println!();
     println!("Locked default candidates (ring ratio ∈ [1.5, 2.0]):");
     let mut any = false;
-    for &(i, _, ratio) in &rows {
+    for &(val, _, ratio) in &rows {
         if (1.5..=2.0).contains(&ratio) {
-            println!("  * intensity {i:.2} → ratio {ratio:.3}×");
+            println!("  * intensity {val:.2} → ratio {ratio:.3}×");
             any = true;
         }
     }
@@ -193,8 +199,8 @@ fn main() {
         std::process::exit(1);
     });
     writeln!(f, "intensity,ring_luminance,ratio_vs_off").unwrap();
-    for (i, ring, ratio) in rows {
-        writeln!(f, "{i:.2},{ring:.6},{ratio:.4}").unwrap();
+    for (val, ring, ratio) in rows {
+        writeln!(f, "{val:.2},{ring:.6},{ratio:.4}").unwrap();
     }
     println!();
     println!("wrote {}", csv_path.display());
