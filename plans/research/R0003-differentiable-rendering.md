@@ -308,16 +308,14 @@ Rev 2 replaces it with a three-part test:
 
 ## Milestones
 
-- [/] **[R0003/primal-timing]** *Milestone zero — decides sub-claim (3)
-  before anything is built.* **Native half shipped 2026-09-15**; see
-  *Findings* for the table. Result: the interactive region is roughly
-  an order of magnitude smaller than rev 1 assumed, and the renderer is
-  **submit-bound rather than shading-bound** at widget resolutions,
-  which is a lever (batch samples per submit) and an argument for the
-  compute port. **Remaining:** the same sweep in Chrome and Safari via
-  the wasm build — native is only a lower bound on browser cost, and
-  the Safari number is the one that decides whether the widget target
-  is Chrome-only.
+- [x] **[R0003/primal-timing]** *Milestone zero — decides sub-claim (3)
+  before anything is built.* **Shipped 2026-09-15, native + browser**;
+  see *Findings*. Result: the widget is **vsync-bound, not GPU-bound**
+  — it renders one sample per `requestAnimationFrame`, so N samples
+  cost N/refresh seconds and quadrupling pixel count changes nothing.
+  Combined with the native submit-bound finding, sample batching is a
+  hard prerequisite for any optimization loop, not an optimization.
+  Safari renders nothing at all (see `[R0003/safari-black]`).
 - [ ] **[R0003/slang-eval]** Evaluate Slang's WGSL autodiff on a
   single BSDF and on a toy transport loop. Decides whether local
   derivatives are hand-written or generated, and whether the whole
@@ -367,6 +365,26 @@ Rev 2 replaces it with a three-part test:
   Safari and Chrome separately; Brush documents Chrome-only support for
   in-browser splat training, so Safari viability is an open question,
   not an assumption.
+- [ ] **[R0003/safari-black]** Safari renders nothing. Found
+  2026-09-15 while running `primal-timing`, *after* the three
+  plan-0028 regressions were fixed and Chrome was confirmed good. The
+  render loop runs (`frameCount` advances normally, 60 samples in 60
+  frames) and neither the JS console nor WebGPU reports any error;
+  the canvas is simply black, confirmed visually and by luminance
+  probe. Safari's limits are ample — `maxColorAttachmentBytesPerSample`
+  64, `maxColorAttachments` 8, `r16floatRenderable` true — so this is
+  not the attachment-budget fault. **Blocks the "both targets" claim
+  and the Safari half of the envelope.** Until it's understood, treat
+  Safari support as an open question, not a given; Brush's
+  in-browser splat training is likewise Chrome-only, so a
+  WebGPU-maturity gap is the leading hypothesis.
+- [ ] **[R0003/sample-batching]** Render M samples per submit / per
+  frame instead of one. Both halves of `primal-timing` point here:
+  native is submit-bound, browser is vsync-bound, and neither is
+  limited by shading at widget resolutions. This is also the entry
+  point the envelope measurement needs — without it, any browser
+  timing measures `requestAnimationFrame` cadence rather than the
+  renderer.
 - [ ] **[R0003/widget]** The live artifact. **Not** a small delta on
   plan 0035's debounce pattern — `src/pathtrace/web.rs` is a
   `requestAnimationFrame` loop (`Inner::tick`, :105) rendering one
@@ -413,6 +431,63 @@ does not clear it, and JCGT publishes PDFs and code — a live widget
 carries no weight there.
 
 ## Findings
+
+- **2026-09-15** — `[R0003/primal-timing]`, browser half, **and three
+  shipped-renderer bugs found in the process.** Running the sweep
+  required the widget to work, and it did not: the interactive path
+  tracer had rendered nothing since plan 0028 landed on 2026-06-15.
+  Three independent faults, each masked by the previous one — a
+  4-entry AOV name table against `NUM_AOVS = 5` (panic, surfacing in
+  the browser only as `RuntimeError: unreachable`); five Rgba16Float
+  attachments at 40 bytes/sample against the requested
+  `Limits::default()` ceiling of 32 (pipeline creation *rejected*,
+  every draw a silent no-op); and a WGSL `vec3<u32>` pad making
+  `PresentU` 32 bytes against a 16-byte Rust allocation (every present
+  draw failed validation). Fixed in `32ac51d`. **Process finding: CI
+  cannot catch any of this.** It runs `cargo test` plus a wasm32
+  `cargo check`; neither ever instantiates a renderer, so 14 commits
+  and a green pipeline shipped over a dead widget for three months. A
+  smoke test that builds `State` against a headless surface and
+  asserts non-black output is the missing gate — it belongs in plan
+  0035 alongside the bloom widget work, and it is a prerequisite for
+  trusting any browser measurement this plan makes.
+
+  Browser numbers, once rendering was restored (Cornell scene,
+  `createHeadless`, median of 4 steady reps after a discarded warmup):
+
+  | Config | Chrome (120.5 Hz) | vsync floor | Safari (60.1 Hz) | vsync floor |
+  |---|---|---|---|---|
+  | 128² @ 1 spp | 8.4 ms | 8.3 | 17.0 ms | 16.6 |
+  | 128² @ 4 spp | 33.4 ms | 33.1 | 67.0 ms | 66.5 |
+  | 128² @ 16 spp | 133.4 ms | 132.5 | 267.0 ms | 266.1 |
+  | 128² @ 64 spp | 533.6 ms | 530.0 | 1066.0 ms | 1064.5 |
+  | 256² @ 16 spp | 133.5 ms | 132.5 | 267.0 ms | 266.1 |
+
+  **Every row sits at 1.00–1.01× the vsync floor, and 128² and 256²
+  are identical.** The widget renders one sample per
+  `requestAnimationFrame` (`web.rs:114`), so wall-clock is purely
+  `N / refresh_rate`; GPU cost per sample is below one frame at both
+  resolutions and is entirely hidden. This measurement therefore gives
+  only an upper bound on true GPU cost (< 8.3 ms/sample at 256²), and
+  resolving the real number needs `[R0003/sample-batching]`.
+
+  Two consequences for sub-claim (3). **(a)** The browser's binding
+  constraint is architectural, not computational — an optimization step
+  needing N samples pays N/refresh of pure latency before any GPU work,
+  which at Safari's 60 Hz is 2× Chrome's tax for identical hardware.
+  **(b)** Safari renders black even after the three fixes, with no
+  error reported and ample limits (64 bytes/sample, r16float
+  renderable) — an unrelated fault, now tracked as
+  `[R0003/safari-black]`. Until it is understood, the plan should not
+  assume a Safari widget target.
+
+  *Superseded:* an earlier run of this sweep produced near-identical
+  timings while the renderer was drawing nothing at all. Those numbers
+  were discarded. The luminance probe that caught it (`nonzeroFrac`,
+  max, mean-vs-spp) is now part of the harness, and any future timing
+  milestone here must carry an equivalent "is it actually rendering?"
+  assertion — a renderer that no-ops is indistinguishable from a fast
+  one when the only instrument is a clock.
 
 - **2026-09-15** — `[R0003/primal-timing]`, native half. Release build,
   M-series, default Cornell scene (`default_triangle_scene`), timing

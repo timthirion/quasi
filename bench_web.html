@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Quasi — R0003 browser primal-timing sweep</title>
+    <style>
+      html, body { margin: 0; background: #111; color: #ccc;
+                   font-family: ui-monospace, monospace; font-size: 13px; }
+      #hosts { display: flex; gap: 8px; padding: 8px; }
+      .host { background: #000; }
+      #h128 { width: 128px; height: 128px; }
+      #h256 { width: 256px; height: 256px; }
+      #log { padding: 8px 12px; white-space: pre; line-height: 1.5; }
+      #done { padding: 8px 12px; color: #6f6; font-weight: bold; }
+    </style>
+  </head>
+  <body>
+    <div id="hosts">
+      <div class="host" id="h128"></div>
+      <div class="host" id="h256"></div>
+    </div>
+    <div id="log">starting…</div>
+    <div id="done"></div>
+
+    <script type="module">
+      // Capture console output so Rust panic messages (written by
+      // console_error_panic_hook to console.error) reach the collector.
+      const consoleCap = [];
+      for (const lvl of ["error", "warn", "log"]) {
+        const orig = console[lvl].bind(console);
+        console[lvl] = (...a) => {
+          try { consoleCap.push(lvl + ": " + a.map(String).join(" ")); } catch (e) {}
+          orig(...a);
+        };
+      }
+
+      const log = document.getElementById("log");
+      const lines = [];
+      function say(s) { lines.push(String(s)); log.textContent = lines.join("\n"); }
+
+      // Stream progress to the collector so failures are visible without
+      // a devtools console.
+      let stage = "boot";
+      function post(kind, extra) {
+        try {
+          navigator.sendBeacon("/result",
+            new Blob([JSON.stringify({
+              kind, stage, lines, consoleCap, ua: navigator.userAgent, ...extra,
+            })], { type: "application/json" }));
+        } catch (e) { /* best effort */ }
+      }
+      function mark(s) { stage = s; say("[stage] " + s); post("stage"); }
+
+      window.addEventListener("error", (e) =>
+        { say("window.error: " + e.message); post("error"); });
+      window.addEventListener("unhandledrejection", (e) =>
+        { say("unhandledrejection: " + e.reason); post("error"); });
+
+      const nextFrame = () => new Promise(requestAnimationFrame);
+
+      async function refreshHz(frames = 120) {
+        await nextFrame();
+        const t0 = performance.now();
+        for (let i = 0; i < frames; i++) await nextFrame();
+        return (frames * 1000) / (performance.now() - t0);
+      }
+
+      // Objective "is it actually rendering?" probe: copy the WebGPU
+      // canvas into a 2-D canvas and measure luminance.
+      const probe = document.createElement("canvas");
+      const pctx = probe.getContext("2d", { willReadFrequently: true });
+      function pixelStats(canvas) {
+        try {
+          const w = Math.min(64, canvas.width), h = Math.min(64, canvas.height);
+          if (!w || !h) return { err: "zero-size canvas",
+                                 cw: canvas.width, ch: canvas.height };
+          probe.width = w; probe.height = h;
+          pctx.clearRect(0, 0, w, h);
+          pctx.drawImage(canvas, 0, 0, w, h);
+          const d = pctx.getImageData(0, 0, w, h).data;
+          let sum = 0, max = 0, nonzero = 0;
+          for (let i = 0; i < d.length; i += 4) {
+            const l = (d[i] + d[i + 1] + d[i + 2]) / 3;
+            sum += l; if (l > max) max = l; if (l > 0) nonzero++;
+          }
+          const n = d.length / 4;
+          return { mean: +(sum / n).toFixed(2), max,
+                   nonzeroFrac: +(nonzero / n).toFixed(3),
+                   cw: canvas.width, ch: canvas.height };
+        } catch (e) { return { err: String(e) }; }
+      }
+
+      function hostCanvas(id) {
+        return document.querySelector("#" + id + " canvas");
+      }
+
+      async function timeToSpp(inst, target) {
+        inst.reset();
+        const t0 = performance.now();
+        let guard = 0;
+        while (inst.frameCount() < target) {
+          await nextFrame();
+          if (++guard > 20000)
+            throw new Error("stalled at " + inst.frameCount() + "/" + target);
+        }
+        return performance.now() - t0;
+      }
+
+      const median = (xs) => {
+        const s = [...xs].sort((a, b) => a - b);
+        return s[Math.floor(s.length / 2)];
+      };
+
+      async function main() {
+        mark("checking navigator.gpu");
+        if (!navigator.gpu) {
+          say("FAIL: no WebGPU");
+          post("fail", { reason: "no-webgpu" });
+          document.getElementById("done").textContent = "NO-WEBGPU";
+          return;
+        }
+
+        mark("requesting adapter");
+        let adapterInfo = "(unavailable)";
+        try {
+          const ad = await navigator.gpu.requestAdapter();
+          if (!ad) { say("requestAdapter returned null"); }
+          else if (ad.info) {
+            adapterInfo = [ad.info.vendor, ad.info.architecture,
+                           ad.info.description].filter(Boolean).join(" / ");
+          }
+        } catch (e) { adapterInfo = "(error: " + e + ")"; }
+        say("adapter: " + adapterInfo);
+
+        // Limits + format support relevant to the 5-AOV MRT pipeline.
+        let limits = {};
+        try {
+          const ad = await navigator.gpu.requestAdapter();
+          const L = ad.limits;
+          for (const k of ["maxColorAttachments",
+                           "maxColorAttachmentBytesPerSample",
+                           "maxStorageBuffersPerShaderStage",
+                           "maxTextureDimension2D"]) {
+            limits[k] = L[k];
+          }
+          limits.features = [...ad.features].slice(0, 40);
+          const dev = await ad.requestDevice();
+          // Can we actually use r16float as a render attachment here?
+          try {
+            dev.createTexture({
+              size: [4, 4], format: "r16float",
+              usage: GPUTextureUsage.RENDER_ATTACHMENT
+                   | GPUTextureUsage.TEXTURE_BINDING,
+            });
+            limits.r16floatRenderable = true;
+          } catch (e) { limits.r16floatRenderable = "ERR: " + e.message; }
+          dev.destroy?.();
+        } catch (e) { limits.err = String(e); }
+        say("limits: " + JSON.stringify(limits));
+
+        mark("importing wasm module");
+        const mod = await import("./pkg/quasi.js");
+        mark("init()");
+        await mod.default();
+
+        mark("measuring refresh");
+        const hz = await refreshHz();
+        say("refresh: " + hz.toFixed(1) + " Hz");
+
+        mark("createHeadless h128");
+        const i128 = await mod.createHeadless("h128");
+        mark("createHeadless h256");
+        const i256 = await mod.createHeadless("h256");
+        const insts = { 128: i128, 256: i256 };
+
+        // Let them accumulate a little, then check they draw anything.
+        mark("warmup + pixel probe");
+        for (let i = 0; i < 60; i++) await nextFrame();
+        const probes = {
+          128: pixelStats(hostCanvas("h128")),
+          256: pixelStats(hostCanvas("h256")),
+        };
+        say("probe128: " + JSON.stringify(probes[128]));
+        say("probe256: " + JSON.stringify(probes[256]));
+        say("frameCount128 after 60 frames: " + i128.frameCount());
+        post("probe", { probes, fc128: i128.frameCount() });
+
+        const results = { ua: navigator.userAgent, adapter: adapterInfo,
+                          hz, probes, limits, rows: [] };
+        const REPS = 5;
+
+        for (const res of [128, 256]) {
+          for (const spp of [1, 4, 16, 64]) {
+            mark(`sweep ${res}^2 @ ${spp}spp`);
+            const times = [];
+            for (let r = 0; r < REPS; r++)
+              times.push(await timeToSpp(insts[res], spp));
+            const med = median(times.slice(1));
+            const vsyncFloor = (spp * 1000) / hz;
+            const px = pixelStats(hostCanvas("h" + res));
+            results.rows.push({ res, spp, med, times, vsyncFloor, px });
+            say(`${res}^2 @ ${String(spp).padStart(3)} spp: ` +
+                `med ${med.toFixed(1).padStart(7)} ms  ` +
+                `floor ${vsyncFloor.toFixed(1).padStart(6)} ms  ` +
+                `ratio ${(med / vsyncFloor).toFixed(2)}  ` +
+                `px(mean ${px.mean}, max ${px.max})`);
+          }
+        }
+
+        mark("done");
+        document.getElementById("done").textContent = "DONE";
+        window.__quasiBench = results;
+        post("result", { results });
+        say("(posted)");
+      }
+
+      main().catch((e) => {
+        say("ERROR at stage '" + stage + "': " + (e && e.stack ? e.stack : e));
+        post("error");
+        document.getElementById("done").textContent = "ERROR";
+      });
+    </script>
+  </body>
+</html>
