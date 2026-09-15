@@ -97,6 +97,27 @@ pub const AOV_DEPTH: usize = 3;
 pub const AOV_MEAN_Y2: usize = 4;
 pub const NUM_AOVS: usize = 5;
 
+/// Per-AOV attachment formats for the **windowed / web** pipeline.
+///
+/// WebGPU's guaranteed `max_color_attachment_bytes_per_sample` is 32.
+/// Plan 0028 added a fifth AOV, and five `Rgba16Float` attachments come
+/// to 40 bytes — over budget, so `create_render_pipeline` was rejected
+/// and the widget rendered black on every target that enforces the
+/// baseline limit. `depth` and `mean_y2` are both scalar (only channel
+/// R is ever read), so giving them a 1-channel format brings the total
+/// to 8+8+8+2+2 = 28 bytes and keeps the widget inside the portable
+/// limit instead of depending on an adapter that reports more.
+///
+/// The offscreen path keeps `OFFSCREEN_FORMAT` throughout — it is
+/// native-only and explicitly requests `adapter.limits()`.
+pub const AOV_FORMATS: [wgpu::TextureFormat; NUM_AOVS] = [
+    HDR_FORMAT,                    // radiance (rgb)
+    HDR_FORMAT,                    // albedo   (rgb)
+    HDR_FORMAT,                    // normal   (rgb)
+    wgpu::TextureFormat::R16Float, // depth    (scalar)
+    wgpu::TextureFormat::R16Float, // mean_y2  (scalar)
+];
+
 /// Small uniform for the accumulate pass. 16 bytes — must match WGSL `AccumU`.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -204,14 +225,16 @@ pub struct State {
     read_idx: usize,
 }
 
-/// Creates one HDR render-attachment texture and returns its default
-/// view. `extra_usage` lets callers add `COPY_SRC` for AOV readback.
-pub(crate) fn create_hdr_texture(
+/// Creates one AOV render-attachment texture and returns its default
+/// view. `extra_usage` lets callers add `COPY_SRC` for AOV readback;
+/// `format` is the per-AOV attachment format — see [`AOV_FORMATS`].
+pub(crate) fn create_aov_texture(
     device: &wgpu::Device,
     w: u32,
     h: u32,
     label: &str,
     extra_usage: wgpu::TextureUsages,
+    format: wgpu::TextureFormat,
 ) -> (wgpu::Texture, wgpu::TextureView) {
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
@@ -223,7 +246,7 @@ pub(crate) fn create_hdr_texture(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: HDR_FORMAT,
+        format,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT
             | wgpu::TextureUsages::TEXTURE_BINDING
             | extra_usage,
@@ -239,14 +262,21 @@ fn make_aov_views(
     h: u32,
     prefix: &str,
 ) -> [wgpu::TextureView; NUM_AOVS] {
-    let names = ["radiance", "albedo", "normal", "depth"];
+    // Typed `[&str; NUM_AOVS]` on purpose: plan 0028 added a fifth AOV
+    // (`AOV_MEAN_Y2`) and this table was left at four, which panicked
+    // `State::new` — the windowed + web path — on every launch. Giving
+    // the array an explicit NUM_AOVS length turns the next such drift
+    // into a compile error instead of a runtime index-out-of-bounds.
+    const NAMES: [&str; NUM_AOVS] = ["radiance", "albedo", "normal", "depth", "mean-y2"];
+    let names = NAMES;
     std::array::from_fn(|i| {
-        let (_tex, view) = create_hdr_texture(
+        let (_tex, view) = create_aov_texture(
             device,
             w,
             h,
             &format!("{prefix}-{}", names[i]),
             wgpu::TextureUsages::empty(),
+            AOV_FORMATS[i],
         );
         view
     })
@@ -1399,7 +1429,7 @@ impl State {
         });
 
         // --- Pipelines ---
-        let aov_formats = [HDR_FORMAT; NUM_AOVS];
+        let aov_formats = AOV_FORMATS;
         let pathtrace_pipeline = make_pipeline(
             &device,
             "pathtrace",

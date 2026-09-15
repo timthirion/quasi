@@ -11,7 +11,14 @@
 struct PresentU {
     // 0 = radiance display, 1 = variance display.
     display_mode: u32,
-    _pad: vec3<u32>,
+    // Three scalar pads, NOT `vec3<u32>`: a vec3 carries 16-byte
+    // alignment, so it would start at offset 16 and round the struct
+    // to 32 bytes, while the Rust side allocates 16 (`size: 16`, a
+    // `[0u32; 4]` write). That mismatch made every present draw fail
+    // validation — "bound with size 16 where the shader expects 32".
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 };
 
 @group(0) @binding(0) var accum_tex: texture_2d<f32>;
