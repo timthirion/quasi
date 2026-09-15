@@ -218,10 +218,18 @@ fn cornell_foggy_room_has_a_pure_scattering_medium_volume() {
 fn cornell_textured_floor_texture_contains_non_zero_pixels() {
     let scene = load_glb_bytes(CORNELL_TEXTURED_FLOOR).expect("load");
     let tex = &scene.textures[0];
-    let non_zero_alpha = tex.rgba.chunks_exact(4).filter(|p| p[3] != 0).count();
+    let non_zero_alpha = tex
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|p| p[3] != 0)
+        .count();
     let non_white = tex
         .rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|p| !(p[0] == 255 && p[1] == 255 && p[2] == 255))
         .count();
     let total = tex.rgba.len() / 4;

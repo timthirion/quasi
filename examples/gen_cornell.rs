@@ -791,7 +791,7 @@ fn icosphere(
     for _ in 0..level {
         let mut new_tris = Vec::with_capacity(tris.len() * 4);
         edge_cache.clear();
-        for chunk in tris.chunks_exact(3) {
+        for chunk in tris.as_chunks::<3>().0 {
             let a = chunk[0];
             let b = chunk[1];
             let c = chunk[2];
@@ -944,7 +944,7 @@ fn parse_obj_full(src: &str) -> ObjParse {
 /// vertex, then normalising. Standard smooth-shading approach.
 fn compute_smooth_normals(positions: &[[f32; 3]], indices: &[u32]) -> Vec<[f32; 3]> {
     let mut normals: Vec<[f32; 3]> = vec![[0.0_f32; 3]; positions.len()];
-    for chunk in indices.chunks_exact(3) {
+    for chunk in indices.as_chunks::<3>().0 {
         let v0 = positions[chunk[0] as usize];
         let v1 = positions[chunk[1] as usize];
         let v2 = positions[chunk[2] as usize];
