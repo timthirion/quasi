@@ -147,3 +147,6 @@ workspace**. Cross-link.
   — mesh-parameterization-driven importance sampling
   (LSCM/ARAP → UV-space prior → hardware texture sampling for
   inverse CDF); status: hypothesis.
+- [`R0003-differentiable-rendering.md`](R0003-differentiable-rendering.md)
+  — gradient scatter without f32 atomics + PRB on a browser-class
+  compute API; status: hypothesis (rev 2, post-critic).
