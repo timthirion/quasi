@@ -739,7 +739,7 @@ fn ingest_referenced_images(
             gltf::image::Format::R8G8B8A8 => data.pixels.clone(),
             gltf::image::Format::R8G8B8 => {
                 let mut out = Vec::with_capacity(data.pixels.len() / 3 * 4);
-                for px in data.pixels.chunks_exact(3) {
+                for px in data.pixels.as_chunks::<3>().0 {
                     out.extend_from_slice(&[px[0], px[1], px[2], 255]);
                 }
                 out
@@ -953,7 +953,7 @@ fn process_primitive(
         .map(|i| (i + 1) as u32)
         .unwrap_or(0);
 
-    for tri in indices.chunks_exact(3) {
+    for tri in indices.as_chunks::<3>().0 {
         scene.indices.push(tri[0] + vertex_offset);
         scene.indices.push(tri[1] + vertex_offset);
         scene.indices.push(tri[2] + vertex_offset);

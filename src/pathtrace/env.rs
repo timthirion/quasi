@@ -72,7 +72,7 @@ impl EnvironmentMap {
         // Rgb32F → 3 × f32 per pixel; reinterpret the byte buffer.
         let float_count = total_bytes / 4;
         let floats: &[f32] = bytemuck::cast_slice(&buf[..float_count * 4]);
-        let pixels: Vec<[f32; 3]> = floats.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+        let pixels: Vec<[f32; 3]> = floats.as_chunks::<3>().0.to_vec();
         Ok(EnvironmentMap::new(width, height, pixels))
     }
 }
