@@ -219,6 +219,7 @@ impl State {
             })
             .await
             .expect("failed to create device");
+        crate::gpu::install_error_logger(&device);
 
         let surface_caps = surface.get_capabilities(&adapter);
         let surface_format = surface_caps
@@ -810,6 +811,11 @@ mod tests {
     #[test]
     fn frame_uniforms_size_matches_wgsl_layout() {
         assert_eq!(std::mem::size_of::<FrameUniforms>(), 112);
+        // The literal above pins the Rust side; these read the WGSL side
+        // so a shader-only change can't slip past.
+        use crate::gpu::wgsl_layout::assert_matches_wgsl;
+        assert_matches_wgsl::<FrameUniforms>(include_str!("raster/shaders/forward.wgsl"), "FrameU");
+        assert_matches_wgsl::<FrameUniforms>(include_str!("raster/shaders/overlay.wgsl"), "FrameU");
     }
 
     #[test]

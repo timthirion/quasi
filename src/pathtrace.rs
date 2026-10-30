@@ -1363,6 +1363,7 @@ impl State {
             })
             .await
             .expect("failed to create device");
+        crate::gpu::install_error_logger(&device);
 
         let surface_caps = surface.get_capabilities(&adapter);
         // A non-sRGB surface: the present shader applies gamma itself.
@@ -1386,8 +1387,11 @@ impl State {
         surface.configure(&device, &config);
 
         // --- Bind group layouts ---
-        let pathtrace_bgl = build_pathtrace_bgl(&device);
-        let accumulate_bgl = build_accumulate_bgl(&device);
+        let pathtrace_bgl =
+            crate::gpu::validated(&device, "pathtrace bgl", || build_pathtrace_bgl(&device)).await;
+        let accumulate_bgl =
+            crate::gpu::validated(&device, "accumulate bgl", || build_accumulate_bgl(&device))
+                .await;
         let present_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("present-bgl"),
             entries: &[
@@ -1430,27 +1434,36 @@ impl State {
 
         // --- Pipelines ---
         let aov_formats = AOV_FORMATS;
-        let pathtrace_pipeline = make_pipeline(
-            &device,
-            "pathtrace",
-            include_str!("pathtrace/shaders/pathtrace.wgsl"),
-            &pathtrace_bgl,
-            &aov_formats,
-        );
-        let accumulate_pipeline = make_pipeline(
-            &device,
-            "accumulate",
-            include_str!("pathtrace/shaders/accumulate.wgsl"),
-            &accumulate_bgl,
-            &aov_formats,
-        );
-        let present_pipeline = make_pipeline(
-            &device,
-            "present",
-            include_str!("pathtrace/shaders/present.wgsl"),
-            &present_bgl,
-            &[config.format],
-        );
+        let pathtrace_pipeline = crate::gpu::validated(&device, "pathtrace pipeline", || {
+            make_pipeline(
+                &device,
+                "pathtrace",
+                include_str!("pathtrace/shaders/pathtrace.wgsl"),
+                &pathtrace_bgl,
+                &aov_formats,
+            )
+        })
+        .await;
+        let accumulate_pipeline = crate::gpu::validated(&device, "accumulate pipeline", || {
+            make_pipeline(
+                &device,
+                "accumulate",
+                include_str!("pathtrace/shaders/accumulate.wgsl"),
+                &accumulate_bgl,
+                &aov_formats,
+            )
+        })
+        .await;
+        let present_pipeline = crate::gpu::validated(&device, "present pipeline", || {
+            make_pipeline(
+                &device,
+                "present",
+                include_str!("pathtrace/shaders/present.wgsl"),
+                &present_bgl,
+                &[config.format],
+            )
+        })
+        .await;
 
         // --- Triangle scene + scene buffers ---
         let triangle_scene = default_triangle_scene();
@@ -1466,8 +1479,10 @@ impl State {
         // PT-adaptive: windowed pipeline never enables adaptive
         // sampling, so a 1×1 dummy mask suffices for the binding.
         let (_dummy_mask_tex, dummy_mask_view) = make_dummy_active_mask(&device, &queue);
-        let pathtrace_bg =
-            build_pathtrace_bg(&device, &pathtrace_bgl, &scene_buffers, &dummy_mask_view);
+        let pathtrace_bg = crate::gpu::validated(&device, "pathtrace bind group", || {
+            build_pathtrace_bg(&device, &pathtrace_bgl, &scene_buffers, &dummy_mask_view)
+        })
+        .await;
         let SceneBuffers {
             uniform: uniform_buf,
             vertex: vertex_buf,
@@ -1815,5 +1830,84 @@ mod tests {
         assert_eq!(AOV_DEPTH, 3);
         assert_eq!(AOV_MEAN_Y2, 4);
         assert_eq!(NUM_AOVS, 5);
+    }
+
+    // CPU/GPU layout: every struct bound by the path-tracer shaders is
+    // compared against the size naga computes from the WGSL source, so a
+    // drift on either side fails here instead of as a runtime binding
+    // error (or, in Safari, a silently black canvas).
+    use crate::gpu::wgsl_layout::{assert_matches_wgsl, wgsl_struct_size};
+
+    const PATHTRACE_WGSL: &str = include_str!("pathtrace/shaders/pathtrace.wgsl");
+
+    #[test]
+    fn pathtrace_structs_match_wgsl() {
+        assert_matches_wgsl::<scene::Uniforms>(PATHTRACE_WGSL, "Uniforms");
+        assert_matches_wgsl::<scene::GpuCamera>(PATHTRACE_WGSL, "Camera");
+        assert_matches_wgsl::<mesh::Vertex>(PATHTRACE_WGSL, "Vertex");
+        assert_matches_wgsl::<mesh::Material>(PATHTRACE_WGSL, "Material");
+        assert_matches_wgsl::<mesh::EmissiveLight>(PATHTRACE_WGSL, "EmissiveLight");
+        assert_matches_wgsl::<bvh::Node>(PATHTRACE_WGSL, "BvhNode");
+    }
+
+    #[test]
+    fn accumulate_and_mask_uniforms_match_wgsl() {
+        assert_matches_wgsl::<AccumUniform>(
+            include_str!("pathtrace/shaders/accumulate.wgsl"),
+            "AccumU",
+        );
+        assert_matches_wgsl::<MaskUniform>(
+            include_str!("pathtrace/shaders/adaptive_mask.wgsl"),
+            "MaskU",
+        );
+    }
+
+    #[test]
+    fn raw_array_uniforms_match_wgsl() {
+        // These uniforms are uploaded as plain `[u32; 4]` / `[f32; 4]`
+        // arrays (16 bytes, `size: 16` buffers), so the WGSL side is the
+        // only thing that can drift.
+        let cases = [
+            (include_str!("pathtrace/shaders/present.wgsl"), "PresentU"),
+            (
+                include_str!("pathtrace/shaders/bloom_extract.wgsl"),
+                "ExtractU",
+            ),
+            (
+                include_str!("pathtrace/shaders/bloom_downsample.wgsl"),
+                "DownsampleU",
+            ),
+            (
+                include_str!("pathtrace/shaders/bloom_upsample.wgsl"),
+                "UpsampleU",
+            ),
+            (
+                include_str!("pathtrace/shaders/bloom_composite.wgsl"),
+                "CompositeU",
+            ),
+        ];
+        for (src, name) in cases {
+            assert_eq!(wgsl_struct_size(src, name), 16, "WGSL `{name}`");
+        }
+    }
+
+    #[test]
+    fn aov_attachments_fit_default_byte_budget() {
+        // The windowed + web pipeline requests `Limits::default()`. Plan
+        // 0028's fifth Rgba16Float AOV pushed the MRT to 40 bytes per
+        // sample and the pathtrace + accumulate pipelines were rejected.
+        // Same packing rule as WebGPU's "color attachment bytes per
+        // sample" check: align the running total, then add the cost.
+        let mut total = 0u32;
+        for f in AOV_FORMATS {
+            let align = f.target_component_alignment().expect("renderable");
+            let cost = f.target_pixel_byte_cost().expect("renderable");
+            total = total.div_ceil(align) * align + cost;
+        }
+        let limit = wgpu::Limits::default().max_color_attachment_bytes_per_sample;
+        assert!(
+            total <= limit,
+            "AOV MRT is {total} bytes/sample, limit {limit}"
+        );
     }
 }

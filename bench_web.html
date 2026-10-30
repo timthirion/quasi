@@ -26,7 +26,7 @@
       // Capture console output so Rust panic messages (written by
       // console_error_panic_hook to console.error) reach the collector.
       const consoleCap = [];
-      for (const lvl of ["error", "warn", "log"]) {
+      for (const lvl of ["error", "warn", "log", "info", "debug"]) {
         const orig = console[lvl].bind(console);
         console[lvl] = (...a) => {
           try { consoleCap.push(lvl + ": " + a.map(String).join(" ")); } catch (e) {}
@@ -184,6 +184,16 @@
         say("probe256: " + JSON.stringify(probes[256]));
         say("frameCount128 after 60 frames: " + i128.frameCount());
         post("probe", { probes, fc128: i128.frameCount() });
+
+        // Bisection: variance mode maps zero variance to viridis purple in
+        // the present pass. Purple here means present + surface work and the
+        // black comes from upstream; black means present itself is broken.
+        i128.setDisplayMode("variance");
+        for (let i = 0; i < 30; i++) await nextFrame();
+        const varProbe = pixelStats(hostCanvas("h128"));
+        say("variance-mode probe128: " + JSON.stringify(varProbe));
+        i128.setDisplayMode("radiance");
+        post("probe", { probes, varProbe });
 
         const results = { ua: navigator.userAgent, adapter: adapterInfo,
                           hz, probes, limits, rows: [] };

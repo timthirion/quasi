@@ -244,9 +244,15 @@ async fn create_inner(host_id: String, chrome: bool) -> Result<QuasiInstance, Js
         visible: Cell::new(true),
     });
 
+    // The default sheet carries the wrapper and canvas sizing as well as
+    // the controls, so inject it in both modes. Headless used to skip it,
+    // which left the canvas with no CSS size: it displayed at its backing
+    // size, DPR times the host, and spilled over the embedder's layout.
+    // The `.quasi-controls` rules match nothing when there are no controls.
+    inject_default_styles_once(&document)?;
+
     // Optional chrome.
     let chrome_dom = if chrome {
-        inject_default_styles_once(&document)?;
         Some(build_controls(&document, &wrapper)?)
     } else {
         None
