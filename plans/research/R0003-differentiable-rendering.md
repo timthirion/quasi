@@ -362,10 +362,15 @@ Rev 2 replaces it with a three-part test:
   requires. Baseline: sep-CMA or SPSA.
 - [ ] **[R0003/browser-envelope]** The envelope surface, Chrome and
   Safari, M-series — captioned as *plain PRB on WebGPU*. Must report
-  Safari and Chrome separately; Brush documents Chrome-only support for
-  in-browser splat training, so Safari viability is an open question,
-  not an assumption.
-- [ ] **[R0003/safari-black]** Safari renders nothing. Found
+  Safari and Chrome separately. Safari works as of `0e3cda5` (see
+  `[R0003/safari-black]`), but naga accepts WGSL that Safari rejects,
+  so every new kernel needs a per-browser check.
+- [x] **[R0003/safari-black]** **Fixed 2026-10-29 in `0e3cda5`.** Cause:
+  WebKit's WGSL compiler rejects the explicitly typed nested
+  constructor in the module-scope `SOBOL_DIRECTIONS` table, so the
+  pathtrace pipeline was invalid and the shared command encoder threw
+  away every frame. Not a WebGPU-maturity gap; the hypothesis below was
+  wrong. See *Findings*. Original report follows. Safari renders nothing. Found
   2026-09-15 while running `primal-timing`, *after* the three
   plan-0028 regressions were fixed and Chrome was confirmed good. The
   render loop runs (`frameCount` advances normally, 60 samples in 60
@@ -431,6 +436,24 @@ does not clear it, and JCGT publishes PDFs and code — a live widget
 carries no weight there.
 
 ## Findings
+
+- **2026-10-29**: `[R0003/safari-black]` fixed. Safari logged nothing
+  because it does not deliver `uncapturederror` events to wgpu's
+  handler; a deliberately invalid pipeline also logged nothing there,
+  while Chrome reported it. Wrapping pipeline creation in error scopes,
+  which report through a promise, surfaced the real error:
+  `pathtrace.wgsl` failed to compile with "cannot use override value in
+  constant expression" at the typed `array<array<u32, 32>, 32>(...)`
+  constructor, though the file has no overrides. Writing it as
+  `array(...)` fixed it; Safari's radiance probe mean is 47.63 against
+  Chrome's 47.72. Two consequences for this plan. **(a)** Safari is a
+  viable target again, so `[R0003/browser-envelope]` measures both
+  browsers as originally intended. **(b)** naga accepted the failing
+  form, so naga validation is not evidence that a shader compiles in
+  every browser; any new WGSL this plan adds (the compute port, the
+  scatter kernels) has to be checked in Safari and Chrome, with error
+  scopes, before its numbers are trusted. A test now blocks the
+  specific constructor pattern, but the general gap remains.
 
 - **2026-09-15** — `[R0003/primal-timing]`, browser half, **and three
   shipped-renderer bugs found in the process.** Running the sweep
