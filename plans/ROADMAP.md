@@ -191,11 +191,14 @@ See [`research/README.md`](research/README.md).
   held-out validation need a local run. Remaining: `PT-sky/time-of-day`
   (Sponza dawn/noon/sunset triptych), `PT-sky/widget`.
 
+- [`0035-pt-bloom-verification.md`](0035-pt-bloom-verification.md) —
+  **active**, 1/6. `widget-smoke` shipped: CI now builds the interactive
+  renderer on lavapipe and fails if it draws black. Remaining: Kawase kernel
+  pin, bloom-off inertness, denoise × bloom halo interaction, the browser
+  widget surface 0029 skipped, attacker pass.
+
 ## Proposed
 
-- [`0035-pt-bloom-verification.md`](0035-pt-bloom-verification.md) — Kawase
-  kernel pin, bloom-off inertness assertion, denoise × bloom halo interaction,
-  and the browser widget surface 0029 skipped.
 - [`0031-pt-nfor.md`](0031-pt-nfor.md) — NFOR feature-weighted denoiser
   (Rousselle et al. 2016) alongside the à-trous path.
 - [`0032-rt-cluster-cull.md`](0032-rt-cluster-cull.md) — GPU-driven cluster

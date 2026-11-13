@@ -41,7 +41,18 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      - name: Install software Vulkan (lavapipe)
+        # Gives the GPU-less runner a wgpu adapter so `tests/widget_smoke.rs`
+        # can build and render the interactive path tracer. Without it the
+        # widget rendered nothing for three months under a green CI (R0003
+        # findings, 2026-09-15).
+        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers libvulkan1
+
       - name: Tests
+        env:
+          # Fail, rather than skip, the widget smoke test if lavapipe ever
+          # stops providing an adapter.
+          QUASI_REQUIRE_GPU: "1"
         run: cargo test --all-targets
 
       - name: wasm32 check

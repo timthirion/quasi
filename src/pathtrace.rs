@@ -30,6 +30,7 @@ pub mod integrator;
 pub mod medium;
 pub mod mesh;
 pub mod phase;
+pub mod present;
 pub mod sampler;
 pub mod scene;
 pub mod sky;
@@ -164,17 +165,21 @@ pub(crate) struct Targets {
     pub present_bg: [wgpu::BindGroup; 2],
 }
 
-/// The path-tracer renderer: owns the surface, pipelines, and scene state.
+/// The path-tracer renderer: owns the present target, pipelines, and scene
+/// state.
+///
+/// Built against a window/canvas surface with [`State::new`], or against
+/// an offscreen texture with [`State::new_headless`] for the widget smoke
+/// test.
 ///
 /// The triangle scene's storage buffers (vertex / index / material /
 /// triangle-material / emissive-triangle) are owned here so the bind
 /// group stays valid for the lifetime of the renderer; they're not
 /// resized or rebuilt on `resize`.
 pub struct State {
-    surface: wgpu::Surface<'static>,
+    output: present::PresentTarget,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
 
     pathtrace_pipeline: wgpu::RenderPipeline,
     accumulate_pipeline: wgpu::RenderPipeline,
@@ -1347,6 +1352,23 @@ impl State {
             })
             .await
             .expect("no suitable GPU adapter found (does this browser support WebGPU?)");
+        Self::build(adapter, Some(surface), width, height).await
+    }
+
+    /// Builds the renderer presenting into an offscreen texture instead of
+    /// a surface. Same device limits, pipelines and passes as [`State::new`],
+    /// so a frame read back with [`State::read_presented`] is what the
+    /// widget would have shown.
+    pub async fn new_headless(adapter: wgpu::Adapter, width: u32, height: u32) -> State {
+        Self::build(adapter, None, width, height).await
+    }
+
+    async fn build(
+        adapter: wgpu::Adapter,
+        surface: Option<wgpu::Surface<'static>>,
+        width: u32,
+        height: u32,
+    ) -> State {
         log::info!("adapter: {:?}", adapter.get_info());
 
         // T1 uses fragment-stage storage buffers (triangle data), which
@@ -1365,26 +1387,13 @@ impl State {
             .expect("failed to create device");
         crate::gpu::install_error_logger(&device);
 
-        let surface_caps = surface.get_capabilities(&adapter);
-        // A non-sRGB surface: the present shader applies gamma itself.
-        let surface_format = surface_caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| !f.is_srgb())
-            .unwrap_or(surface_caps.formats[0]);
-
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: surface_format,
-            width: width.max(1),
-            height: height.max(1),
-            present_mode: surface_caps.present_modes[0],
-            alpha_mode: surface_caps.alpha_modes[0],
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+        let output = match surface {
+            Some(surface) => {
+                present::PresentTarget::surface(surface, &adapter, &device, width, height)
+            }
+            None => present::PresentTarget::offscreen(&device, width, height),
         };
-        surface.configure(&device, &config);
+        let (out_w, out_h) = output.size();
 
         // --- Bind group layouts ---
         let pathtrace_bgl =
@@ -1460,7 +1469,7 @@ impl State {
                 "present",
                 include_str!("pathtrace/shaders/present.wgsl"),
                 &present_bgl,
-                &[config.format],
+                &[output.format()],
             )
         })
         .await;
@@ -1530,8 +1539,8 @@ impl State {
 
         let targets = build_targets(
             &device,
-            config.width,
-            config.height,
+            out_w,
+            out_h,
             &accumulate_bgl,
             &present_bgl,
             &accum_uniform_buf,
@@ -1540,10 +1549,9 @@ impl State {
         );
 
         State {
-            surface,
+            output,
             device,
             queue,
-            config,
             pathtrace_pipeline,
             accumulate_pipeline,
             present_pipeline,
@@ -1579,10 +1587,8 @@ impl State {
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
-        if width > 0 && height > 0 && (width != self.config.width || height != self.config.height) {
-            self.config.width = width;
-            self.config.height = height;
-            self.surface.configure(&self.device, &self.config);
+        if width > 0 && height > 0 && (width, height) != self.output.size() {
+            self.output.resize(&self.device, width, height);
             self.targets = build_targets(
                 &self.device,
                 width,
@@ -1664,19 +1670,10 @@ impl State {
     }
 
     pub fn render(&mut self) {
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface.configure(&self.device, &self.config);
-                return;
-            }
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => return,
-            wgpu::CurrentSurfaceTexture::Validation => {
-                log::warn!("surface validation error acquiring frame");
-                return;
-            }
+        let Some(frame) = self.output.acquire(&self.device) else {
+            return;
         };
+        let (width, height) = self.output.size();
 
         // Restart accumulation when the camera moved.
         if self.camera.dirty {
@@ -1691,10 +1688,10 @@ impl State {
         self.uniforms.camera.direction = dir;
         self.uniforms.camera.up = [0.0, 1.0, 0.0];
         self.uniforms.camera.fov = self.camera.fov;
-        self.uniforms.camera.aspect = self.config.width as f32 / self.config.height as f32;
+        self.uniforms.camera.aspect = width as f32 / height as f32;
         self.uniforms.frame_count = self.frame_count;
-        self.uniforms.viewport_width = self.config.width;
-        self.uniforms.viewport_height = self.config.height;
+        self.uniforms.viewport_width = width;
+        self.uniforms.viewport_height = height;
         self.queue
             .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&self.uniforms));
         self.queue.write_buffer(
@@ -1709,9 +1706,7 @@ impl State {
 
         let src = self.read_idx;
         let dst = 1 - src;
-        let surface_view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        let surface_view = frame.view();
 
         let mut encoder = self
             .device
@@ -1753,6 +1748,19 @@ impl State {
 
         self.read_idx = dst;
         self.frame_count += 1;
+    }
+
+    /// Read the last presented frame back as tightly packed RGBA8 rows
+    /// (`width * height * 4` bytes, [`present::OFFSCREEN_FORMAT`]).
+    /// Returns `None` for a surface-backed renderer.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn read_presented(&self) -> Option<Vec<u8>> {
+        self.output.read_rgba8(&self.device, &self.queue)
+    }
+
+    /// Size of the present target in pixels.
+    pub fn size(&self) -> (u32, u32) {
+        self.output.size()
     }
 }
 

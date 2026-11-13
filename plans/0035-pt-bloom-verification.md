@@ -1,8 +1,8 @@
 # PT-bloom-verification — close the gaps plan 0029 left open
 
-- **Status:** proposed
-- **Last updated:** 2026-08-10
-- **Last touched on:** created during the 0029 closing pass to hold the four verification riders and one whole milestone that 0029 shipped without. A second closure-pass run then ran the `close-plan` review gauntlet the first pass explicitly skipped (plan-skeptic + code-attacker/defender + render-attacker) and surfaced three P0 correctness bugs in the shipped bloom code that the inline verification never caught. Those were fixed in-place ahead of this plan's execution — see the `Prior P0 fixes` section below — so this plan's milestones now build on a known-good foundation.
+- **Status:** active — 1 of 6 milestones shipped (`widget-smoke`)
+- **Last updated:** 2026-11-13
+- **Last touched on:** 2026-11-13 — added and shipped `[PT-bloomv/widget-smoke]`, the CI gate R0003's 2026-09-15 findings asked for (the widget rendered nothing for three months under a green CI). It comes first because `[PT-bloomv/widget]` is unverifiable without it. Originally created during the 0029 closing pass to hold the four verification riders and one whole milestone that 0029 shipped without. A second closure-pass run then ran the `close-plan` review gauntlet the first pass explicitly skipped (plan-skeptic + code-attacker/defender + render-attacker) and surfaced three P0 correctness bugs in the shipped bloom code that the inline verification never caught. Those were fixed in-place ahead of this plan's execution — see the `Prior P0 fixes` section below — so this plan's milestones now build on a known-good foundation.
 
 ## Goal
 
@@ -101,6 +101,21 @@ What did not:
 
 ## Milestones
 
+- [x] **[PT-bloomv/widget-smoke]** **Shipped 2026-11-13.** A CI gate
+  that instantiates the interactive renderer and asserts it draws.
+  `pathtrace::State` now presents through a `present::PresentTarget`
+  (surface *or* offscreen texture); `State::new_headless` builds the
+  exact widget pipelines against the offscreen target and
+  `State::read_presented` reads the frame back. `tests/widget_smoke.rs`
+  (not `#[ignore]`d) checks first frame, 8 frames, resize, camera
+  restart and variance display mode against a `FrameStats` probe
+  (`nonzero_frac > 0.5`, `mean > 10/255`). CI installs lavapipe and
+  sets `QUASI_REQUIRE_GPU=1` so a missing adapter fails rather than
+  skips. Mutation-checked locally: re-introducing the 40-byte AOV
+  attachments, the `vec3<u32>` `PresentU` pad, or a black present
+  shader turns all five tests red. **Not covered:** browser-only WGSL
+  rejections (naga ≠ Safari — see R0003 `safari-black`) and the
+  `web.rs` driver itself; the raster `State` has no equivalent yet.
 - [ ] **[PT-bloomv/kernel-pin]** CPU test for the Kawase chain: a
   single bright pixel at (128,128) in a 256×256 buffer, run through
   the 4-level chain, asserting
@@ -190,7 +205,7 @@ What did not:
 
 ## Done when
 
-* All five milestones ticked
+* All six milestones ticked
 * Kawase kernel numerically pinned; bloom-off inertness asserted
 * Halo interaction test green at the ≤ 10% ceiling
 * Bloom live in the browser widget with its measured composite cost
@@ -201,7 +216,12 @@ What did not:
 
 ## Findings
 
-(Populated during execution.)
+- **2026-11-13** — `[PT-bloomv/widget-smoke]`. Local Metal (Apple M4),
+  64×48 default Cornell: first frame `nonzero_frac 0.709, mean 33.4,
+  max 248`; after 8 frames `0.795 / 36.5 / 248`. The camera-restart
+  frame reproduces the first frame bit-for-bit in these stats, so
+  accumulation reset is exercised, not just "something drew". Lavapipe
+  numbers to be recorded from the first CI run.
 
 ## Followups (out of scope)
 
