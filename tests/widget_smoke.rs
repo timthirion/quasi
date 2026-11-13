@@ -76,65 +76,52 @@ fn assert_rendered(stats: FrameStats, what: &str) {
     );
 }
 
+/// One test, one `State`, scenarios in sequence. On lavapipe almost all of
+/// the cost is device creation plus the LLVM compile of the megakernel —
+/// five separate tests each paying that took 443 s of CI time, against a
+/// few seconds for the renders themselves. Every assertion names its
+/// scenario, so a failure still says which one broke.
 #[test]
 fn widget_renders_non_black() {
     let Some(mut state) = headless(W, H) else {
         return;
     };
-    let (rgba, stats) = render_and_read(&mut state, 8);
+
+    // The very first frame is what a reader sees on page load.
+    let (rgba, stats) = render_and_read(&mut state, 1);
     assert_eq!(rgba.len(), (W * H * 4) as usize);
+    assert_rendered(stats, "first frame");
+    let first = stats;
+
+    // Accumulation keeps drawing.
+    let (_, stats) = render_and_read(&mut state, 7);
     assert_eq!(state.frame_count, 8);
     assert_rendered(stats, "8 frames");
-}
 
-#[test]
-fn first_frame_is_non_black() {
-    // The widget's very first frame is what a reader sees on page load.
-    let Some(mut state) = headless(W, H) else {
-        return;
-    };
+    // A camera move restarts accumulation. The camera has not actually
+    // moved, so the restarted frame must reproduce the first one exactly:
+    // that proves the restart reset the accumulation, not just the counter.
+    state.camera.dirty = true;
     let (_, stats) = render_and_read(&mut state, 1);
-    assert_rendered(stats, "1 frame");
-}
+    assert_eq!(state.frame_count, 1, "a dirty camera restarts accumulation");
+    assert_rendered(stats, "after camera move");
+    assert_eq!(stats, first, "restarted frame differs from the first frame");
 
-#[test]
-fn resize_keeps_rendering() {
+    // Display mode 1 shows the adaptive-sampling variance AOV — the AOV
+    // whose addition broke the widget in plan 0028. Variance is noise, so
+    // only require that something is drawn.
+    state.set_display_mode(1);
+    let (_, stats) = render_and_read(&mut state, 3);
+    eprintln!("widget_smoke variance mode: {stats:?}");
+    assert!(stats.max > 0, "variance display is entirely black");
+    state.set_display_mode(0);
+
     // The widget resizes to its observed canvas size every tick; resizing
     // rebuilds every AOV target and bind group.
-    let Some(mut state) = headless(W, H) else {
-        return;
-    };
-    render_and_read(&mut state, 2);
     state.resize(80, 60);
     assert_eq!(state.size(), (80, 60));
     assert_eq!(state.frame_count, 0, "resize restarts accumulation");
     let (rgba, stats) = render_and_read(&mut state, 4);
     assert_eq!(rgba.len(), 80 * 60 * 4);
     assert_rendered(stats, "after resize");
-}
-
-#[test]
-fn variance_display_mode_renders() {
-    // Display mode 1 shows the adaptive-sampling variance AOV — the AOV
-    // whose addition broke the widget in plan 0028. Variance is noise, so
-    // only require that something is drawn.
-    let Some(mut state) = headless(W, H) else {
-        return;
-    };
-    state.set_display_mode(1);
-    let (_, stats) = render_and_read(&mut state, 4);
-    eprintln!("widget_smoke variance mode: {stats:?}");
-    assert!(stats.max > 0, "variance display is entirely black");
-}
-
-#[test]
-fn camera_move_restarts_and_still_renders() {
-    let Some(mut state) = headless(W, H) else {
-        return;
-    };
-    render_and_read(&mut state, 4);
-    state.camera.dirty = true;
-    let (_, stats) = render_and_read(&mut state, 1);
-    assert_eq!(state.frame_count, 1, "a dirty camera restarts accumulation");
-    assert_rendered(stats, "after camera move");
 }
