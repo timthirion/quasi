@@ -237,13 +237,12 @@ impl FrameStats {
             };
         }
         let (mut nonzero, mut sum, mut max) = (0usize, 0u64, 0u8);
-        for px in rgba.chunks_exact(4) {
-            let rgb = &px[..3];
-            if rgb.iter().any(|&c| c != 0) {
+        for &[r, g, b, _] in rgba.as_chunks::<4>().0 {
+            if (r, g, b) != (0, 0, 0) {
                 nonzero += 1;
             }
-            sum += rgb.iter().map(|&c| u64::from(c)).sum::<u64>();
-            max = max.max(*rgb.iter().max().unwrap_or(&0));
+            sum += u64::from(r) + u64::from(g) + u64::from(b);
+            max = max.max(r).max(g).max(b);
         }
         FrameStats {
             nonzero_frac: nonzero as f64 / pixels as f64,
