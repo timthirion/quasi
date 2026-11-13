@@ -220,8 +220,16 @@ What did not:
   64×48 default Cornell: first frame `nonzero_frac 0.709, mean 33.4,
   max 248`; after 8 frames `0.795 / 36.5 / 248`. The camera-restart
   frame reproduces the first frame bit-for-bit in these stats, so
-  accumulation reset is exercised, not just "something drew". Lavapipe
-  numbers to be recorded from the first CI run.
+  accumulation reset is exercised, not just "something drew".
+  **CI (lavapipe, ubuntu-latest):** passes with an adapter required,
+  including the exact-equality restart check, so lavapipe renders
+  deterministically. Cost is the catch: five separate tests took
+  443 s; merged into one `State` it is 234 s, versus 0.9 s on local
+  Metal, so nearly all of it is lavapipe's LLVM compile of the
+  megakernel. CI wall time went from ~3 min to ~5 min. If that hurts,
+  move the smoke test to its own parallel CI job. Per-scenario
+  `FrameStats` are printed but cargo hides stderr for passing tests;
+  run with `--nocapture` to see them.
 
 ## Followups (out of scope)
 
